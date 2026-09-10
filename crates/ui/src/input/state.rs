@@ -22,7 +22,7 @@ use super::{
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
-    mode::{InputMode, LineNumbers},
+    mode::{InputMode, LineNumbers, RenderWhitespace},
     number_input,
     text_wrapper::TextWrapper,
 };
@@ -495,6 +495,41 @@ impl InputState {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {
             *l = line_number.into();
+        }
+        cx.notify();
+    }
+
+    /// Set which whitespace characters are drawn, only for
+    /// [`InputMode::CodeEditor`] mode.
+    ///
+    /// Takes a [`RenderWhitespace`], or a `bool` for the all/nothing case.
+    pub fn render_whitespace(mut self, render_whitespace: impl Into<RenderWhitespace>) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            render_whitespace: w,
+            ..
+        } = &mut self.mode
+        {
+            *w = render_whitespace.into();
+        }
+        self
+    }
+
+    /// Set which whitespace characters are drawn, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_render_whitespace(
+        &mut self,
+        render_whitespace: impl Into<RenderWhitespace>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            render_whitespace: w,
+            ..
+        } = &mut self.mode
+        {
+            *w = render_whitespace.into();
         }
         cx.notify();
     }

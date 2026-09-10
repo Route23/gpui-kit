@@ -68,6 +68,49 @@ impl LineNumbers {
     }
 }
 
+/// Which whitespace characters are drawn as visible marks.
+///
+/// Mirrors VS Code's `editor.renderWhitespace`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RenderWhitespace {
+    /// Draw nothing.
+    #[default]
+    None,
+    /// Everything except a single space between two words. Leading, trailing
+    /// and repeated spaces are drawn; tabs are always drawn.
+    Boundary,
+    /// Only inside the selection.
+    Selection,
+    /// Only the whitespace after the last non-whitespace character of a line.
+    Trailing,
+    /// Every space and tab.
+    All,
+}
+
+impl From<bool> for RenderWhitespace {
+    fn from(on: bool) -> Self {
+        if on {
+            RenderWhitespace::All
+        } else {
+            RenderWhitespace::None
+        }
+    }
+}
+
+impl RenderWhitespace {
+    /// Whether anything is drawn at all.
+    #[inline]
+    pub fn is_visible(&self) -> bool {
+        !matches!(self, RenderWhitespace::None)
+    }
+
+    /// Whether the marks are limited to the selection.
+    #[inline]
+    pub fn follows_selection(&self) -> bool {
+        matches!(self, RenderWhitespace::Selection)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum InputMode {
     /// A plain text input mode.
@@ -91,6 +134,8 @@ pub(crate) enum InputMode {
         line_number: LineNumbers,
         language: SharedString,
         indent_guides: bool,
+        /// Which whitespace characters are drawn as visible marks
+        render_whitespace: RenderWhitespace,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -123,6 +168,7 @@ impl InputMode {
             highlighter: Rc::new(RefCell::new(None)),
             line_number: LineNumbers::default(),
             indent_guides: true,
+            render_whitespace: RenderWhitespace::default(),
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -255,6 +301,20 @@ impl InputMode {
         }
     }
 
+    /// Return [`RenderWhitespace::None`] if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn render_whitespace(&self) -> RenderWhitespace {
+        match self {
+            InputMode::CodeEditor {
+                render_whitespace,
+                multi_line,
+                ..
+            } if *multi_line => *render_whitespace,
+            _ => RenderWhitespace::None,
+        }
+    }
+
     pub(super) fn update_highlighter(
         &mut self,
         selected_range: &Range<usize>,
@@ -337,7 +397,7 @@ mod tests {
         highlighter::DiagnosticSet,
         input::{
             TabSize,
-            mode::{InputMode, LineNumbers},
+            mode::{InputMode, LineNumbers, RenderWhitespace},
         },
     };
 
@@ -356,6 +416,7 @@ mod tests {
             multi_line: false,
             line_number: LineNumbers::On,
             indent_guides: true,
+            render_whitespace: RenderWhitespace::None,
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),

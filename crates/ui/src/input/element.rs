@@ -809,6 +809,7 @@ pub(super) struct PrepaintState {
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
+    whitespaces: Vec<crate::input::whitespace::PlacedMark>,
     bounds: Bounds<Pixels>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
@@ -1226,6 +1227,7 @@ impl Element for TextElement {
         let hover_definition_hitbox = self.layout_hover_definition_hitbox(state, window, cx);
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
+        let whitespaces = self.layout_whitespaces(state, &bounds, &last_layout);
 
         PrepaintState {
             bounds,
@@ -1241,6 +1243,7 @@ impl Element for TextElement {
             hover_definition_hitbox,
             document_color_paths,
             indent_guides_path,
+            whitespaces,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -1407,6 +1410,9 @@ impl Element for TextElement {
                 }
             }
         }
+
+        // Paint whitespace marks on top of the glyphs they belong to.
+        Self::paint_whitespaces(&prepaint.whitespaces, line_height, window, cx);
 
         // Paint blinking cursor
         if focused && show_cursor {
