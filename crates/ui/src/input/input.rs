@@ -316,6 +316,9 @@ impl RenderOnce for Input {
                     .on_action(
                         window.listener_for(&self.state, InputState::on_action_go_to_definition),
                     )
+                    .on_action(window.listener_for(&self.state, InputState::on_action_toggle_fold))
+                    .on_action(window.listener_for(&self.state, InputState::on_action_fold_all))
+                    .on_action(window.listener_for(&self.state, InputState::on_action_unfold_all))
             })
             .on_action(window.listener_for(&self.state, InputState::select_all))
             .on_action(window.listener_for(&self.state, InputState::select_to_start_of_line))

@@ -19,7 +19,9 @@ use gpui::{
 
 use crate::{
     ActiveTheme as _, RopeExt as _,
-    input::{InputState, LastLayout, TabSize, element::TextElement},
+    input::{
+        FoldAll, InputState, LastLayout, TabSize, ToggleFold, UnfoldAll, element::TextElement,
+    },
 };
 
 /// Whether a line is blank (only whitespace, including a lone `\r`).
@@ -230,6 +232,38 @@ impl InputState {
         self.folded_rows.clear();
         self.update_folds();
         cx.notify();
+    }
+
+    /// Fold or unfold the region the cursor is in the header of.
+    ///
+    /// Does nothing when the cursor's row heads no fold; walking up to the
+    /// enclosing header is a later refinement.
+    pub(super) fn on_action_toggle_fold(
+        &mut self,
+        _: &ToggleFold,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row = self.text.offset_to_point(self.cursor()).row;
+        self.toggle_fold(row, cx);
+    }
+
+    pub(super) fn on_action_fold_all(
+        &mut self,
+        _: &FoldAll,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fold_all(cx);
+    }
+
+    pub(super) fn on_action_unfold_all(
+        &mut self,
+        _: &UnfoldAll,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.unfold_all(cx);
     }
 
     /// Recompute which rows are hidden, dropping headers that no longer fold.
@@ -467,9 +501,14 @@ impl InputState {
         };
         // **`input_bounds`, not `last_bounds`** -- the latter is shifted by the
         // horizontal scroll offset, and the gutter does not scroll with it.
-        let right = self.input_bounds.origin.x + last_layout.line_number_width;
-        let left = right - crate::input::element::FOLD_CHEVRON_WIDTH;
-        position.x >= left && position.x < right
+        //
+        // The strip has to match where the chevron is *painted*, which is
+        // inside `LINE_NUMBER_RIGHT_MARGIN`, not flush against the text.
+        let left = crate::input::element::fold_chevron_x(
+            self.input_bounds.origin.x,
+            last_layout.line_number_width,
+        );
+        position.x >= left && position.x < left + crate::input::element::FOLD_CHEVRON_WIDTH
     }
 
     /// Handle a click on the fold chevron strip.

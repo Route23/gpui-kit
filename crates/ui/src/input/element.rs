@@ -21,6 +21,14 @@ pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 /// The strip between the line numbers and the text that holds fold chevrons.
 pub(super) const FOLD_CHEVRON_WIDTH: Pixels = px(14.);
 
+/// The left edge of the fold chevron strip.
+///
+/// **Paint and hit-testing must agree**: the chevron sits inside
+/// `LINE_NUMBER_RIGHT_MARGIN`, not flush against the text.
+pub(super) fn fold_chevron_x(gutter_origin_x: Pixels, line_number_width: Pixels) -> Pixels {
+    gutter_origin_x + line_number_width - LINE_NUMBER_RIGHT_MARGIN - FOLD_CHEVRON_WIDTH
+}
+
 /// The width the fold chevrons take out of the gutter, 0 when folding is off.
 pub(super) fn fold_chevron_width(state: &InputState) -> Pixels {
     if state.mode.has_folding() {
@@ -568,7 +576,10 @@ impl TextElement {
                 None,
             );
 
-            empty_line_number.width + px(6.) + LINE_NUMBER_RIGHT_MARGIN + fold_chevron_width(state)
+            empty_line_number.width
+                + px(6.)
+                + LINE_NUMBER_RIGHT_MARGIN
+                + fold_chevron_width(state)
         } else {
             fold_chevron_width(state)
         };
@@ -1271,10 +1282,10 @@ impl Element for TextElement {
         let fold_chevrons =
             self.layout_fold_chevrons(state, &last_layout, text_size, &text_style, window, cx);
         let fold_gutter_hitbox = (state.mode.has_folding() && !fold_chevrons.is_empty()).then(|| {
-            let right = state.input_bounds.origin.x + last_layout.line_number_width;
+            let x = fold_chevron_x(state.input_bounds.origin.x, last_layout.line_number_width);
             window.insert_hitbox(
                 Bounds::new(
-                    point(right - FOLD_CHEVRON_WIDTH, state.input_bounds.origin.y),
+                    point(x, state.input_bounds.origin.y),
                     size(FOLD_CHEVRON_WIDTH, state.input_bounds.size.height),
                 ),
                 gpui::HitboxBehavior::Normal,
@@ -1526,9 +1537,10 @@ impl Element for TextElement {
                 }
 
                 if let Some(chevron) = prepaint.fold_chevrons.iter().find(|c| c.ix == ix) {
-                    let x = input_bounds.origin.x + prepaint.last_layout.line_number_width
-                        - LINE_NUMBER_RIGHT_MARGIN
-                        - FOLD_CHEVRON_WIDTH;
+                    let x = fold_chevron_x(
+                        input_bounds.origin.x,
+                        prepaint.last_layout.line_number_width,
+                    );
                     _ = chevron.line.paint(point(x, p.y), line_height, window, cx);
                 }
 

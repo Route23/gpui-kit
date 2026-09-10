@@ -91,6 +91,9 @@ actions!(
         ToggleCodeActions,
         Search,
         GoToDefinition,
+        ToggleFold,
+        FoldAll,
+        UnfoldAll,
     ]
 );
 
@@ -214,6 +217,19 @@ pub(crate) fn init(cx: &mut App) {
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
+        // `cmd-[` is Outdent, so folding takes the alt variants.
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-[", ToggleFold, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-[", ToggleFold, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-shift-[", FoldAll, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-shift-[", FoldAll, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-shift-]", UnfoldAll, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-shift-]", UnfoldAll, Some(CONTEXT)),
         KeyBinding::new("cmd-.", ToggleCodeActions, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-.", ToggleCodeActions, Some(CONTEXT)),
