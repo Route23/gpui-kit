@@ -2069,6 +2069,17 @@ impl EntityInputHandler for InputState {
         self.mode.update_auto_grow(&self.text_wrapper);
         self.history.start_grouping();
         self.push_history(&old_text, &range, new_text);
+        // The IME path mutates `self.text` just like `replace_text_in_range` does,
+        // so it has to report the change as well. Without this, an app that
+        // tracks its "unsaved" state through `InputEvent::Change` never sees the
+        // text typed while an IME is active -- and with a CJK IME switched on,
+        // even plain ASCII goes through here.
+        //
+        // The check is deliberately structural rather than `old_text != self.text`:
+        // comparing two ropes is O(n) and this runs on every keystroke.
+        if !range.is_empty() || !new_text.is_empty() {
+            cx.emit(InputEvent::Change);
+        }
         cx.notify();
     }
 
