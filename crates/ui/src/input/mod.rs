@@ -26,7 +26,7 @@ pub use indent::TabSize;
 pub use input::*;
 pub use lsp::*;
 pub use mask_pattern::MaskPattern;
-pub use mode::{LineNumbers, RenderWhitespace};
+pub use mode::{FoldingControls, LineNumbers, RenderWhitespace};
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};
 pub use otp_input::*;
 pub use state::*;

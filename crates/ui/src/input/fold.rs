@@ -336,10 +336,17 @@ impl TextElement {
             if !state.is_foldable(row) {
                 continue;
             }
+            let folded = state.is_folded(row);
+            if !state
+                .mode
+                .folding_controls()
+                .shows(row, folded, state.hovered_gutter_row)
+            {
+                continue;
+            }
 
             // **gpui has no `transform: rotate`** -- swapping the glyph is how
             // the "rotate the chevron by 90 degrees" affordance is expressed.
-            let folded = state.is_folded(row);
             let glyph: SharedString = if folded { "\u{203a}" } else { "\u{2304}" }.into();
             let line = window.text_system().shape_line(
                 glyph.clone(),
@@ -426,6 +433,45 @@ impl InputState {
         None
     }
 
+    /// Remember which gutter row the pointer is over, for
+    /// [`FoldingControls::MouseOver`].
+    ///
+    /// **Only notifies when the row actually changes** -- mouse-move fires
+    /// constantly, and redrawing on every one of them would be a frame tax for
+    /// nothing.
+    pub(super) fn track_fold_gutter_hover(
+        &mut self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.has_folding()
+            || self.mode.folding_controls() == crate::input::FoldingControls::Always
+        {
+            return;
+        }
+
+        let row = self
+            .in_fold_gutter(position)
+            .then(|| self.row_for_mouse_position(position))
+            .flatten();
+        if row != self.hovered_gutter_row {
+            self.hovered_gutter_row = row;
+            cx.notify();
+        }
+    }
+
+    /// Whether `position` is inside the chevron strip.
+    fn in_fold_gutter(&self, position: Point<Pixels>) -> bool {
+        let Some(last_layout) = self.last_layout.as_ref() else {
+            return false;
+        };
+        // **`input_bounds`, not `last_bounds`** -- the latter is shifted by the
+        // horizontal scroll offset, and the gutter does not scroll with it.
+        let right = self.input_bounds.origin.x + last_layout.line_number_width;
+        let left = right - crate::input::element::FOLD_CHEVRON_WIDTH;
+        position.x >= left && position.x < right
+    }
+
     /// Handle a click on the fold chevron strip.
     ///
     /// Returns true when the click was consumed, so the caller can return
@@ -439,16 +485,7 @@ impl InputState {
             return false;
         }
 
-        let Some(last_layout) = self.last_layout.as_ref() else {
-            return false;
-        };
-        // **`input_bounds`, not `last_bounds`** -- the latter is shifted by the
-        // horizontal scroll offset, and the gutter does not scroll with it.
-        let input_bounds = self.input_bounds;
-
-        let right = input_bounds.origin.x + last_layout.line_number_width;
-        let left = right - crate::input::element::FOLD_CHEVRON_WIDTH;
-        if event.position.x < left || event.position.x >= right {
+        if !self.in_fold_gutter(event.position) {
             return false;
         }
 

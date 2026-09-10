@@ -111,6 +111,32 @@ impl RenderWhitespace {
     }
 }
 
+/// When the fold chevrons in the gutter are visible.
+///
+/// Mirrors VS Code's `editor.showFoldingControls`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FoldingControls {
+    /// Always, on every foldable row.
+    #[default]
+    Always,
+    /// Only while the pointer is over the gutter.
+    ///
+    /// A row that is *already folded* keeps its chevron either way -- hiding it
+    /// would leave no way to open the fold again.
+    MouseOver,
+}
+
+impl FoldingControls {
+    /// Whether a chevron shows on `row`.
+    #[inline]
+    pub fn shows(&self, row: usize, folded: bool, hovered_row: Option<usize>) -> bool {
+        match self {
+            FoldingControls::Always => true,
+            FoldingControls::MouseOver => folded || hovered_row == Some(row),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum InputMode {
     /// A plain text input mode.
@@ -138,6 +164,8 @@ pub(crate) enum InputMode {
         render_whitespace: RenderWhitespace,
         /// Whether rows can be folded
         folding: bool,
+        /// When the fold chevrons are visible
+        folding_controls: FoldingControls,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -172,6 +200,7 @@ impl InputMode {
             indent_guides: true,
             render_whitespace: RenderWhitespace::default(),
             folding: true,
+            folding_controls: FoldingControls::default(),
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -332,6 +361,18 @@ impl InputMode {
         }
     }
 
+    /// Return the default when the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn folding_controls(&self) -> FoldingControls {
+        match self {
+            InputMode::CodeEditor {
+                folding_controls, ..
+            } => *folding_controls,
+            _ => FoldingControls::default(),
+        }
+    }
+
     pub(super) fn update_highlighter(
         &mut self,
         selected_range: &Range<usize>,
@@ -414,7 +455,7 @@ mod tests {
         highlighter::DiagnosticSet,
         input::{
             TabSize,
-            mode::{InputMode, LineNumbers, RenderWhitespace},
+            mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace},
         },
     };
 
@@ -427,6 +468,7 @@ mod tests {
         assert_eq!(mode.line_number(), true);
         assert_eq!(mode.has_indent_guides(), true);
         assert_eq!(mode.has_folding(), true);
+        assert_eq!(mode.folding_controls(), FoldingControls::Always);
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
 
@@ -436,6 +478,7 @@ mod tests {
             indent_guides: true,
             render_whitespace: RenderWhitespace::None,
             folding: true,
+            folding_controls: FoldingControls::default(),
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),
@@ -495,6 +538,24 @@ mod tests {
 
         mode.set_rows(10);
         assert_eq!(mode.rows(), 5);
+    }
+
+    #[test]
+    fn test_folding_controls() {
+        assert_eq!(FoldingControls::default(), FoldingControls::Always);
+
+        // Always: every foldable row, hovered or not.
+        assert!(FoldingControls::Always.shows(3, false, None));
+        assert!(FoldingControls::Always.shows(3, false, Some(9)));
+
+        // MouseOver: only the hovered row...
+        let m = FoldingControls::MouseOver;
+        assert!(!m.shows(3, false, None));
+        assert!(!m.shows(3, false, Some(9)));
+        assert!(m.shows(3, false, Some(3)));
+        // ...but a folded row always keeps its chevron, or there would be no
+        // way to open it again.
+        assert!(m.shows(3, true, None));
     }
 
     #[test]

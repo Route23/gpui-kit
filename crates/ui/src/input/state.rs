@@ -22,7 +22,7 @@ use super::{
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
-    mode::{InputMode, LineNumbers, RenderWhitespace},
+    mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace},
     number_input,
     text_wrapper::TextWrapper,
 };
@@ -302,6 +302,9 @@ pub struct InputState {
     /// the text every time, so a stale header can only fold the wrong block --
     /// never hide bytes with no way to reveal them.
     pub(super) folded_rows: Vec<usize>,
+    /// The row the pointer is over in the fold gutter, for
+    /// [`FoldingControls::MouseOver`].
+    pub(super) hovered_gutter_row: Option<usize>,
     pub(super) pattern: Option<regex::Regex>,
     pub(super) validate: Option<Box<dyn Fn(&str, &mut Context<Self>) -> bool + 'static>>,
     pub(crate) scroll_handle: ScrollHandle,
@@ -396,6 +399,7 @@ impl InputState {
             clean_on_escape: false,
             soft_wrap: true,
             folded_rows: Vec::new(),
+            hovered_gutter_row: None,
             loading: false,
             pattern: None,
             validate: None,
@@ -516,6 +520,39 @@ impl InputState {
     }
 
     /// Enable folding, only for [`InputMode::CodeEditor`] mode.
+    /// Set when the fold chevrons are visible, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn folding_controls(mut self, controls: FoldingControls) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            folding_controls: c,
+            ..
+        } = &mut self.mode
+        {
+            *c = controls;
+        }
+        self
+    }
+
+    /// Set when the fold chevrons are visible, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_folding_controls(
+        &mut self,
+        controls: FoldingControls,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            folding_controls: c,
+            ..
+        } = &mut self.mode
+        {
+            *c = controls;
+        }
+        cx.notify();
+    }
+
     pub fn set_folding(&mut self, folding: bool, _: &mut Window, cx: &mut Context<Self>) {
         debug_assert!(self.mode.is_code_editor());
         if let InputMode::CodeEditor { folding: f, .. } = &mut self.mode {
@@ -1343,6 +1380,8 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.track_fold_gutter_hover(event.position, cx);
+
         // Show diagnostic popover on mouse move
         let offset = self.index_for_mouse_position(event.position);
         self.handle_mouse_move(offset, event, window, cx);
