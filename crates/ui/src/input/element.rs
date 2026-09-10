@@ -492,14 +492,20 @@ impl TextElement {
             return (0..1, visible_top);
         }
 
-        let total_lines = state.text_wrapper.len();
+        // `visible_range` is a range of **buffer rows**, so it has to be seeded
+        // from the row count -- `TextWrapper::len()` is the *visual* line count,
+        // which is only ever >= the row count while soft wrap is the sole reason
+        // the two differ. Anything that makes a row occupy fewer visual lines
+        // than one (folding) would clamp the range short and stop laying out the
+        // tail of the document.
+        let total_rows = state.text_wrapper.lines.len();
         let scroll_top = if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
             deferred_scroll_offset.y
         } else {
             state.scroll_handle.offset().y
         };
 
-        let mut visible_range = 0..total_lines;
+        let mut visible_range = 0..total_rows;
         let mut line_bottom = px(0.);
         for (ix, line) in state.text_wrapper.lines.iter().enumerate() {
             let wrapped_height = line.height(line_height);
@@ -511,7 +517,7 @@ impl TextElement {
             }
 
             if line_bottom + scroll_top >= input_height {
-                visible_range.end = (ix + extra_rows).min(total_lines);
+                visible_range.end = (ix + extra_rows).min(total_rows);
                 break;
             }
         }
