@@ -10,6 +10,64 @@ use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
 use crate::input::{RopeExt as _, TabSize};
 
+/// How the line number gutter of a [`InputMode::CodeEditor`] is rendered.
+///
+/// Mirrors VS Code's `editor.lineNumbers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LineNumbers {
+    /// No gutter at all.
+    Off,
+    /// Absolute line numbers on every line.
+    #[default]
+    On,
+    /// Distance from the cursor's line; the cursor's own line shows its
+    /// absolute number (same as VS Code and vim's `relativenumber`).
+    Relative,
+    /// Only every n-th line, plus the cursor's line. VS Code uses 10.
+    Interval(usize),
+}
+
+impl From<bool> for LineNumbers {
+    fn from(on: bool) -> Self {
+        if on {
+            LineNumbers::On
+        } else {
+            LineNumbers::Off
+        }
+    }
+}
+
+impl LineNumbers {
+    /// Whether the gutter takes up any width.
+    #[inline]
+    pub fn is_visible(&self) -> bool {
+        !matches!(self, LineNumbers::Off)
+    }
+
+    /// The number to render on `row` (0-based), or `None` to leave it blank.
+    ///
+    /// `cursor_row` is the row the cursor is on, when the input has one.
+    pub fn number_for(&self, row: usize, cursor_row: Option<usize>) -> Option<usize> {
+        match self {
+            LineNumbers::Off => None,
+            LineNumbers::On => Some(row + 1),
+            LineNumbers::Relative => match cursor_row {
+                Some(cursor) if cursor == row => Some(row + 1),
+                Some(cursor) => Some(cursor.abs_diff(row)),
+                None => Some(row + 1),
+            },
+            LineNumbers::Interval(n) => {
+                let n = (*n).max(1);
+                if Some(row) == cursor_row || (row + 1) % n == 0 {
+                    Some(row + 1)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum InputMode {
     /// A plain text input mode.
@@ -29,8 +87,8 @@ pub(crate) enum InputMode {
         multi_line: bool,
         tab: TabSize,
         rows: usize,
-        /// Show line number
-        line_number: bool,
+        /// How the line number gutter is rendered
+        line_number: LineNumbers,
         language: SharedString,
         indent_guides: bool,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
@@ -63,7 +121,7 @@ impl InputMode {
             tab: TabSize::default(),
             language: language.into(),
             highlighter: Rc::new(RefCell::new(None)),
-            line_number: true,
+            line_number: LineNumbers::default(),
             indent_guides: true,
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
@@ -174,17 +232,26 @@ impl InputMode {
         }
     }
 
+    /// Whether the line number gutter is drawn.
+    ///
     /// Return false if the mode is not [`InputMode::CodeEditor`].
     #[allow(unused)]
     #[inline]
     pub(super) fn line_number(&self) -> bool {
+        self.line_numbers().is_visible()
+    }
+
+    /// Return [`LineNumbers::Off`] if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn line_numbers(&self) -> LineNumbers {
         match self {
             InputMode::CodeEditor {
                 line_number,
                 multi_line,
                 ..
-            } => *line_number && *multi_line,
-            _ => false,
+            } if *multi_line => *line_number,
+            _ => LineNumbers::Off,
         }
     }
 
@@ -268,7 +335,10 @@ mod tests {
 
     use crate::{
         highlighter::DiagnosticSet,
-        input::{TabSize, mode::InputMode},
+        input::{
+            TabSize,
+            mode::{InputMode, LineNumbers},
+        },
     };
 
     #[test]
@@ -284,7 +354,7 @@ mod tests {
 
         let mode = InputMode::CodeEditor {
             multi_line: false,
-            line_number: true,
+            line_number: LineNumbers::On,
             indent_guides: true,
             rows: 0,
             tab: Default::default(),
@@ -344,5 +414,37 @@ mod tests {
 
         mode.set_rows(10);
         assert_eq!(mode.rows(), 5);
+    }
+
+    #[test]
+    fn test_line_numbers() {
+        assert_eq!(LineNumbers::default(), LineNumbers::On);
+        assert_eq!(LineNumbers::from(true), LineNumbers::On);
+        assert_eq!(LineNumbers::from(false), LineNumbers::Off);
+
+        assert_eq!(LineNumbers::Off.is_visible(), false);
+        assert_eq!(LineNumbers::On.is_visible(), true);
+        assert_eq!(LineNumbers::Relative.is_visible(), true);
+        assert_eq!(LineNumbers::Interval(10).is_visible(), true);
+
+        assert_eq!(LineNumbers::Off.number_for(0, Some(0)), None);
+        assert_eq!(LineNumbers::On.number_for(0, Some(3)), Some(1));
+        assert_eq!(LineNumbers::On.number_for(41, None), Some(42));
+
+        // Relative counts the distance, but the cursor's own row is absolute.
+        assert_eq!(LineNumbers::Relative.number_for(3, Some(3)), Some(4));
+        assert_eq!(LineNumbers::Relative.number_for(0, Some(3)), Some(3));
+        assert_eq!(LineNumbers::Relative.number_for(5, Some(3)), Some(2));
+        // No cursor -> absolute, so the gutter is never blank.
+        assert_eq!(LineNumbers::Relative.number_for(5, None), Some(6));
+
+        // Interval shows every n-th line plus the cursor's line.
+        let every10 = LineNumbers::Interval(10);
+        assert_eq!(every10.number_for(0, Some(3)), None);
+        assert_eq!(every10.number_for(3, Some(3)), Some(4));
+        assert_eq!(every10.number_for(9, Some(3)), Some(10));
+        assert_eq!(every10.number_for(19, None), Some(20));
+        // 0 would divide by zero; clamp to 1 (= every line).
+        assert_eq!(LineNumbers::Interval(0).number_for(4, None), Some(5));
     }
 }

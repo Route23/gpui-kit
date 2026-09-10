@@ -18,8 +18,13 @@ use sum_tree::Bias;
 use unicode_segmentation::*;
 
 use super::{
-    blink_cursor::BlinkCursor, change::Change, element::TextElement, mask_pattern::MaskPattern,
-    mode::InputMode, number_input, text_wrapper::TextWrapper,
+    blink_cursor::BlinkCursor,
+    change::Change,
+    element::TextElement,
+    mask_pattern::MaskPattern,
+    mode::{InputMode, LineNumbers},
+    number_input,
+    text_wrapper::TextWrapper,
 };
 use crate::Size;
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
@@ -469,20 +474,27 @@ impl InputState {
         self
     }
 
-    /// Set enable/disable line number, only for [`InputMode::CodeEditor`] mode.
-    pub fn line_number(mut self, line_number: bool) -> Self {
+    /// Set the line number gutter, only for [`InputMode::CodeEditor`] mode.
+    ///
+    /// Takes a [`LineNumbers`], or a `bool` for the on/off case.
+    pub fn line_number(mut self, line_number: impl Into<LineNumbers>) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {
-            *l = line_number;
+            *l = line_number.into();
         }
         self
     }
 
-    /// Set line number, only for [`InputMode::CodeEditor`] mode.
-    pub fn set_line_number(&mut self, line_number: bool, _: &mut Window, cx: &mut Context<Self>) {
+    /// Set the line number gutter, only for [`InputMode::CodeEditor`] mode.
+    pub fn set_line_number(
+        &mut self,
+        line_number: impl Into<LineNumbers>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {
-            *l = line_number;
+            *l = line_number.into();
         }
         cx.notify();
     }

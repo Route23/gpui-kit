@@ -1169,7 +1169,8 @@ impl Element for TextElement {
             self.layout_document_colors(&document_colors, &last_layout, &bounds);
 
         let state = self.state.read(cx);
-        let line_numbers = if state.mode.line_number() {
+        let line_numbers_mode = state.mode.line_numbers();
+        let line_numbers = if line_numbers_mode.is_visible() {
             let mut line_numbers = vec![];
             let other_line_runs = vec![TextRun {
                 len: line_number_len,
@@ -1191,7 +1192,14 @@ impl Element for TextElement {
             // build line numbers
             for (ix, line) in last_layout.lines.iter().enumerate() {
                 let ix = last_layout.visible_range.start + ix;
-                let line_no = format!("{:>width$}", ix + 1, width = line_number_len).into();
+                // `Relative` / `Interval` do not simply count up, and may leave a
+                // row blank. Pad to `line_number_len` either way so the shaped
+                // line keeps matching the `TextRun` length below.
+                let line_no: SharedString = match line_numbers_mode.number_for(ix, current_row) {
+                    Some(no) => format!("{:>width$}", no, width = line_number_len),
+                    None => " ".repeat(line_number_len),
+                }
+                .into();
 
                 let runs = if current_row == Some(ix) {
                     &current_line_runs
