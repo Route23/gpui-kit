@@ -18,6 +18,18 @@ use super::{InputState, LastLayout, mode::InputMode};
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
+/// The strip between the line numbers and the text that holds fold chevrons.
+pub(super) const FOLD_CHEVRON_WIDTH: Pixels = px(14.);
+
+/// The width the fold chevrons take out of the gutter, 0 when folding is off.
+pub(super) fn fold_chevron_width(state: &InputState) -> Pixels {
+    if state.mode.has_folding() {
+        FOLD_CHEVRON_WIDTH
+    } else {
+        px(0.)
+    }
+}
+
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
 
 pub(super) struct TextElement {
@@ -556,9 +568,9 @@ impl TextElement {
                 None,
             );
 
-            empty_line_number.width + px(6.) + LINE_NUMBER_RIGHT_MARGIN
+            empty_line_number.width + px(6.) + LINE_NUMBER_RIGHT_MARGIN + fold_chevron_width(state)
         } else {
-            px(0.)
+            fold_chevron_width(state)
         };
 
         (line_number_width, line_number_len)
@@ -825,6 +837,12 @@ pub(super) struct PrepaintState {
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
     whitespaces: Vec<crate::input::whitespace::PlacedMark>,
+    fold_chevrons: Vec<crate::input::fold::FoldChevron>,
+    /// The chevron strip, so the cursor turns into a hand over it.
+    fold_gutter_hitbox: Option<Hitbox>,
+    /// The `…` badge drawn after a folded header, keyed by index into
+    /// `LastLayout::lines`.
+    fold_markers: Vec<(usize, ShapedLine)>,
     bounds: Bounds<Pixels>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
@@ -1250,6 +1268,20 @@ impl Element for TextElement {
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
         let whitespaces = self.layout_whitespaces(state, &bounds, &last_layout);
+        let fold_chevrons =
+            self.layout_fold_chevrons(state, &last_layout, text_size, &text_style, window, cx);
+        let fold_gutter_hitbox = (state.mode.has_folding() && !fold_chevrons.is_empty()).then(|| {
+            let right = state.input_bounds.origin.x + last_layout.line_number_width;
+            window.insert_hitbox(
+                Bounds::new(
+                    point(right - FOLD_CHEVRON_WIDTH, state.input_bounds.origin.y),
+                    size(FOLD_CHEVRON_WIDTH, state.input_bounds.size.height),
+                ),
+                gpui::HitboxBehavior::Normal,
+            )
+        });
+        let fold_markers =
+            self.layout_fold_markers(state, &last_layout, text_size, &text_style, window, cx);
 
         PrepaintState {
             bounds,
@@ -1266,6 +1298,9 @@ impl Element for TextElement {
             document_color_paths,
             indent_guides_path,
             whitespaces,
+            fold_chevrons,
+            fold_gutter_hitbox,
+            fold_markers,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -1407,6 +1442,19 @@ impl Element for TextElement {
 
             // Paint the actual line
             _ = line.paint(p, line_height, window, cx);
+
+            // `…` after a folded header, on its **last** wrapped line -- not at
+            // `longest_width`, which would float mid-paragraph when the header
+            // itself wraps.
+            if let Some((_, marker)) = prepaint.fold_markers.iter().find(|(mix, _)| *mix == ix) {
+                let last = line.wrapped_lines.last();
+                let marker_p = point(
+                    p.x + last.map(|l| l.width).unwrap_or(px(0.)) + px(4.),
+                    p.y + line_height * (line.wrapped_lines.len().saturating_sub(1)) as f32,
+                );
+                _ = marker.paint(marker_p, line_height, window, cx);
+            }
+
             offset_y += line.size(line_height).height;
 
             // After the cursor row, paint ghost lines (which shifts subsequent content down)
@@ -1477,6 +1525,13 @@ impl Element for TextElement {
                     }
                 }
 
+                if let Some(chevron) = prepaint.fold_chevrons.iter().find(|c| c.ix == ix) {
+                    let x = input_bounds.origin.x + prepaint.last_layout.line_number_width
+                        - LINE_NUMBER_RIGHT_MARGIN
+                        - FOLD_CHEVRON_WIDTH;
+                    _ = chevron.line.paint(point(x, p.y), line_height, window, cx);
+                }
+
                 for line in lines {
                     _ = line.paint(p, line_height, window, cx);
                     offset_y += line_height;
@@ -1504,6 +1559,10 @@ impl Element for TextElement {
 
         if let Some(hitbox) = prepaint.hover_definition_hitbox.as_ref() {
             window.set_cursor_style(gpui::CursorStyle::PointingHand, &hitbox);
+        }
+
+        if let Some(hitbox) = prepaint.fold_gutter_hitbox.as_ref() {
+            window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
         }
 
         // Paint inline completion first line suffix (after cursor on same line)

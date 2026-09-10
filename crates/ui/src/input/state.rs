@@ -1280,6 +1280,13 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The fold gutter is checked **first**: before `selecting` is set and
+        // before the caret is moved, so clicking a chevron neither jumps the
+        // caret nor starts a drag-selection.
+        if self.handle_fold_gutter_click(event, cx) {
+            return;
+        }
+
         // Clear inline completion on any mouse interaction
         self.clear_inline_completion(cx);
 

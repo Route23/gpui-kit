@@ -12,11 +12,14 @@ use std::ops::{Range, RangeInclusive};
 
 use ropey::Rope;
 
-use gpui::Context;
+use gpui::{
+    App, Context, MouseButton, MouseDownEvent, Pixels, Point, ShapedLine, SharedString, TextRun,
+    TextStyle, Window, px,
+};
 
 use crate::{
-    RopeExt as _,
-    input::{InputState, TabSize},
+    ActiveTheme as _, RopeExt as _,
+    input::{InputState, LastLayout, TabSize, element::TextElement},
 };
 
 /// Whether a line is blank (only whitespace, including a lone `\r`).
@@ -302,6 +305,165 @@ impl InputState {
                 }
             }
         }
+    }
+}
+
+/// A chevron placed in the gutter, ready to paint.
+pub(super) struct FoldChevron {
+    /// Index into `LastLayout::lines`, so paint can reuse the y it already
+    /// accumulates for the line numbers.
+    pub(super) ix: usize,
+    pub(super) line: ShapedLine,
+}
+
+impl TextElement {
+    /// Shape a chevron for every visible row that heads a fold.
+    pub(super) fn layout_fold_chevrons(
+        &self,
+        state: &InputState,
+        last_layout: &LastLayout,
+        text_size: Pixels,
+        style: &TextStyle,
+        window: &mut Window,
+        cx: &App,
+    ) -> Vec<FoldChevron> {
+        if !state.mode.has_folding() {
+            return vec![];
+        }
+
+        let mut chevrons = vec![];
+        for (ix, row) in last_layout.visible_range.clone().enumerate() {
+            if !state.is_foldable(row) {
+                continue;
+            }
+
+            // **gpui has no `transform: rotate`** -- swapping the glyph is how
+            // the "rotate the chevron by 90 degrees" affordance is expressed.
+            let folded = state.is_folded(row);
+            let glyph: SharedString = if folded { "\u{203a}" } else { "\u{2304}" }.into();
+            let line = window.text_system().shape_line(
+                glyph.clone(),
+                text_size,
+                &[TextRun {
+                    len: glyph.len(),
+                    font: style.font(),
+                    color: cx.theme().muted_foreground,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            chevrons.push(FoldChevron { ix, line });
+        }
+
+        chevrons
+    }
+}
+
+impl TextElement {
+    /// Shape a `…` badge for every folded header that is on screen.
+    pub(super) fn layout_fold_markers(
+        &self,
+        state: &InputState,
+        last_layout: &LastLayout,
+        text_size: Pixels,
+        style: &TextStyle,
+        window: &mut Window,
+        cx: &App,
+    ) -> Vec<(usize, ShapedLine)> {
+        if !state.mode.has_folding() || state.folded_rows.is_empty() {
+            return vec![];
+        }
+
+        let glyph: SharedString = "\u{22ef}".into();
+        let mut markers = vec![];
+        for (ix, row) in last_layout.visible_range.clone().enumerate() {
+            if !state.is_folded(row) {
+                continue;
+            }
+            let line = window.text_system().shape_line(
+                glyph.clone(),
+                text_size,
+                &[TextRun {
+                    len: glyph.len(),
+                    font: style.font(),
+                    color: cx.theme().muted_foreground,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            markers.push((ix, line));
+        }
+
+        markers
+    }
+}
+
+impl InputState {
+    /// The buffer row under `position`, or `None` when it is past the text.
+    ///
+    /// Deliberately a separate y-walk from `index_for_mouse_position`: this
+    /// runs on gutter clicks only, and keeping it out of that hot path is worth
+    /// twenty lines.
+    pub(super) fn row_for_mouse_position(&self, position: Point<Pixels>) -> Option<usize> {
+        let last_layout = self.last_layout.as_ref()?;
+        let bounds = self.last_bounds?;
+        let line_height = last_layout.line_height;
+
+        let mut y = bounds.origin.y + last_layout.visible_top;
+        for row in last_layout.visible_range.clone() {
+            let line = self.text_wrapper.lines.get(row)?;
+            let height = line.height(line_height);
+            if height > px(0.) && position.y >= y && position.y < y + height {
+                return Some(row);
+            }
+            y += height;
+        }
+
+        None
+    }
+
+    /// Handle a click on the fold chevron strip.
+    ///
+    /// Returns true when the click was consumed, so the caller can return
+    /// before moving the caret or starting a drag-selection.
+    pub(super) fn handle_fold_gutter_click(
+        &mut self,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.mode.has_folding() || event.button != MouseButton::Left {
+            return false;
+        }
+
+        let Some(last_layout) = self.last_layout.as_ref() else {
+            return false;
+        };
+        // **`input_bounds`, not `last_bounds`** -- the latter is shifted by the
+        // horizontal scroll offset, and the gutter does not scroll with it.
+        let input_bounds = self.input_bounds;
+
+        let right = input_bounds.origin.x + last_layout.line_number_width;
+        let left = right - crate::input::element::FOLD_CHEVRON_WIDTH;
+        if event.position.x < left || event.position.x >= right {
+            return false;
+        }
+
+        let Some(row) = self.row_for_mouse_position(event.position) else {
+            return false;
+        };
+        if !self.is_foldable(row) {
+            // Still inside the strip: swallow it so the caret does not jump to
+            // the start of the line the user was aiming a chevron at.
+            return true;
+        }
+
+        self.toggle_fold(row, cx);
+        cx.stop_propagation();
+        true
     }
 }
 
