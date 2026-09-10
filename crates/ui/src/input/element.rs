@@ -705,6 +705,15 @@ impl TextElement {
 
             debug_assert_eq!(line_item.len(), line.len());
 
+            // A row hidden by a fold is still emitted, so `visible_range.start
+            // + ix == row` keeps holding for every consumer -- it just has no
+            // visual lines. See `LineLayout::folded`.
+            if line_item.hidden {
+                lines.push(LineLayout::folded(line.len()));
+                offset += line.len() + 1;
+                continue;
+            }
+
             let mut line_layout = LineLayout::new();
             let mut wrapped_lines = SmallVec::with_capacity(1);
 
@@ -1199,6 +1208,13 @@ impl Element for TextElement {
             // build line numbers
             for (ix, line) in last_layout.lines.iter().enumerate() {
                 let ix = last_layout.visible_range.start + ix;
+                // Folded away: no number, but still an entry so the index keeps
+                // matching the row. (An empty *buffer* line still has one
+                // wrapped line, so this only ever means "hidden".)
+                if line.wrapped_lines.is_empty() {
+                    line_numbers.push(SmallVec::new());
+                    continue;
+                }
                 // `Relative` / `Interval` do not simply count up, and may leave a
                 // row blank. Pad to `line_number_len` either way so the shaped
                 // line keeps matching the `TextRun` length below.

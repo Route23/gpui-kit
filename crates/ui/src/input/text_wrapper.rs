@@ -15,6 +15,11 @@ pub(super) struct LineItem {
     ///
     /// Not contains the line end `\n`.
     pub(super) wrapped_lines: Vec<Range<usize>>,
+    /// Hidden by a fold.
+    ///
+    /// The wrap info is kept, so unfolding needs no re-wrap (which would need
+    /// the text system, and therefore a `Window`).
+    pub(super) hidden: bool,
 }
 
 impl LineItem {
@@ -25,8 +30,14 @@ impl LineItem {
     }
 
     /// Get number of soft wrapped lines of this line (include the first line).
+    ///
+    /// A row hidden by a fold occupies **no** visual lines, which is what makes
+    /// every height-accumulating loop skip it for free.
     #[inline]
     pub(super) fn lines_len(&self) -> usize {
+        if self.hidden {
+            return 0;
+        }
         self.wrapped_lines.len()
     }
 
@@ -59,6 +70,13 @@ pub(super) struct TextWrapper {
     pub(super) longest_row: LongestRow,
     /// The lines by split \n
     pub(super) lines: Vec<LineItem>,
+    /// Rows hidden by folding.
+    ///
+    /// Kept here (rather than only as flags on the lines) because `_update`
+    /// splices `lines` and `update_all` rebuilds it outright -- `set_wrap_width`
+    /// and `set_font` both go through the latter, and would otherwise drop
+    /// every flag mid-frame.
+    hidden_rows: Vec<usize>,
 
     _initialized: bool,
 }
@@ -74,6 +92,7 @@ impl TextWrapper {
             soft_lines: 0,
             longest_row: LongestRow::default(),
             lines: Vec::new(),
+            hidden_rows: Vec::new(),
             _initialized: false,
         }
     }
@@ -93,6 +112,28 @@ impl TextWrapper {
     #[inline]
     pub(super) fn line(&self, row: usize) -> Option<&LineItem> {
         self.lines.iter().skip(row).next()
+    }
+
+    /// Replace the set of rows hidden by folding.
+    ///
+    /// Clear-then-set, never incremental: `_update` splices `lines` and keeps
+    /// the flags of the rows it did not touch, so a row shift would otherwise
+    /// leave stale flags behind.
+    pub(super) fn set_hidden_rows(&mut self, rows: Vec<usize>) {
+        self.hidden_rows = rows;
+        self.apply_hidden_rows();
+    }
+
+    fn apply_hidden_rows(&mut self) {
+        for line in self.lines.iter_mut() {
+            line.hidden = false;
+        }
+        for &row in &self.hidden_rows {
+            if let Some(line) = self.lines.get_mut(row) {
+                line.hidden = true;
+            }
+        }
+        self.soft_lines = self.lines.iter().map(|l| l.lines_len()).sum();
     }
 
     pub(super) fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
@@ -219,6 +260,7 @@ impl TextWrapper {
             new_lines.push(LineItem {
                 line: Rope::from(line),
                 wrapped_lines,
+                hidden: false,
             });
         }
 
@@ -229,7 +271,7 @@ impl TextWrapper {
         }
 
         self.text = changed_text.clone();
-        self.soft_lines = self.lines.iter().map(|l| l.lines_len()).sum();
+        self.apply_hidden_rows();
         self.longest_row = LongestRow {
             row: longest_row_ix,
             len: longest_row_len,
@@ -345,6 +387,21 @@ pub(crate) struct LineLayout {
 }
 
 impl LineLayout {
+    /// A layout for a row hidden by a fold: no visual lines (so it takes no
+    /// height and reports no positions), but an **honest byte length**.
+    ///
+    /// The length matters more than it looks: every offset-walking loop steps
+    /// through the visible rows with `prev_lines_offset += line.len() + 1`, so a
+    /// folded row reporting 0 would put a gap in the byte stream and misplace
+    /// every click, selection and IME rect below the fold.
+    pub(crate) fn folded(len: usize) -> Self {
+        Self {
+            len,
+            longest_width: px(0.),
+            wrapped_lines: SmallVec::new(),
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             len: 0,
@@ -700,6 +757,82 @@ mod tests {
     }
 
     #[test]
+    fn test_hidden_rows() {
+        fn fake_wrap_line(_line: &str, _wrap_width: Pixels) -> Vec<Boundary> {
+            vec![]
+        }
+
+        let font = gpui::Font {
+            family: "Arial".into(),
+            weight: FontWeight::default(),
+            style: FontStyle::Normal,
+            features: FontFeatures::default(),
+            fallbacks: None,
+        };
+        let mut wrapper = TextWrapper::new(font, px(14.), None);
+        let text = Rope::from("a\nb\nc\nd\n");
+        wrapper._update(&text, &(0..text.len()), &text, &mut fake_wrap_line);
+        assert_eq!(wrapper.len(), 5, "4 lines plus the row after the last \\n");
+
+        // Hiding rows 1 and 2 drops them from the visual line count and from
+        // their own height, without touching the rows around them.
+        wrapper.set_hidden_rows(vec![1, 2]);
+        assert_eq!(wrapper.len(), 3);
+        assert_eq!(wrapper.lines[0].height(px(20.)), px(20.));
+        assert_eq!(wrapper.lines[1].height(px(20.)), px(0.));
+        assert_eq!(wrapper.lines[2].height(px(20.)), px(0.));
+        assert_eq!(wrapper.lines[3].height(px(20.)), px(20.));
+        // The wrap info survives, so unfolding needs no re-wrap.
+        assert_eq!(wrapper.lines[1].wrapped_lines, vec![0..1]);
+
+        // **Vertical cursor movement rides on this**: a display point never
+        // lands on a hidden row, so `move_vertical` steps over a fold with no
+        // code of its own.
+        let d_offset = text.line_start_offset(3);
+        let after_a = wrapper.offset_to_display_point(text.line_start_offset(0));
+        let mut next = after_a;
+        next.row += 1;
+        assert_eq!(
+            wrapper.display_point_to_offset(next),
+            d_offset,
+            "one row down from `a` is `d`, skipping the folded `b` and `c`"
+        );
+
+        // Clearing brings them back.
+        wrapper.set_hidden_rows(vec![]);
+        assert_eq!(wrapper.len(), 5);
+        assert_eq!(wrapper.lines[1].height(px(20.)), px(20.));
+    }
+
+    #[test]
+    fn test_hidden_rows_survive_an_edit() {
+        fn fake_wrap_line(_line: &str, _wrap_width: Pixels) -> Vec<Boundary> {
+            vec![]
+        }
+
+        let font = gpui::Font {
+            family: "Arial".into(),
+            weight: FontWeight::default(),
+            style: FontStyle::Normal,
+            features: FontFeatures::default(),
+            fallbacks: None,
+        };
+        let mut wrapper = TextWrapper::new(font, px(14.), None);
+        let mut text = Rope::from("a\nb\nc\nd\n");
+        wrapper._update(&text, &(0..text.len()), &text, &mut fake_wrap_line);
+        wrapper.set_hidden_rows(vec![2]);
+        assert_eq!(wrapper.len(), 4);
+
+        // `_update` splices `lines`; the flags have to be re-applied or the
+        // spliced-in rows come back with stale ones.
+        let range = 0..1;
+        text.replace(range.clone(), "AA");
+        wrapper._update(&text, &range, &Rope::from("AA"), &mut fake_wrap_line);
+        assert_eq!(wrapper.len(), 4, "row 2 is still hidden after the edit");
+        assert_eq!(wrapper.lines[2].height(px(20.)), px(0.));
+    }
+
+    #[test]
     fn test_line_layout() {
         let mut line_layout = LineLayout::new();
 
@@ -730,21 +863,25 @@ mod tests {
             LineItem {
                 line: Rope::from("Hello, 世界!\r"),
                 wrapped_lines: vec![0..15],
+                hidden: false,
             },
             // range: 16..36
             LineItem {
                 line: Rope::from("This is second line."),
                 wrapped_lines: vec![0..10, 10..20],
+                hidden: false,
             },
             // range: 37..56
             LineItem {
                 line: Rope::from("This is third line."),
                 wrapped_lines: vec![0..9, 9..15, 15..20],
+                hidden: false,
             },
             // range: 57..79
             LineItem {
                 line: Rope::from("这里是第 4 行。"),
                 wrapped_lines: vec![0..22],
+                hidden: false,
             },
         ];
 

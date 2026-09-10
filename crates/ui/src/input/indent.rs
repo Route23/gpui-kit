@@ -133,6 +133,11 @@ impl TextElement {
             let Some(line_layout) = last_layout.line(ix) else {
                 continue;
             };
+            // Hidden by a fold: no height, and no guide of its own -- the rows
+            // inside a fold should not shape the guides drawn below it.
+            if line_layout.wrapped_lines.is_empty() {
+                continue;
+            }
 
             let mut current_indents = vec![];
             if line.len() > 0 {
