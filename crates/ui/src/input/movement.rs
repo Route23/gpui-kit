@@ -46,6 +46,18 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let offset = offset.clamp(0, self.text.len());
+        // The caret must never come to rest inside a folded region. This is the
+        // choke point for movement, mouse and `set_cursor_position`; vertical
+        // movement is already safe because a display point never lands on a
+        // row with no visual lines.
+        let offset = self.snap_out_of_fold(
+            offset,
+            match direction {
+                Some(MoveDirection::Up) => crate::input::fold::SnapDirection::Up,
+                Some(MoveDirection::Down) => crate::input::fold::SnapDirection::Down,
+                None => crate::input::fold::SnapDirection::Nearest,
+            },
+        );
         self.selected_range = (offset..offset).into();
         self.scroll_to(offset, direction, cx);
         self.pause_blink_cursor(cx);

@@ -136,6 +136,8 @@ pub(crate) enum InputMode {
         indent_guides: bool,
         /// Which whitespace characters are drawn as visible marks
         render_whitespace: RenderWhitespace,
+        /// Whether rows can be folded
+        folding: bool,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -169,6 +171,7 @@ impl InputMode {
             line_number: LineNumbers::default(),
             indent_guides: true,
             render_whitespace: RenderWhitespace::default(),
+            folding: true,
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -315,6 +318,20 @@ impl InputMode {
         }
     }
 
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn has_folding(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                folding,
+                multi_line,
+                ..
+            } => *folding && *multi_line,
+            _ => false,
+        }
+    }
+
     pub(super) fn update_highlighter(
         &mut self,
         selected_range: &Range<usize>,
@@ -409,6 +426,7 @@ mod tests {
         assert_eq!(mode.is_single_line(), false);
         assert_eq!(mode.line_number(), true);
         assert_eq!(mode.has_indent_guides(), true);
+        assert_eq!(mode.has_folding(), true);
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
 
@@ -417,6 +435,7 @@ mod tests {
             line_number: LineNumbers::On,
             indent_guides: true,
             render_whitespace: RenderWhitespace::None,
+            folding: true,
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),
@@ -428,6 +447,7 @@ mod tests {
         assert_eq!(mode.is_single_line(), true);
         assert_eq!(mode.line_number(), false);
         assert_eq!(mode.has_indent_guides(), false);
+        assert_eq!(mode.has_folding(), false, "single line never folds");
         assert_eq!(mode.max_rows(), 1);
         assert_eq!(mode.min_rows(), 1);
     }

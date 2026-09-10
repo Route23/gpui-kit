@@ -12,7 +12,12 @@ use std::ops::{Range, RangeInclusive};
 
 use ropey::Rope;
 
-use crate::{RopeExt as _, input::TabSize};
+use gpui::Context;
+
+use crate::{
+    RopeExt as _,
+    input::{InputState, TabSize},
+};
 
 /// Whether a line is blank (only whitespace, including a lone `\r`).
 fn is_blank(line: &str) -> bool {
@@ -128,6 +133,176 @@ pub(super) fn adjust_folded_rows(
             }
         }
     });
+}
+
+/// Where a caret pushed into a hidden row should come to rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapDirection {
+    /// To the end of the fold's header row.
+    Up,
+    /// To the start of the first row after the fold.
+    Down,
+    /// Whichever edge is nearer.
+    Nearest,
+}
+
+impl InputState {
+    /// Whether `row` is currently folded.
+    pub fn is_folded(&self, row: usize) -> bool {
+        self.folded_rows.contains(&row)
+    }
+
+    /// Whether `row` heads a fold, folded or not.
+    pub(super) fn is_foldable(&self, row: usize) -> bool {
+        self.mode.has_folding() && is_foldable(&self.text, row, self.mode.tab_size())
+    }
+
+    /// Fold or unfold the region headed by `row`.
+    ///
+    /// Does nothing when `row` heads no fold.
+    pub fn toggle_fold(&mut self, row: usize, cx: &mut Context<Self>) {
+        if !self.mode.has_folding() {
+            return;
+        }
+
+        if let Some(ix) = self.folded_rows.iter().position(|&r| r == row) {
+            self.folded_rows.remove(ix);
+        } else {
+            let Some(hidden) = fold_range(&self.text, row, self.mode.tab_size()) else {
+                return;
+            };
+            // Never leave the caret inside a region the user cannot see.
+            let bytes = self.text.line_start_offset(hidden.start)
+                ..self.text.line_end_offset(hidden.end.saturating_sub(1));
+            let selected: Range<usize> = self.selected_range.into();
+            if selected.start < bytes.end && selected.end > bytes.start {
+                let anchor = self.text.line_end_offset(row);
+                self.selected_range = (anchor..anchor).into();
+                self.preferred_column = None;
+            }
+            self.folded_rows.push(row);
+            self.folded_rows.sort_unstable();
+        }
+
+        self.update_folds();
+        cx.notify();
+    }
+
+    /// Fold every foldable row that is not already inside another fold.
+    pub fn fold_all(&mut self, cx: &mut Context<Self>) {
+        if !self.mode.has_folding() {
+            return;
+        }
+
+        let tab = self.mode.tab_size();
+        let mut headers: Vec<usize> = vec![];
+        let mut row = 0;
+        while row < self.text.lines_len() {
+            if let Some(range) = fold_range(&self.text, row, tab) {
+                headers.push(row);
+                // Skip the body: the outermost fold already hides it.
+                row = range.end;
+            } else {
+                row += 1;
+            }
+        }
+
+        self.folded_rows = headers;
+        let cursor = self.cursor();
+        self.update_folds();
+        // The caret may now be inside a fold; pull it to the nearest edge.
+        let snapped = self.snap_out_of_fold(cursor, SnapDirection::Nearest);
+        if snapped != cursor {
+            self.selected_range = (snapped..snapped).into();
+            self.preferred_column = None;
+        }
+        cx.notify();
+    }
+
+    /// Unfold everything.
+    pub fn unfold_all(&mut self, cx: &mut Context<Self>) {
+        if self.folded_rows.is_empty() {
+            return;
+        }
+        self.folded_rows.clear();
+        self.update_folds();
+        cx.notify();
+    }
+
+    /// Recompute which rows are hidden, dropping headers that no longer fold.
+    ///
+    /// The hidden set is **always derived from the current text**, so the worst
+    /// a stale header can do is fold the wrong block -- never hide bytes the
+    /// user has no way to reveal.
+    pub(super) fn update_folds(&mut self) {
+        if !self.mode.has_folding() {
+            self.folded_rows.clear();
+        }
+
+        let tab = self.mode.tab_size();
+        let text = self.text.clone();
+        self.folded_rows.retain(|&row| is_foldable(&text, row, tab));
+        let rows = hidden_rows(&text, &self.folded_rows, tab);
+        self.text_wrapper.set_hidden_rows(rows);
+    }
+
+    /// Keep the fold headers pointing at the same blocks across an edit.
+    pub(super) fn shift_folds_for_edit(&mut self, old_text: &Rope, edited: &Range<usize>) {
+        if self.folded_rows.is_empty() {
+            return;
+        }
+
+        let start_row = old_text.offset_to_point(edited.start.min(old_text.len())).row;
+        let end_row = old_text.offset_to_point(edited.end.min(old_text.len())).row;
+        let delta = self.text.lines_len() as isize - old_text.lines_len() as isize;
+        adjust_folded_rows(&mut self.folded_rows, start_row..=end_row, delta);
+    }
+
+    /// Push an offset that landed on a hidden row out to a visible one.
+    ///
+    /// Selections are allowed to span a fold -- this only stops the caret from
+    /// *resting* inside one.
+    pub(super) fn snap_out_of_fold(&self, offset: usize, direction: SnapDirection) -> usize {
+        if self.folded_rows.is_empty() {
+            return offset;
+        }
+
+        let row = self.text.offset_to_point(offset.min(self.text.len())).row;
+        let tab = self.mode.tab_size();
+        // The innermost fold that hides this row.
+        let enclosing = self
+            .folded_rows
+            .iter()
+            .filter_map(|&header| {
+                fold_range(&self.text, header, tab)
+                    .filter(|range| range.contains(&row))
+                    .map(|range| (header, range))
+            })
+            .max_by_key(|(header, _)| *header);
+
+        let Some((header, range)) = enclosing else {
+            return offset;
+        };
+
+        let up = self.text.line_end_offset(header);
+        let down = if range.end < self.text.lines_len() {
+            self.text.line_start_offset(range.end)
+        } else {
+            self.text.len()
+        };
+
+        match direction {
+            SnapDirection::Up => up,
+            SnapDirection::Down => down,
+            SnapDirection::Nearest => {
+                if offset.abs_diff(up) <= offset.abs_diff(down) {
+                    up
+                } else {
+                    down
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

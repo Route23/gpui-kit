@@ -296,6 +296,12 @@ pub struct InputState {
     pub(super) masked: bool,
     pub(super) clean_on_escape: bool,
     pub(super) soft_wrap: bool,
+    /// Rows that head a folded region, sorted.
+    ///
+    /// Only the **headers** are stored; which rows they hide is recomputed from
+    /// the text every time, so a stale header can only fold the wrong block --
+    /// never hide bytes with no way to reveal them.
+    pub(super) folded_rows: Vec<usize>,
     pub(super) pattern: Option<regex::Regex>,
     pub(super) validate: Option<Box<dyn Fn(&str, &mut Context<Self>) -> bool + 'static>>,
     pub(crate) scroll_handle: ScrollHandle,
@@ -389,6 +395,7 @@ impl InputState {
             masked: false,
             clean_on_escape: false,
             soft_wrap: true,
+            folded_rows: Vec::new(),
             loading: false,
             pattern: None,
             validate: None,
@@ -496,6 +503,25 @@ impl InputState {
         if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {
             *l = line_number.into();
         }
+        cx.notify();
+    }
+
+    /// Enable folding, only for [`InputMode::CodeEditor`] mode.
+    pub fn folding(mut self, folding: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { folding: f, .. } = &mut self.mode {
+            *f = folding;
+        }
+        self
+    }
+
+    /// Enable folding, only for [`InputMode::CodeEditor`] mode.
+    pub fn set_folding(&mut self, folding: bool, _: &mut Window, cx: &mut Context<Self>) {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor { folding: f, .. } = &mut self.mode {
+            *f = folding;
+        }
+        self.update_folds();
         cx.notify();
     }
 
@@ -826,6 +852,9 @@ impl InputState {
             diagnostics.reset(&self.text)
         }
         self.text_wrapper.set_default_text(&self.text);
+        // A new document: the old headers mean nothing.
+        self.folded_rows.clear();
+        self.update_folds();
         self._pending_update = true;
         self
     }
@@ -2042,6 +2071,11 @@ impl EntityInputHandler for InputState {
         }
         self.text_wrapper
             .update(&self.text, &range, &Rope::from(new_text), cx);
+        // Folds are shifted, not dropped -- losing them on every keystroke
+        // would be worse than not having the feature. `update_folds` then drops
+        // any header that no longer heads a fold.
+        self.shift_folds_for_edit(&old_text, &range);
+        self.update_folds();
         self.mode
             .update_highlighter(&range, &self.text, &new_text, true, cx);
         self.lsp.update(&self.text, window, cx);
@@ -2097,6 +2131,8 @@ impl EntityInputHandler for InputState {
         }
         self.text_wrapper
             .update(&self.text, &range, &Rope::from(new_text), cx);
+        self.shift_folds_for_edit(&old_text, &range);
+        self.update_folds();
         self.mode
             .update_highlighter(&range, &self.text, &new_text, true, cx);
         self.lsp.update(&self.text, window, cx);
