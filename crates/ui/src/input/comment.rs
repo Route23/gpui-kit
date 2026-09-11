@@ -121,6 +121,26 @@ fn indent_len(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+/// The closer to add when the text before the caret has just become a block
+/// comment opener.
+///
+/// `before` is the line up to and including the character just typed. Typing
+/// the `*` of `/*` is what triggers it — the opener is only complete then.
+///
+/// Only closes when the caret sits before whitespace or the end of the line,
+/// the same rule the brackets use.
+pub fn block_open_at(before: &str, next: Option<char>, language: &str) -> Option<&'static str> {
+    let (open, close) = tokens_for(language).block?;
+    if !before.ends_with(open) {
+        return None;
+    }
+    match next {
+        None => Some(close),
+        Some(c) if c.is_whitespace() => Some(close),
+        _ => None,
+    }
+}
+
 /// What Enter should do on a line that is a comment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnterComment {
@@ -265,6 +285,16 @@ mod tests {
     fn on_enter(text: &str, token: &str, space: bool) -> Option<EnterComment> {
         let caret = text.find('|').expect("mark the caret with |");
         enter_comment(&text.replace('|', ""), caret, token, space)
+    }
+
+    #[test]
+    fn a_finished_block_opener_wants_its_closer() {
+        assert_eq!(block_open_at("/*", None, "rust"), Some("*/"));
+        assert_eq!(block_open_at("let x = /*", Some(' '), "rust"), Some("*/"));
+        assert_eq!(block_open_at("<!--", None, "html"), Some("-->"));
+        assert_eq!(block_open_at("/", None, "rust"), None, "まだ開いていない");
+        assert_eq!(block_open_at("/*", Some('a'), "rust"), None, "語の前では閉じない");
+        assert_eq!(block_open_at("/*", None, "python"), None, "ブロックの無い言語");
     }
 
     #[test]

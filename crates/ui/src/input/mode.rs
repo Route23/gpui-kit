@@ -172,8 +172,14 @@ pub(crate) enum InputMode {
         match_brackets: MatchBrackets,
         /// Whether bracket pairs are coloured by nesting depth
         bracket_colors: bool,
+        /// Whether each bracket kind counts its depth on its own
+        bracket_colors_per_type: bool,
         /// Which bracket pairs get a guide line
         bracket_guides: BracketGuides,
+        /// Whether the guides get a stub at each end
+        bracket_guides_horizontal: bool,
+        /// Whether the pair the caret is in is drawn stronger
+        highlight_active_bracket_pair: bool,
         /// Whether a space follows the comment token
         comment_insert_space: bool,
         /// Whether Enter carries a line comment onto the next line
@@ -216,7 +222,10 @@ impl InputMode {
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,
+            bracket_colors_per_type: false,
             bracket_guides: BracketGuides::default(),
+            bracket_guides_horizontal: true,
+            highlight_active_bracket_pair: true,
             comment_insert_space: true,
             comment_on_newline: true,
             diagnostics: DiagnosticSet::new(&Rope::new()),
@@ -403,6 +412,45 @@ impl InputMode {
         }
     }
 
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn bracket_colors_per_type(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                bracket_colors_per_type,
+                ..
+            } => *bracket_colors_per_type,
+            _ => false,
+        }
+    }
+
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn bracket_guides_horizontal(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                bracket_guides_horizontal,
+                ..
+            } => *bracket_guides_horizontal,
+            _ => false,
+        }
+    }
+
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn highlight_active_bracket_pair(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                highlight_active_bracket_pair,
+                ..
+            } => *highlight_active_bracket_pair,
+            _ => false,
+        }
+    }
+
     /// Return [`BracketGuides::Off`] if the mode is not [`InputMode::CodeEditor`].
     #[allow(unused)]
     #[inline]
@@ -569,6 +617,9 @@ mod tests {
         assert_eq!(mode.match_brackets(), MatchBrackets::Always);
         assert!(mode.bracket_colors(), "on like VS Code");
         assert_eq!(mode.bracket_guides(), BracketGuides::Off, "off like VS Code");
+        assert!(!mode.bracket_colors_per_type(), "one pool like VS Code");
+        assert!(mode.bracket_guides_horizontal());
+        assert!(mode.highlight_active_bracket_pair());
         assert!(mode.comment_insert_space(), "`// a` like VS Code");
         assert!(mode.comment_on_newline(), "Enter keeps the comment going");
         assert_eq!(mode.language_name(), "rust");
@@ -585,7 +636,10 @@ mod tests {
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,
+            bracket_colors_per_type: false,
             bracket_guides: BracketGuides::default(),
+            bracket_guides_horizontal: true,
+            highlight_active_bracket_pair: true,
             comment_insert_space: true,
             comment_on_newline: true,
             rows: 0,

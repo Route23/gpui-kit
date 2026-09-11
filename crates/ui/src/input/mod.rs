@@ -18,6 +18,7 @@ pub(crate) mod popovers;
 mod rope_ext;
 mod search;
 mod state;
+mod tags;
 mod text_wrapper;
 mod whitespace;
 mod selection;

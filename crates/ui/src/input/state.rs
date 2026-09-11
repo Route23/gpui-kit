@@ -20,7 +20,8 @@ use unicode_segmentation::*;
 use super::{
     blink_cursor::BlinkCursor,
     brackets::{self, AutoClose, AutoCloseEdit, BracketGuides, MatchBrackets},
-    comment::EnterComment,
+    comment::{self, EnterComment},
+    tags,
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
@@ -604,6 +605,102 @@ impl InputState {
             *bracket_colors = on;
         }
         self
+    }
+
+    /// Count each bracket kind's depth on its own, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn bracket_colors_per_type(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            bracket_colors_per_type,
+            ..
+        } = &mut self.mode
+        {
+            *bracket_colors_per_type = on;
+        }
+        self
+    }
+
+    /// Count each bracket kind's depth on its own, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_bracket_colors_per_type(
+        &mut self,
+        on: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor {
+            bracket_colors_per_type,
+            ..
+        } = &mut self.mode
+        {
+            *bracket_colors_per_type = on;
+        }
+        cx.notify();
+    }
+
+    /// Put a stub at each end of the bracket guides, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn bracket_guides_horizontal(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            bracket_guides_horizontal,
+            ..
+        } = &mut self.mode
+        {
+            *bracket_guides_horizontal = on;
+        }
+        self
+    }
+
+    /// Put a stub at each end of the bracket guides, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_bracket_guides_horizontal(
+        &mut self,
+        on: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor {
+            bracket_guides_horizontal,
+            ..
+        } = &mut self.mode
+        {
+            *bracket_guides_horizontal = on;
+        }
+        cx.notify();
+    }
+
+    /// Draw the pair the caret is in stronger than the rest, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn highlight_active_bracket_pair(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            highlight_active_bracket_pair,
+            ..
+        } = &mut self.mode
+        {
+            *highlight_active_bracket_pair = on;
+        }
+        self
+    }
+
+    /// Draw the pair the caret is in stronger than the rest, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_highlight_active_bracket_pair(
+        &mut self,
+        on: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor {
+            highlight_active_bracket_pair,
+            ..
+        } = &mut self.mode
+        {
+            *highlight_active_bracket_pair = on;
+        }
+        cx.notify();
     }
 
     /// Draw a guide line down each bracket pair, only for
@@ -1349,6 +1446,39 @@ impl InputState {
                 return Some(AutoCloseEdit::Overtype {
                     to: selection.start + ch.len_utf8(),
                 });
+            }
+            // The line up to and including what was just typed. Both the block
+            // comment and the JSX tag need it, and neither needs the tree.
+            let line_start = self.text.line_start_offset(
+                self.text.offset_to_point(selection.start).row,
+            );
+            let mut before = self.text.slice(line_start..selection.start).to_string();
+            before.push(ch);
+            let next = self.text.char_at(selection.start);
+
+            if cfg.comments {
+                if let Some(close) = comment::block_open_at(&before, next, language) {
+                    let space = if self.mode.comment_insert_space() { " " } else { "" };
+                    let closer = format!("{space}{close}");
+                    let mut text = String::with_capacity(ch.len_utf8() + closer.len());
+                    text.push(ch);
+                    text.push_str(&closer);
+                    return Some(AutoCloseEdit::Insert {
+                        caret_back: closer.len(),
+                        text,
+                    });
+                }
+            }
+            if cfg.jsx_tags && ch == '>' && tags::is_jsx(language) {
+                if let Some(close) = tags::closing_tag(&before) {
+                    let mut text = String::with_capacity(ch.len_utf8() + close.len());
+                    text.push(ch);
+                    text.push_str(&close);
+                    return Some(AutoCloseEdit::Insert {
+                        caret_back: close.len(),
+                        text,
+                    });
+                }
             }
             if !cfg.brackets {
                 return None;

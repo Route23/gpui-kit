@@ -487,18 +487,19 @@ impl TextElement {
             language,
             &skip,
         );
+        // The pair the caret sits in — `Always` so it is found even when the
+        // caret is not next to a bracket. Used both to narrow the list down and
+        // to draw that one stronger.
+        let active = brackets::match_at(
+            &state.text,
+            state.cursor(),
+            language,
+            brackets::MatchBrackets::Always,
+            last_layout.visible_range_offset.clone(),
+            &skip,
+        );
         if matches!(guides, brackets::BracketGuides::Active) {
-            // Only the pair the caret sits in — `Always` so it finds the
-            // enclosing one even when the caret is not next to a bracket.
-            let active = brackets::match_at(
-                &state.text,
-                state.cursor(),
-                language,
-                brackets::MatchBrackets::Always,
-                last_layout.visible_range_offset.clone(),
-                &skip,
-            );
-            let Some((open, close)) = active else {
+            let Some((open, close)) = active.clone() else {
                 return vec![];
             };
             pairs.retain(|(o, c, _)| *o == open && *c == close);
@@ -554,7 +555,14 @@ impl TextElement {
                 continue;
             }
 
-            let color = brackets::depth_color(base, depth).opacity(0.7);
+            // The pair the caret is in is drawn at full strength so it stands
+            // out of a screen full of guides.
+            let is_active = state.mode.highlight_active_bracket_pair()
+                && active
+                    .as_ref()
+                    .is_some_and(|(o, c)| *o == open && *c == close);
+            let alpha = if is_active { 1.0 } else { 0.55 };
+            let color = brackets::depth_color(base, depth).opacity(alpha);
             let builder = match by_color.iter_mut().find(|(c, _)| *c == color) {
                 Some((_, b)) => b,
                 None => {
@@ -564,6 +572,16 @@ impl TextElement {
             };
             builder.move_to(point(x, top));
             builder.line_to(point(x, bottom));
+
+            // A short stub at each end, pointing at the bracket it belongs to
+            // (VS Code's `bracketPairsHorizontal`).
+            if state.mode.bracket_guides_horizontal() {
+                let stub = px(4.);
+                builder.move_to(point(x, top));
+                builder.line_to(point(x + stub, top));
+                builder.move_to(point(x, bottom));
+                builder.line_to(point(x + stub, bottom));
+            }
         }
 
         by_color
@@ -1042,6 +1060,7 @@ impl TextElement {
                 visible_byte_range.clone(),
                 state.mode.language_name(),
                 &skip,
+                state.mode.bracket_colors_per_type(),
             )
             .into_iter()
             .map(|(range, depth)| (range, brackets::depth_color(base, depth)))

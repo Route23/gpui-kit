@@ -29,6 +29,10 @@ pub struct AutoClose {
     /// Typing a closer that is already in front of the caret steps over it
     /// instead of inserting a second one.
     pub overtype: bool,
+    /// Finishing a block comment opener (`/*`) adds its closer.
+    pub comments: bool,
+    /// Typing `>` after `<Foo` adds `</Foo>` (JSX only).
+    pub jsx_tags: bool,
 }
 
 impl Default for AutoClose {
@@ -37,6 +41,8 @@ impl Default for AutoClose {
             brackets: true,
             surround: true,
             overtype: true,
+            comments: true,
+            jsx_tags: true,
         }
     }
 }
@@ -50,6 +56,8 @@ impl From<bool> for AutoClose {
                 brackets: false,
                 surround: false,
                 overtype: false,
+                comments: false,
+                jsx_tags: false,
             }
         }
     }
@@ -419,6 +427,7 @@ pub fn depths_in(
     range: Range<usize>,
     language: &str,
     skip: &[Range<usize>],
+    per_type: bool,
 ) -> Vec<(Range<usize>, usize)> {
     let pairs: Vec<Pair> = pairs_for(language)
         .into_iter()
@@ -426,7 +435,9 @@ pub fn depths_in(
         .collect();
     let end = range.end.min(text.len());
     let mut out = Vec::new();
-    let mut depth = 0usize;
+    // One counter shared by every kind, or one per kind when the colours are
+    // pooled separately (VS Code's `independentColorPoolPerBracketType`).
+    let mut depth = vec![0usize; if per_type { pairs.len() } else { 1 }];
     let mut at = range.start;
     while at < end {
         let Some(ch) = text.char_at(at) else { break };
@@ -435,13 +446,15 @@ pub fn depths_in(
             at += len;
             continue;
         }
-        if pairs.iter().any(|p| p.open == ch) {
-            out.push((at..at + len, depth));
-            depth += 1;
-        } else if pairs.iter().any(|p| p.close == ch) {
-            if depth > 0 {
-                depth -= 1;
-                out.push((at..at + len, depth));
+        if let Some(i) = pairs.iter().position(|p| p.open == ch) {
+            let slot = if per_type { i } else { 0 };
+            out.push((at..at + len, depth[slot]));
+            depth[slot] += 1;
+        } else if let Some(i) = pairs.iter().position(|p| p.close == ch) {
+            let slot = if per_type { i } else { 0 };
+            if depth[slot] > 0 {
+                depth[slot] -= 1;
+                out.push((at..at + len, depth[slot]));
             }
         }
         at += len;
@@ -711,7 +724,7 @@ mod tests {
     #[test]
     fn depths_count_from_zero_inside_the_range() {
         let rope = Rope::from("((a)b)");
-        let out = depths_in(&rope, 0..rope.len(), "rust", &[]);
+        let out = depths_in(&rope, 0..rope.len(), "rust", &[], false);
         assert_eq!(
             out,
             vec![(0..1, 0), (1..2, 1), (3..4, 1), (5..6, 0)],
@@ -720,16 +733,31 @@ mod tests {
     }
 
     #[test]
+    fn each_kind_can_count_on_its_own() {
+        let rope = Rope::from("([a])");
+        // Shared pool: the `[` sits one level in.
+        assert_eq!(
+            depths_in(&rope, 0..rope.len(), "rust", &[], false),
+            vec![(0..1, 0), (1..2, 1), (3..4, 1), (4..5, 0)]
+        );
+        // Separate pools: both kinds start at 0.
+        assert_eq!(
+            depths_in(&rope, 0..rope.len(), "rust", &[], true),
+            vec![(0..1, 0), (1..2, 0), (3..4, 0), (4..5, 0)]
+        );
+    }
+
+    #[test]
     fn a_closer_with_nothing_open_gets_no_colour() {
         let rope = Rope::from(")a(");
-        let out = depths_in(&rope, 0..rope.len(), "rust", &[]);
+        let out = depths_in(&rope, 0..rope.len(), "rust", &[], false);
         assert_eq!(out, vec![(2..3, 0)], "the stray closer is left alone");
     }
 
     #[test]
     fn depths_skip_strings() {
         let rope = Rope::from("(\"(\")");
-        let out = depths_in(&rope, 0..rope.len(), "rust", &[1..4]);
+        let out = depths_in(&rope, 0..rope.len(), "rust", &[1..4], false);
         assert_eq!(out, vec![(0..1, 0), (4..5, 0)]);
     }
 
