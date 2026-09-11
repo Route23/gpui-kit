@@ -319,13 +319,19 @@ impl InputState {
 
         let insert = format!("{token}{}", self.comment_space());
         let mut delta: isize = 0;
+        // **What moved the caret is only what happened in front of it.** The
+        // token goes in after the indent, so a caret sitting at the start of
+        // the line must not move at all.
+        let mut delta_before: isize = 0;
         let mut offset = start_offset;
+        let mut original = start_offset;
         for line in &lines {
             let body = line.trim_end_matches('\r');
             let bare = body.trim().is_empty();
             match toggle {
                 LineToggle::Comment { column } if !bare => {
-                    let at = offset + column.min(body.len());
+                    let column = column.min(body.len());
+                    let at = offset + column;
                     self.replace_text_in_range_silent(
                         Some(self.range_to_utf16(&(at..at))),
                         &insert,
@@ -333,6 +339,9 @@ impl InputState {
                         cx,
                     );
                     delta += insert.len() as isize;
+                    if original + column < selected_range.start {
+                        delta_before += insert.len() as isize;
+                    }
                     offset += line.len() + insert.len() + 1;
                 }
                 LineToggle::Uncomment => {
@@ -345,6 +354,9 @@ impl InputState {
                             cx,
                         );
                         delta -= prefix.len() as isize;
+                        if original + prefix.end <= selected_range.start {
+                            delta_before -= prefix.len() as isize;
+                        }
                         offset += line.len() - prefix.len() + 1;
                     } else {
                         offset += line.len() + 1;
@@ -353,15 +365,16 @@ impl InputState {
                 // A blank line while commenting: left alone.
                 _ => offset += line.len() + 1,
             }
+            original += line.len() + 1;
         }
 
         self.history.end_grouping();
 
-        let end = selected_range.end.saturating_add_signed(delta);
         self.selected_range = if selected_range.is_empty() {
-            let caret = selected_range.start.saturating_add_signed(delta);
+            let caret = selected_range.start.saturating_add_signed(delta_before);
             (caret..caret).into()
         } else {
+            let end = selected_range.end.saturating_add_signed(delta);
             (start_offset..end).into()
         };
         cx.notify();
