@@ -297,6 +297,13 @@ impl RenderOnce for Input {
                             .on_action(window.listener_for(&self.state, InputState::outdent_inline))
                             .on_action(window.listener_for(&self.state, InputState::indent_block))
                             .on_action(window.listener_for(&self.state, InputState::outdent_block))
+                            .on_action(
+                                window.listener_for(&self.state, InputState::on_toggle_comment),
+                            )
+                            .on_action(window.listener_for(
+                                &self.state,
+                                InputState::on_toggle_block_comment,
+                            ))
                     })
                     .on_action(
                         window.listener_for(&self.state, InputState::on_action_toggle_code_actions),

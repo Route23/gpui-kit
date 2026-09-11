@@ -95,6 +95,8 @@ actions!(
         ToggleFold,
         FoldAll,
         UnfoldAll,
+        ToggleComment,
+        ToggleBlockComment,
     ]
 );
 
@@ -231,6 +233,14 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-shift-]", UnfoldAll, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-alt-shift-]", UnfoldAll, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-/", ToggleComment, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-/", ToggleComment, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-/", ToggleBlockComment, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-/", ToggleBlockComment, Some(CONTEXT)),
         KeyBinding::new("cmd-.", ToggleCodeActions, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-.", ToggleCodeActions, Some(CONTEXT)),
@@ -603,6 +613,33 @@ impl InputState {
             *bracket_guides = guides.into();
         }
         self
+    }
+
+    /// Put a space after the comment token, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn comment_insert_space(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            comment_insert_space,
+            ..
+        } = &mut self.mode
+        {
+            *comment_insert_space = on;
+        }
+        self
+    }
+
+    /// Put a space after the comment token, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_comment_insert_space(&mut self, on: bool, _: &mut Window, cx: &mut Context<Self>) {
+        if let InputMode::CodeEditor {
+            comment_insert_space,
+            ..
+        } = &mut self.mode
+        {
+            *comment_insert_space = on;
+        }
+        cx.notify();
     }
 
     /// Draw a guide line down each bracket pair, only for
