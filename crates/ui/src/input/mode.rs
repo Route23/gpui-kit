@@ -176,6 +176,8 @@ pub(crate) enum InputMode {
         bracket_guides: BracketGuides,
         /// Whether a space follows the comment token
         comment_insert_space: bool,
+        /// Whether Enter carries a line comment onto the next line
+        comment_on_newline: bool,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -216,6 +218,7 @@ impl InputMode {
             bracket_colors: true,
             bracket_guides: BracketGuides::default(),
             comment_insert_space: true,
+            comment_on_newline: true,
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -372,6 +375,18 @@ impl InputMode {
         match self {
             InputMode::CodeEditor { auto_close, .. } => *auto_close,
             _ => AutoClose::from(false),
+        }
+    }
+
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn comment_on_newline(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                comment_on_newline, ..
+            } => *comment_on_newline,
+            _ => false,
         }
     }
 
@@ -555,6 +570,7 @@ mod tests {
         assert!(mode.bracket_colors(), "on like VS Code");
         assert_eq!(mode.bracket_guides(), BracketGuides::Off, "off like VS Code");
         assert!(mode.comment_insert_space(), "`// a` like VS Code");
+        assert!(mode.comment_on_newline(), "Enter keeps the comment going");
         assert_eq!(mode.language_name(), "rust");
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
@@ -571,6 +587,7 @@ mod tests {
             bracket_colors: true,
             bracket_guides: BracketGuides::default(),
             comment_insert_space: true,
+            comment_on_newline: true,
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),

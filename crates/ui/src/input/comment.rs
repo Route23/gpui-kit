@@ -121,6 +121,40 @@ fn indent_len(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+/// What Enter should do on a line that is a comment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnterComment {
+    /// Start the next line with this (`// `).
+    Continue { prefix: String },
+    /// The line held nothing but the marker — take it off and just break the
+    /// line, so Enter is how you leave a comment block.
+    Clear { range: Range<usize> },
+}
+
+/// What Enter at `caret` bytes into `line` should do, or `None` for a plain
+/// line break.
+///
+/// Only continues when the caret is **after** the marker: pressing Enter in
+/// front of `//` splits the line like anywhere else.
+pub fn enter_comment(
+    line: &str,
+    caret: usize,
+    token: &str,
+    space: bool,
+) -> Option<EnterComment> {
+    let body = line.trim_end_matches('\r');
+    let prefix = line_prefix(body, token)?;
+    if caret < prefix.end {
+        return None;
+    }
+    if body[prefix.end..].trim().is_empty() {
+        return Some(EnterComment::Clear { range: prefix });
+    }
+    Some(EnterComment::Continue {
+        prefix: format!("{token}{}", if space { " " } else { "" }),
+    })
+}
+
 /// What toggling a block comment around `selected` should do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockToggle {
@@ -226,6 +260,55 @@ mod tests {
         assert_eq!(line_toggle(&lines, "//"), Some(LineToggle::Uncomment));
     }
 
+    /// `|` marks the caret.
+    #[track_caller]
+    fn on_enter(text: &str, token: &str, space: bool) -> Option<EnterComment> {
+        let caret = text.find('|').expect("mark the caret with |");
+        enter_comment(&text.replace('|', ""), caret, token, space)
+    }
+
+    #[test]
+    fn enter_carries_the_marker_to_the_next_line() {
+        assert_eq!(
+            on_enter("// foo|", "//", true),
+            Some(EnterComment::Continue {
+                prefix: "// ".into()
+            })
+        );
+        assert_eq!(
+            on_enter("    // foo|", "//", false),
+            Some(EnterComment::Continue {
+                prefix: "//".into()
+            }),
+            "空白を入れない設定ならそのぶんも入れない"
+        );
+    }
+
+    #[test]
+    fn enter_on_an_empty_comment_clears_it() {
+        assert_eq!(
+            on_enter("// |", "//", true),
+            Some(EnterComment::Clear { range: 0..3 }),
+            "記号だけの行は畳んで抜ける"
+        );
+        assert_eq!(
+            on_enter("    //|", "//", true),
+            Some(EnterComment::Clear { range: 4..6 })
+        );
+    }
+
+    #[test]
+    fn enter_in_front_of_the_marker_is_a_plain_break() {
+        assert_eq!(on_enter("|// foo", "//", true), None);
+        assert_eq!(on_enter("  |  // foo", "//", true), None);
+    }
+
+    #[test]
+    fn enter_on_code_is_a_plain_break() {
+        assert_eq!(on_enter("let a = 1;|", "//", true), None);
+        assert_eq!(on_enter("let a = 1; // tail|", "//", true), None, "行頭のものだけ");
+    }
+
     #[test]
     fn block_wraps_then_unwraps() {
         assert_eq!(block_toggle("a", ("/*", "*/")), BlockToggle::Wrap);
@@ -285,6 +368,33 @@ impl InputState {
             return;
         }
         self.toggle_block_comment(window, cx);
+    }
+
+    /// What Enter should carry onto the next line, if anything.
+    ///
+    /// Reads the line the caret is on and hands it to [`enter_comment`]; the
+    /// range in `Clear` is translated into buffer offsets so the caller can
+    /// delete it directly.
+    pub(super) fn comment_to_carry(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<EnterComment> {
+        if !self.mode.comment_on_newline() {
+            return None;
+        }
+        let token = tokens_for(self.mode.language_name()).line?;
+        let start = self.start_of_line();
+        let end = self.end_of_line();
+        let line = self
+            .text_for_range(self.range_to_utf16(&(start..end)), &mut None, window, cx)?;
+        let caret = self.cursor().checked_sub(start)?;
+        match enter_comment(&line, caret, token, self.mode.comment_insert_space())? {
+            EnterComment::Continue { prefix } => Some(EnterComment::Continue { prefix }),
+            EnterComment::Clear { range } => Some(EnterComment::Clear {
+                range: start + range.start..start + range.end,
+            }),
+        }
     }
 
     /// Whether a space follows the comment token.

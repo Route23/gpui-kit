@@ -20,6 +20,7 @@ use unicode_segmentation::*;
 use super::{
     blink_cursor::BlinkCursor,
     brackets::{self, AutoClose, AutoCloseEdit, BracketGuides, MatchBrackets},
+    comment::EnterComment,
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
@@ -627,6 +628,31 @@ impl InputState {
             *comment_insert_space = on;
         }
         self
+    }
+
+    /// Carry a line comment onto the next line on Enter, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn comment_on_newline(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            comment_on_newline, ..
+        } = &mut self.mode
+        {
+            *comment_on_newline = on;
+        }
+        self
+    }
+
+    /// Carry a line comment onto the next line on Enter, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_comment_on_newline(&mut self, on: bool, _: &mut Window, cx: &mut Context<Self>) {
+        if let InputMode::CodeEditor {
+            comment_on_newline, ..
+        } = &mut self.mode
+        {
+            *comment_on_newline = on;
+        }
+        cx.notify();
     }
 
     /// Put a space after the comment token, only for
@@ -1491,8 +1517,25 @@ impl InputState {
                 "".to_string()
             };
 
+            // Carry a line comment onto the next line, and let a line that is
+            // nothing but the marker be the way out of the block.
+            let carry = self.comment_to_carry(window, cx);
+            let prefix = match carry {
+                Some(EnterComment::Continue { prefix }) => prefix,
+                Some(EnterComment::Clear { range }) => {
+                    self.replace_text_in_range_silent(
+                        Some(self.range_to_utf16(&range)),
+                        "",
+                        window,
+                        cx,
+                    );
+                    String::new()
+                }
+                None => String::new(),
+            };
+
             // Add newline and indent
-            let new_line_text = format!("\n{}", indent);
+            let new_line_text = format!("\n{indent}{prefix}");
             self.replace_text_in_range_silent(None, &new_line_text, window, cx);
             self.pause_blink_cursor(cx);
         } else {
