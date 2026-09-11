@@ -385,11 +385,16 @@ impl InputState {
             return;
         };
         let selected_range = self.selected_range;
-        // With no selection, wrap the line the caret is on.
+        // With no selection, wrap the line the caret is on — **without its
+        // indent**, so the block keeps the shape of the code around it.
         let range = if selected_range.is_empty() {
             let start = self.start_of_line_of_selection(window, cx);
             let row = self.text.offset_to_point(start).row;
-            start..self.text.line_end_offset(row)
+            let end = self.text.line_end_offset(row);
+            let line = self
+                .text_for_range(self.range_to_utf16(&(start..end)), &mut None, window, cx)
+                .unwrap_or_default();
+            start + indent_len(&line)..end
         } else {
             selected_range.into()
         };
