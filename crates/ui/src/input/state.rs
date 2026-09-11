@@ -19,6 +19,7 @@ use unicode_segmentation::*;
 
 use super::{
     blink_cursor::BlinkCursor,
+    brackets::{self, AutoClose, AutoCloseEdit},
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
@@ -548,6 +549,30 @@ impl InputState {
             *c = controls;
         }
         self
+    }
+
+    /// Set which auto-closing behaviours are on, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn auto_close(mut self, auto_close: impl Into<AutoClose>) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor { auto_close: a, .. } = &mut self.mode {
+            *a = auto_close.into();
+        }
+        self
+    }
+
+    /// Set which auto-closing behaviours are on, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_auto_close(
+        &mut self,
+        auto_close: impl Into<AutoClose>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor { auto_close: a, .. } = &mut self.mode {
+            *a = auto_close.into();
+        }
+        cx.notify();
     }
 
     /// Set when the fold chevrons are visible, only for
@@ -1157,9 +1182,86 @@ impl InputState {
         }
     }
 
+    /// What auto-closing wants to do for this insertion, if anything.
+    ///
+    /// Returns `None` for every path that is not a person typing one character
+    /// into a code editor:
+    ///
+    /// - `silent_replace_text` covers `insert` / `replace` / `paste` / `enter`
+    ///   / the LSP, none of which should grow a bracket;
+    /// - `ime_marked_range` covers composition — a CJK IME routes even plain
+    ///   ASCII through `replace_and_mark_text_in_range`, so closing there would
+    ///   fire mid-preedit;
+    /// - an explicit `range_utf16` means the caller chose the range, not the
+    ///   caret.
+    fn auto_close_edit(
+        &self,
+        range_utf16: Option<&Range<usize>>,
+        new_text: &str,
+    ) -> Option<AutoCloseEdit> {
+        if self.silent_replace_text || self.ime_marked_range.is_some() || range_utf16.is_some() {
+            return None;
+        }
+        if !self.mode.is_code_editor() {
+            return None;
+        }
+        let cfg = self.mode.auto_close();
+        let mut chars = new_text.chars();
+        let ch = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        let language = self.mode.language_name();
+        let selection: Range<usize> = self.selected_range.into();
+
+        if selection.is_empty() {
+            if cfg.overtype && brackets::is_overtype(&self.text, selection.start, ch, language) {
+                return Some(AutoCloseEdit::Overtype {
+                    to: selection.start + ch.len_utf8(),
+                });
+            }
+            if !cfg.brackets {
+                return None;
+            }
+            let close = brackets::close_for(&self.text, selection.start, ch, language)?;
+            let mut text = String::with_capacity(ch.len_utf8() + close.len_utf8());
+            text.push(ch);
+            text.push(close);
+            return Some(AutoCloseEdit::Insert {
+                text,
+                caret_back: close.len_utf8(),
+            });
+        }
+
+        if !cfg.surround {
+            return None;
+        }
+        let close = brackets::closer_of(ch, language)?;
+        let inner = self.text.slice(selection).to_string();
+        let mut text = String::with_capacity(ch.len_utf8() + inner.len() + close.len_utf8());
+        text.push(ch);
+        text.push_str(&inner);
+        text.push(close);
+        Some(AutoCloseEdit::Surround {
+            text,
+            open_len: ch.len_utf8(),
+            inner_len: inner.len(),
+        })
+    }
+
     pub(super) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor()), cx)
+            // Between an auto-closed pair, take both halves: leaving the closer
+            // behind is never what the caret position meant.
+            let offset = self.cursor();
+            if self.mode.auto_close().brackets
+                && brackets::is_inside_pair(&self.text, offset, self.mode.language_name())
+            {
+                self.selected_range =
+                    (self.previous_boundary(offset)..self.next_boundary(offset)).into();
+            } else {
+                self.select_to(self.previous_boundary(self.cursor()), cx)
+            }
         }
         self.replace_text_in_range(None, "", window, cx);
         self.pause_blink_cursor(cx);
@@ -2095,6 +2197,19 @@ impl EntityInputHandler for InputState {
 
         self.pause_blink_cursor(cx);
 
+        // ── auto-closing brackets ──────────────────────────────────────────
+        // Decided before anything is written, because the whole point is to
+        // change *what* gets written (and where the caret lands afterwards).
+        let auto = self.auto_close_edit(range_utf16.as_ref(), new_text);
+        if let Some(AutoCloseEdit::Overtype { to }) = auto {
+            self.selected_range = (to..to).into();
+            self.update_preferred_column();
+            cx.notify();
+            return;
+        }
+        let auto_text = auto.as_ref().map(|a| a.text().to_string());
+        let new_text = auto_text.as_deref().unwrap_or(new_text);
+
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -2142,6 +2257,22 @@ impl EntityInputHandler for InputState {
             .update_highlighter(&range, &self.text, &new_text, true, cx);
         self.lsp.update(&self.text, window, cx);
         self.selected_range = (new_offset..new_offset).into();
+        // Put the caret back inside the pair, or keep the wrapped text selected.
+        match &auto {
+            Some(AutoCloseEdit::Insert { caret_back, .. }) => {
+                let offset = new_offset.saturating_sub(*caret_back);
+                self.selected_range = (offset..offset).into();
+            }
+            Some(AutoCloseEdit::Surround {
+                open_len,
+                inner_len,
+                ..
+            }) => {
+                let start = range.start + open_len;
+                self.selected_range = (start..start + inner_len).into();
+            }
+            _ => {}
+        }
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.update_search(cx);

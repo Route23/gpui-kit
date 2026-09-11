@@ -8,7 +8,7 @@ use tree_sitter::InputEdit;
 use super::text_wrapper::TextWrapper;
 use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
-use crate::input::{RopeExt as _, TabSize};
+use crate::input::{AutoClose, RopeExt as _, TabSize};
 
 /// How the line number gutter of a [`InputMode::CodeEditor`] is rendered.
 ///
@@ -166,6 +166,8 @@ pub(crate) enum InputMode {
         folding: bool,
         /// When the fold chevrons are visible
         folding_controls: FoldingControls,
+        /// Which auto-closing behaviours are on
+        auto_close: AutoClose,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -201,6 +203,7 @@ impl InputMode {
             render_whitespace: RenderWhitespace::default(),
             folding: true,
             folding_controls: FoldingControls::default(),
+            auto_close: AutoClose::default(),
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -347,6 +350,29 @@ impl InputMode {
         }
     }
 
+    /// Return the default when the mode is not [`InputMode::CodeEditor`].
+    ///
+    /// Plain inputs never auto-close: a single-line field is as likely to hold
+    /// a search term as code.
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn auto_close(&self) -> AutoClose {
+        match self {
+            InputMode::CodeEditor { auto_close, .. } => *auto_close,
+            _ => AutoClose::from(false),
+        }
+    }
+
+    /// The language name, or `""` if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn language_name(&self) -> &str {
+        match self {
+            InputMode::CodeEditor { language, .. } => language,
+            _ => "",
+        }
+    }
+
     /// Return false if the mode is not [`InputMode::CodeEditor`].
     #[allow(unused)]
     #[inline]
@@ -454,7 +480,7 @@ mod tests {
     use crate::{
         highlighter::DiagnosticSet,
         input::{
-            TabSize,
+            AutoClose, TabSize,
             mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace},
         },
     };
@@ -469,6 +495,8 @@ mod tests {
         assert_eq!(mode.has_indent_guides(), true);
         assert_eq!(mode.has_folding(), true);
         assert_eq!(mode.folding_controls(), FoldingControls::Always);
+        assert_eq!(mode.auto_close(), AutoClose::default(), "on like VS Code");
+        assert_eq!(mode.language_name(), "rust");
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
 
@@ -479,6 +507,7 @@ mod tests {
             render_whitespace: RenderWhitespace::None,
             folding: true,
             folding_controls: FoldingControls::default(),
+            auto_close: AutoClose::default(),
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),

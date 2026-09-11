@@ -1,4 +1,5 @@
 mod blink_cursor;
+mod brackets;
 mod change;
 mod clear_button;
 mod cursor;
@@ -26,6 +27,7 @@ pub use indent::TabSize;
 pub use input::*;
 pub use lsp::*;
 pub use mask_pattern::MaskPattern;
+pub use brackets::{AutoClose, Pair};
 pub use mode::{FoldingControls, LineNumbers, RenderWhitespace};
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};
 pub use otp_input::*;
