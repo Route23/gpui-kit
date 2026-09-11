@@ -8,6 +8,8 @@
 //! this feature keeps its own table (VS Code's `language-configuration.json`,
 //! Zed's `config.toml`).
 
+use std::ops::Range;
+
 use ropey::Rope;
 
 use crate::input::RopeExt as _;
@@ -48,6 +50,30 @@ impl From<bool> for AutoClose {
                 surround: false,
                 overtype: false,
             }
+        }
+    }
+}
+
+/// When the bracket that matches the caret's is outlined.
+///
+/// Mirrors VS Code's `editor.matchBrackets`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MatchBrackets {
+    /// Never outline anything.
+    Never,
+    /// Only when the caret is right next to a bracket.
+    Near,
+    /// Also outline the innermost pair the caret sits inside.
+    #[default]
+    Always,
+}
+
+impl From<bool> for MatchBrackets {
+    fn from(on: bool) -> Self {
+        if on {
+            MatchBrackets::Always
+        } else {
+            MatchBrackets::Never
         }
     }
 }
@@ -201,6 +227,146 @@ fn prev_char(text: &Rope, offset: usize) -> Option<char> {
     text.chars_at(offset).reversed().next()
 }
 
+/// The pair to outline for a caret at `offset`, as `(opener, closer)` byte
+/// ranges.
+///
+/// `bounds` is how far the scan may go — pass the visible byte range. A partner
+/// outside it cannot be drawn anyway, and scanning the whole buffer on every
+/// frame would be wasteful.
+///
+/// **Strings and comments are not excluded.** A `(` inside `"a (b"` counts.
+/// Telling them apart needs the syntax tree, which is not reachable from the
+/// input state today; VS Code has the same gap when no tokenizer has run yet.
+pub fn match_at(
+    text: &Rope,
+    offset: usize,
+    language: &str,
+    mode: MatchBrackets,
+    bounds: Range<usize>,
+) -> Option<(Range<usize>, Range<usize>)> {
+    if matches!(mode, MatchBrackets::Never) {
+        return None;
+    }
+    let pairs = pairs_for(language);
+    // Quotes have no direction, so they cannot be counted — only brackets.
+    let pairs: Vec<Pair> = pairs.into_iter().filter(|p| p.open != p.close).collect();
+
+    // The character after the caret first, then the one before it: that is the
+    // order VS Code resolves ties in.
+    if let Some(next) = text.char_at(offset) {
+        if let Some(found) = partner_of(text, offset, next, &pairs, &bounds) {
+            return Some(found);
+        }
+    }
+    if let Some(prev) = prev_char(text, offset) {
+        let start = offset - prev.len_utf8();
+        if let Some(found) = partner_of(text, start, prev, &pairs, &bounds) {
+            return Some(found);
+        }
+    }
+
+    if matches!(mode, MatchBrackets::Near) {
+        return None;
+    }
+    enclosing(text, offset, &pairs, &bounds)
+}
+
+/// The pair `ch` at `at` belongs to, scanning in the direction it opens.
+fn partner_of(
+    text: &Rope,
+    at: usize,
+    ch: char,
+    pairs: &[Pair],
+    bounds: &Range<usize>,
+) -> Option<(Range<usize>, Range<usize>)> {
+    if let Some(p) = pairs.iter().find(|p| p.open == ch) {
+        let close = scan_forward(text, at + ch.len_utf8(), *p, bounds)?;
+        return Some((at..at + ch.len_utf8(), close..close + p.close.len_utf8()));
+    }
+    if let Some(p) = pairs.iter().find(|p| p.close == ch) {
+        let open = scan_backward(text, at, *p, bounds)?;
+        return Some((open..open + p.open.len_utf8(), at..at + ch.len_utf8()));
+    }
+    None
+}
+
+/// The innermost pair that encloses `offset`.
+fn enclosing(
+    text: &Rope,
+    offset: usize,
+    pairs: &[Pair],
+    bounds: &Range<usize>,
+) -> Option<(Range<usize>, Range<usize>)> {
+    // Walk back to the nearest opener that is still unclosed, whichever kind it
+    // is, then find its partner going forward.
+    let start = bounds.start.min(offset);
+    let mut depth = vec![0usize; pairs.len()];
+    let mut at = offset;
+    while at > start {
+        let ch = prev_char_from(text, at)?;
+        at -= ch.len_utf8();
+        if let Some(i) = pairs.iter().position(|p| p.close == ch) {
+            depth[i] += 1;
+        } else if let Some(i) = pairs.iter().position(|p| p.open == ch) {
+            if depth[i] == 0 {
+                let p = pairs[i];
+                let close = scan_forward(text, at + ch.len_utf8(), p, bounds)?;
+                return Some((at..at + ch.len_utf8(), close..close + p.close.len_utf8()));
+            }
+            depth[i] -= 1;
+        }
+    }
+    None
+}
+
+/// The offset of `p.close` that matches an opener just before `from`.
+fn scan_forward(text: &Rope, from: usize, p: Pair, bounds: &Range<usize>) -> Option<usize> {
+    let end = bounds.end.min(text.len());
+    let mut depth = 0usize;
+    let mut at = from;
+    while at < end {
+        let ch = text.char_at(at)?;
+        if ch == p.open {
+            depth += 1;
+        } else if ch == p.close {
+            if depth == 0 {
+                return Some(at);
+            }
+            depth -= 1;
+        }
+        at += ch.len_utf8();
+    }
+    None
+}
+
+/// The offset of `p.open` that matches a closer at `from`.
+fn scan_backward(text: &Rope, from: usize, p: Pair, bounds: &Range<usize>) -> Option<usize> {
+    let start = bounds.start.min(from);
+    let mut depth = 0usize;
+    let mut at = from;
+    while at > start {
+        let ch = prev_char_from(text, at)?;
+        at -= ch.len_utf8();
+        if ch == p.close {
+            depth += 1;
+        } else if ch == p.open {
+            if depth == 0 {
+                return Some(at);
+            }
+            depth -= 1;
+        }
+    }
+    None
+}
+
+/// The character ending at `at`.
+fn prev_char_from(text: &Rope, at: usize) -> Option<char> {
+    if at == 0 {
+        return None;
+    }
+    text.chars_at(at).reversed().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +436,74 @@ mod tests {
         assert!(!is_inside_pair(&rope, 3, "rust"));
         let rope = Rope::from("f(x)");
         assert!(!is_inside_pair(&rope, 3, "rust"));
+    }
+
+    /// `|` marks the caret; the whole text is in scope for the scan.
+    #[track_caller]
+    fn matched(text: &str, mode: MatchBrackets) -> Option<(Range<usize>, Range<usize>)> {
+        let offset = text.find('|').expect("mark the caret with |");
+        let rope = Rope::from(text.replace('|', ""));
+        let len = rope.len();
+        match_at(&rope, offset, "rust", mode, 0..len)
+    }
+
+    #[test]
+    fn outlines_the_pair_on_either_side_of_the_caret() {
+        // In front of the opener.
+        assert_eq!(matched("f|(x)", MatchBrackets::Near), Some((1..2, 3..4)));
+        // Right after the closer.
+        assert_eq!(matched("f(x)|", MatchBrackets::Near), Some((1..2, 3..4)));
+        // Inside, right after the opener: still "next to a bracket".
+        assert_eq!(matched("f(|x)", MatchBrackets::Near), Some((1..2, 3..4)));
+    }
+
+    #[test]
+    fn counts_nesting() {
+        assert_eq!(matched("|((a))", MatchBrackets::Near), Some((0..1, 4..5)));
+        assert_eq!(matched("(|(a))", MatchBrackets::Near), Some((1..2, 3..4)));
+    }
+
+    #[test]
+    fn spans_lines() {
+        let out = matched("fn f() |{\n    x\n}\n", MatchBrackets::Near);
+        assert_eq!(out, Some((7..8, 15..16)));
+    }
+
+    #[test]
+    fn an_unmatched_bracket_lights_nothing() {
+        assert_eq!(matched("|(a", MatchBrackets::Near), None);
+        assert_eq!(matched("a)|", MatchBrackets::Near), None);
+    }
+
+    #[test]
+    fn always_finds_the_pair_around_the_caret() {
+        assert_eq!(matched("f(a|b)", MatchBrackets::Always), Some((1..2, 4..5)));
+        // The innermost one wins.
+        assert_eq!(matched("((a|b))", MatchBrackets::Always), Some((1..2, 4..5)));
+        // ...and `near` still says no.
+        assert_eq!(matched("f(a|b)", MatchBrackets::Near), None);
+    }
+
+    #[test]
+    fn never_never_matches() {
+        assert_eq!(matched("|(x)", MatchBrackets::Never), None);
+    }
+
+    #[test]
+    fn the_scan_stops_at_the_bounds() {
+        let rope = Rope::from("(aaaaaaaaaa)");
+        assert_eq!(match_at(&rope, 0, "rust", MatchBrackets::Near, 0..12), Some((0..1, 11..12)));
+        assert_eq!(
+            match_at(&rope, 0, "rust", MatchBrackets::Near, 0..5),
+            None,
+            "the partner is off screen, so there is nothing to draw"
+        );
+    }
+
+    #[test]
+    fn quotes_are_not_counted() {
+        // Quotes have no direction, so they are never outlined.
+        assert_eq!(matched("|\"a\"", MatchBrackets::Near), None);
     }
 
     #[test]

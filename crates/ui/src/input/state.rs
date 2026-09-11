@@ -19,7 +19,7 @@ use unicode_segmentation::*;
 
 use super::{
     blink_cursor::BlinkCursor,
-    brackets::{self, AutoClose, AutoCloseEdit},
+    brackets::{self, AutoClose, AutoCloseEdit, MatchBrackets},
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
@@ -571,6 +571,30 @@ impl InputState {
     ) {
         if let InputMode::CodeEditor { auto_close: a, .. } = &mut self.mode {
             *a = auto_close.into();
+        }
+        cx.notify();
+    }
+
+    /// Set when the matching bracket is outlined, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn match_brackets(mut self, match_brackets: impl Into<MatchBrackets>) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor { match_brackets: m, .. } = &mut self.mode {
+            *m = match_brackets.into();
+        }
+        self
+    }
+
+    /// Set when the matching bracket is outlined, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_match_brackets(
+        &mut self,
+        match_brackets: impl Into<MatchBrackets>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor { match_brackets: m, .. } = &mut self.mode {
+            *m = match_brackets.into();
         }
         cx.notify();
     }

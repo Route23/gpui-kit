@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ActiveTheme as _, Colorize, PixelsExt, Root,
-    input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, text_wrapper::LineLayout},
+    input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, brackets, text_wrapper::LineLayout},
 };
 
 use super::{InputState, LastLayout, mode::InputMode};
@@ -272,6 +272,18 @@ impl TextElement {
         last_layout: &LastLayout,
         bounds: &Bounds<Pixels>,
     ) -> Option<Path<Pixels>> {
+        Self::layout_match_range_with(range, last_layout, bounds, None)
+    }
+
+    /// The same box as [`Self::layout_match_range`], stroked instead of filled
+    /// when `stroke` is given. Used to outline the matching bracket without
+    /// touching the glyph underneath.
+    pub(crate) fn layout_match_range_with(
+        range: Range<usize>,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        stroke: Option<Pixels>,
+    ) -> Option<Path<Pixels>> {
         if range.is_empty() {
             return None;
         }
@@ -391,10 +403,18 @@ impl TextElement {
 
         let path_origin = bounds.origin + point(line_number_width, px(0.));
         let first_p = *points.get(0).unwrap();
-        let mut builder = gpui::PathBuilder::fill();
+        let mut builder = match stroke {
+            Some(width) => gpui::PathBuilder::stroke(width),
+            None => gpui::PathBuilder::fill(),
+        };
         builder.move_to(path_origin + first_p);
         for p in points.iter().skip(1) {
             builder.line_to(path_origin + *p);
+        }
+        // A stroked outline has to come back to where it started, or the box is
+        // missing one side.
+        if stroke.is_some() {
+            builder.line_to(path_origin + first_p);
         }
 
         builder.build().ok()
@@ -425,6 +445,40 @@ impl TextElement {
         }
 
         paths
+    }
+
+    /// Outline the bracket the caret is next to and the one it matches.
+    ///
+    /// The scan is bounded by what is on screen: a partner further away could
+    /// not be drawn anyway (`layout_match_range` clips to the visible range),
+    /// and scanning the whole buffer every frame would be waste.
+    fn layout_bracket_match(
+        &self,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        cx: &mut App,
+    ) -> Vec<Path<Pixels>> {
+        let state = self.state.read(cx);
+        let mode = state.mode.match_brackets();
+        if matches!(mode, brackets::MatchBrackets::Never) {
+            return vec![];
+        }
+        let Some((open, close)) = brackets::match_at(
+            &state.text,
+            state.cursor(),
+            state.mode.language_name(),
+            mode,
+            last_layout.visible_range_offset.clone(),
+        ) else {
+            return vec![];
+        };
+
+        [open, close]
+            .into_iter()
+            .filter_map(|range| {
+                Self::layout_match_range_with(range, last_layout, bounds, Some(px(1.)))
+            })
+            .collect()
     }
 
     fn layout_hover_highlight(
@@ -844,6 +898,8 @@ pub(super) struct PrepaintState {
     selection_path: Option<Path<Pixels>>,
     hover_highlight_path: Option<Path<Pixels>>,
     search_match_paths: Vec<(Path<Pixels>, bool)>,
+    /// The outlines of the bracket next to the caret and its partner
+    bracket_match_paths: Vec<Path<Pixels>>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
@@ -1210,6 +1266,7 @@ impl Element for TextElement {
         let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
         let selection_path = self.layout_selections(&last_layout, &mut bounds, cx);
         let hover_highlight_path = self.layout_hover_highlight(&last_layout, &mut bounds, cx);
+        let bracket_match_paths = self.layout_bracket_match(&last_layout, &bounds, cx);
         let document_color_paths =
             self.layout_document_colors(&document_colors, &last_layout, &bounds);
 
@@ -1304,6 +1361,7 @@ impl Element for TextElement {
             current_row,
             selection_path,
             search_match_paths,
+            bracket_match_paths,
             hover_highlight_path,
             hover_definition_hitbox,
             document_color_paths,
@@ -1426,6 +1484,12 @@ impl Element for TextElement {
 
             if let Some(path) = prepaint.selection_path.take() {
                 window.paint_path(path, cx.theme().selection);
+            }
+
+            // Paint the matching bracket's outline. Drawn after the selection
+            // so it stays readable inside one.
+            for path in prepaint.bracket_match_paths.iter() {
+                window.paint_path(path.clone(), cx.theme().selection);
             }
 
             // Paint hover highlight

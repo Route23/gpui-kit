@@ -8,7 +8,7 @@ use tree_sitter::InputEdit;
 use super::text_wrapper::TextWrapper;
 use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
-use crate::input::{AutoClose, RopeExt as _, TabSize};
+use crate::input::{AutoClose, MatchBrackets, RopeExt as _, TabSize};
 
 /// How the line number gutter of a [`InputMode::CodeEditor`] is rendered.
 ///
@@ -168,6 +168,8 @@ pub(crate) enum InputMode {
         folding_controls: FoldingControls,
         /// Which auto-closing behaviours are on
         auto_close: AutoClose,
+        /// When the matching bracket is outlined
+        match_brackets: MatchBrackets,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -204,6 +206,7 @@ impl InputMode {
             folding: true,
             folding_controls: FoldingControls::default(),
             auto_close: AutoClose::default(),
+            match_brackets: MatchBrackets::default(),
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -363,6 +366,16 @@ impl InputMode {
         }
     }
 
+    /// Return [`MatchBrackets::Never`] if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn match_brackets(&self) -> MatchBrackets {
+        match self {
+            InputMode::CodeEditor { match_brackets, .. } => *match_brackets,
+            _ => MatchBrackets::Never,
+        }
+    }
+
     /// The language name, or `""` if the mode is not [`InputMode::CodeEditor`].
     #[allow(unused)]
     #[inline]
@@ -480,7 +493,7 @@ mod tests {
     use crate::{
         highlighter::DiagnosticSet,
         input::{
-            AutoClose, TabSize,
+            AutoClose, MatchBrackets, TabSize,
             mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace},
         },
     };
@@ -496,6 +509,7 @@ mod tests {
         assert_eq!(mode.has_folding(), true);
         assert_eq!(mode.folding_controls(), FoldingControls::Always);
         assert_eq!(mode.auto_close(), AutoClose::default(), "on like VS Code");
+        assert_eq!(mode.match_brackets(), MatchBrackets::Always);
         assert_eq!(mode.language_name(), "rust");
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
@@ -508,6 +522,7 @@ mod tests {
             folding: true,
             folding_controls: FoldingControls::default(),
             auto_close: AutoClose::default(),
+            match_brackets: MatchBrackets::default(),
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),
