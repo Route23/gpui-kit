@@ -272,10 +272,15 @@ impl TextElement {
                 _ => 0.85,
             };
 
+            // **No scroll offset on either axis here.** `cursor_bounds_with_scroll`
+            // adds it at paint time, so the rectangle stored in `LastLayout` is
+            // in text coordinates -- which is what the caret slide interpolates
+            // in. Mixing the two would make a plain sideways scroll look like
+            // the caret slid across the pane.
             cursor_bounds = Some(caret::cursor_bounds(
                 state.mode.cursor_style(),
                 point(
-                    bounds.left() + cursor_pos.x + line_number_width + scroll_offset.x,
+                    bounds.left() + cursor_pos.x + line_number_width,
                     bounds.top() + cursor_pos.y,
                 ),
                 line_height,
@@ -1176,10 +1181,14 @@ pub(super) struct PrepaintState {
 impl PrepaintState {
     /// Returns cursor bounds adjusted for scroll offset, if available.
     fn cursor_bounds_with_scroll(&self) -> Option<Bounds<Pixels>> {
-        self.cursor_bounds.map(|mut bounds| {
-            bounds.origin.y += self.cursor_scroll_offset.y;
-            bounds
-        })
+        self.cursor_bounds.map(|bounds| Self::with_scroll(bounds, self.cursor_scroll_offset))
+    }
+
+    /// Move a caret rectangle from text coordinates into the viewport.
+    fn with_scroll(mut bounds: Bounds<Pixels>, scroll: Point<Pixels>) -> Bounds<Pixels> {
+        bounds.origin.x += scroll.x;
+        bounds.origin.y += scroll.y;
+        bounds
     }
 }
 
@@ -1825,7 +1834,16 @@ impl Element for TextElement {
         // `Blink` is already on/off by the time it gets here; the fades are
         // shaped from the phase, and only those need a frame scheduled.
         if focused && show_cursor {
-            if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
+            if let Some(target) = prepaint.cursor_bounds {
+                // Where the caret is *drawn* -- part way along a slide, or the
+                // target itself. Interpolated in text coordinates; the scroll
+                // offset goes on after.
+                let line_height = prepaint.last_layout.line_height;
+                let (quad, sliding) = self.state.update(cx, |state, _| {
+                    state.advance_caret_slide(target, line_height)
+                });
+                let cursor_bounds = PrepaintState::with_scroll(quad, prepaint.cursor_scroll_offset);
+
                 let state = self.state.read(cx);
                 let blinking = state.mode.cursor_blinking();
                 let style = state.mode.cursor_style();
@@ -1849,7 +1867,10 @@ impl Element for TextElement {
                     window.paint_quad(fill(quad, color));
                 }
 
-                if blinking.needs_animation() {
+                // A slide needs frames for the same reason the fades do.
+                // Every caret move pauses the blink (`pause_blink_cursor`), so
+                // the caret is solid while it travels without any extra work.
+                if sliding || blinking.needs_animation() {
                     window.request_animation_frame();
                 }
             }

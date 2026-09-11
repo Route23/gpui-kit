@@ -9,8 +9,8 @@ use super::text_wrapper::TextWrapper;
 use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
 use crate::input::{
-    AutoClose, BracketGuides, CursorBlinking, CursorStyle, MatchBrackets, RopeExt as _,
-    SurroundingLinesStyle, TabSize,
+    AutoClose, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle, MatchBrackets,
+    RopeExt as _, SurroundingLinesStyle, TabSize,
 };
 
 /// How many rows the editor keeps above and below the caret when it scrolls
@@ -208,6 +208,8 @@ pub(crate) enum InputMode {
         surrounding_lines_style: SurroundingLinesStyle,
         /// Whether clicking near an edge scrolls to keep those rows
         autoscroll_on_clicks: bool,
+        /// Whether the caret slides between positions
+        caret_animation: CaretAnimation,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -259,6 +261,7 @@ impl InputMode {
             cursor_surrounding_lines: DEFAULT_SURROUNDING_LINES,
             surrounding_lines_style: SurroundingLinesStyle::default(),
             autoscroll_on_clicks: false,
+            caret_animation: CaretAnimation::default(),
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -479,6 +482,18 @@ impl InputMode {
                 ..
             } => *highlight_active_bracket_pair,
             _ => false,
+        }
+    }
+
+    /// Return [`CaretAnimation::Off`] if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn caret_animation(&self) -> CaretAnimation {
+        match self {
+            InputMode::CodeEditor {
+                caret_animation, ..
+            } => *caret_animation,
+            _ => CaretAnimation::Off,
         }
     }
 
@@ -715,7 +730,7 @@ mod tests {
     use crate::{
         highlighter::DiagnosticSet,
         input::{
-            AutoClose, BracketGuides, CursorBlinking, CursorStyle, MatchBrackets,
+            AutoClose, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle, MatchBrackets,
             SurroundingLinesStyle, TabSize,
             mode::{
                 DEFAULT_SURROUNDING_LINES, FoldingControls, InputMode, LineNumbers,
@@ -751,6 +766,11 @@ mod tests {
         assert_eq!(mode.cursor_surrounding_lines(), 3, "was a bare 3");
         assert_eq!(mode.surrounding_lines_style(), SurroundingLinesStyle::OnMove);
         assert!(!mode.autoscroll_on_clicks(), "off like Zed");
+        assert_eq!(
+            mode.caret_animation(),
+            CaretAnimation::Off,
+            "the caret jumped before this existed"
+        );
         assert_eq!(mode.language_name(), "rust");
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
@@ -778,6 +798,7 @@ mod tests {
             cursor_surrounding_lines: 0,
             surrounding_lines_style: SurroundingLinesStyle::Always,
             autoscroll_on_clicks: true,
+            caret_animation: CaretAnimation::On,
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),
@@ -801,6 +822,7 @@ mod tests {
         assert_eq!(mode.cursor_surrounding_lines(), 0);
         assert_eq!(mode.surrounding_lines_style(), SurroundingLinesStyle::Always);
         assert!(mode.autoscroll_on_clicks());
+        assert_eq!(mode.caret_animation(), CaretAnimation::On);
     }
 
     #[test]
@@ -813,6 +835,7 @@ mod tests {
         assert_eq!(mode.cursor_surrounding_lines(), DEFAULT_SURROUNDING_LINES);
         assert_eq!(mode.surrounding_lines_style(), SurroundingLinesStyle::OnMove);
         assert!(!mode.autoscroll_on_clicks());
+        assert_eq!(mode.caret_animation(), CaretAnimation::Off);
     }
 
     #[test]

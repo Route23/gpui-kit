@@ -5,6 +5,8 @@
 //! `editor.cursorStyle` / `editor.cursorBlinking` / `editor.cursorWidth` and
 //! Zed's `cursor_shape` / `vertical_scroll_margin` / `autoscroll_on_clicks`.
 
+use std::time::Duration;
+
 use gpui::{point, px, size, Bounds, Pixels, Point};
 
 /// The width a line caret gets when the width is left at `0` (auto).
@@ -94,6 +96,69 @@ impl CursorBlinking {
             CursorBlinking::Smooth | CursorBlinking::Phase | CursorBlinking::Expand
         )
     }
+}
+
+/// How the caret moves between two positions.
+///
+/// Mirrors VS Code's `editor.cursorSmoothCaretAnimation`. This is the
+/// **position**; [`CursorBlinking::Smooth`] is the **opacity**. They are
+/// different things and can be on at the same time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CaretAnimation {
+    /// Jump, as the caret always did. The default.
+    #[default]
+    Off,
+    /// Slide only when the caret was moved on purpose -- a key or a click.
+    /// An edit that pushes the caret along does not animate.
+    Explicit,
+    /// Slide whenever the caret moves, typing included.
+    On,
+}
+
+/// How long one slide takes.
+///
+/// Short on purpose: this is meant to be felt, not watched. VS Code is in the
+/// same range.
+pub const SLIDE_DURATION: Duration = Duration::from_millis(90);
+
+/// How far the caret will slide instead of jumping, in rows.
+///
+/// A click across the file or a jump from a search hit should land, not draw
+/// a line across the pane.
+const MAX_SLIDE_ROWS: f32 = 3.;
+
+/// Whether a move from `from` to `to` is close enough to animate.
+///
+/// Only the vertical distance is capped -- moving to the far end of the same
+/// row (end of line, home) still reads well as a slide.
+pub fn should_slide(from: Bounds<Pixels>, to: Bounds<Pixels>, line_height: Pixels) -> bool {
+    if from.origin == to.origin {
+        return false;
+    }
+    let dy = (to.origin.y - from.origin.y).abs();
+    dy <= line_height * MAX_SLIDE_ROWS
+}
+
+/// The caret part way from `from` to `to`.
+///
+/// The size is interpolated too, so a block caret moving between a wide glyph
+/// and a narrow one does not pop.
+pub fn slide(from: Bounds<Pixels>, to: Bounds<Pixels>, t: f32) -> Bounds<Pixels> {
+    let t = smoothstep(t);
+    Bounds::new(
+        point(
+            lerp(from.origin.x, to.origin.x, t),
+            lerp(from.origin.y, to.origin.y, t),
+        ),
+        size(
+            lerp(from.size.width, to.size.width, t),
+            lerp(from.size.height, to.size.height, t),
+        ),
+    )
+}
+
+fn lerp(a: Pixels, b: Pixels, t: f32) -> Pixels {
+    a + (b - a) * t
 }
 
 /// When the rows kept above and below the caret are enforced.
@@ -351,6 +416,46 @@ mod tests {
         assert!(CursorBlinking::Smooth.needs_animation());
         assert!(CursorBlinking::Phase.needs_animation());
         assert!(CursorBlinking::Expand.needs_animation());
+    }
+
+    #[test]
+    fn a_slide_starts_at_from_and_lands_on_to() {
+        let a = Bounds::new(point(px(0.), px(0.)), size(px(2.), px(20.)));
+        let b = Bounds::new(point(px(100.), px(40.)), size(px(8.), px(20.)));
+
+        assert_eq!(slide(a, b, 0.), a);
+        assert_eq!(slide(a, b, 1.), b);
+        // Out of range is clamped, not extrapolated.
+        assert_eq!(slide(a, b, -1.), a);
+        assert_eq!(slide(a, b, 2.), b);
+
+        // Half way is half way, and the width comes along.
+        let mid = slide(a, b, 0.5);
+        assert_eq!(mid.origin, point(px(50.), px(20.)));
+        assert_eq!(mid.size.width, px(5.));
+    }
+
+    #[test]
+    fn only_nearby_moves_slide() {
+        let line = px(20.);
+        let at = |x: f32, y: f32| Bounds::new(point(px(x), px(y)), size(px(2.), px(17.)));
+
+        // Same row, far across: still a slide.
+        assert!(should_slide(at(0., 0.), at(800., 0.), line));
+        // Three rows: the edge of the window.
+        assert!(should_slide(at(0., 0.), at(0., 60.), line));
+        assert!(should_slide(at(0., 60.), at(0., 0.), line));
+        // Four rows: a jump.
+        assert!(!should_slide(at(0., 0.), at(0., 80.), line));
+        // Not moving is not a slide.
+        assert!(!should_slide(at(10., 20.), at(10., 20.), line));
+    }
+
+    #[test]
+    fn the_two_smooths_are_different_settings() {
+        // `CaretAnimation` is the position, `CursorBlinking` the opacity.
+        assert_eq!(CaretAnimation::default(), CaretAnimation::Off);
+        assert_eq!(CursorBlinking::default(), CursorBlinking::Blink);
     }
 
     #[test]

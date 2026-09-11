@@ -14,13 +14,14 @@ use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Instant;
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
 use super::{
     blink_cursor::BlinkCursor,
     brackets::{self, AutoClose, AutoCloseEdit, BracketGuides, MatchBrackets},
-    caret::{CursorBlinking, CursorStyle, SurroundingLinesStyle},
+    caret::{self, CaretAnimation, CursorBlinking, CursorStyle, SurroundingLinesStyle},
     comment::{self, EnterComment},
     tags,
     change::Change,
@@ -257,6 +258,17 @@ pub(crate) fn init(cx: &mut App) {
     number_input::init(cx);
 }
 
+/// A caret slide in flight.
+///
+/// `from` and `to` are in text coordinates (no scroll offset), so a slide
+/// survives scrolling without turning into a drift.
+#[derive(Clone, Copy)]
+pub(super) struct CaretSlide {
+    from: Bounds<Pixels>,
+    to: Bounds<Pixels>,
+    start: Instant,
+}
+
 #[derive(Clone)]
 pub(super) struct LastLayout {
     /// The visible range (no wrap) of lines in the viewport, the value is row (0-based) index.
@@ -300,6 +312,16 @@ pub struct InputState {
     pub(super) text_wrapper: TextWrapper,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
+    /// The caret slide in flight, if any (`editor.cursorSmoothCaretAnimation`).
+    ///
+    /// Lives here rather than in the element because the element is rebuilt
+    /// every frame. The rectangles are in **text coordinates** -- no scroll
+    /// offset -- so scrolling never looks like the caret moved.
+    pub(super) caret_slide: Option<CaretSlide>,
+    /// Whether the last caret move was asked for (a key or a click) rather
+    /// than the result of an edit pushing it along. Read by
+    /// [`CaretAnimation::Explicit`].
+    pub(super) caret_moved_explicitly: bool,
     pub(super) loading: bool,
     /// Range in UTF-8 length for the selected text.
     ///
@@ -416,6 +438,8 @@ impl InputState {
             text: "".into(),
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
+            caret_slide: None,
+            caret_moved_explicitly: false,
             history,
             selected_range: Selection::default(),
             search_panel: None,
@@ -825,6 +849,37 @@ impl InputState {
         if let InputMode::CodeEditor { cursor_height, .. } = &mut self.mode {
             *cursor_height = percent;
         }
+        cx.notify();
+    }
+
+    /// Slide the caret between positions, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn caret_animation(mut self, animation: CaretAnimation) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            caret_animation, ..
+        } = &mut self.mode
+        {
+            *caret_animation = animation;
+        }
+        self
+    }
+
+    /// Slide the caret between positions, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_caret_animation(
+        &mut self,
+        animation: CaretAnimation,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor {
+            caret_animation, ..
+        } = &mut self.mode
+        {
+            *caret_animation = animation;
+        }
+        self.caret_slide = None;
         cx.notify();
     }
 
@@ -2316,6 +2371,7 @@ impl InputState {
     ///
     /// Ensure the offset use self.next_boundary or self.previous_boundary to get the correct offset.
     pub(crate) fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.caret_moved_explicitly = true;
         self.clear_inline_completion(cx);
 
         let offset = offset.clamp(0, self.text.len());
@@ -2392,6 +2448,74 @@ impl InputState {
         }
 
         offset
+    }
+
+    /// Where to draw the caret this frame, and whether a slide is still in
+    /// flight (so the element knows to ask for another frame).
+    ///
+    /// `target` is in text coordinates, without the scroll offset -- the
+    /// element adds that after. Interpolating in screen coordinates would
+    /// make a plain scroll look like the caret slid across the pane.
+    pub(crate) fn advance_caret_slide(
+        &mut self,
+        target: Bounds<Pixels>,
+        line_height: Pixels,
+    ) -> (Bounds<Pixels>, bool) {
+        let animation = self.mode.caret_animation();
+        if animation == CaretAnimation::Off {
+            self.caret_slide = None;
+            return (target, false);
+        }
+
+        // Where the caret is being drawn right now: part way through the
+        // slide in flight, or wherever the last frame put it.
+        let (drawn, aiming_at) = match self.caret_slide {
+            Some(slide) => {
+                let t = slide.start.elapsed().as_secs_f32()
+                    / caret::SLIDE_DURATION.as_secs_f32();
+                (caret::slide(slide.from, slide.to, t), Some(slide.to))
+            }
+            None => {
+                // `last_layout` is still the previous frame's here; the
+                // element writes this frame's at the end of `paint`.
+                let last = self
+                    .last_layout
+                    .as_ref()
+                    .and_then(|layout| layout.cursor_bounds);
+                (last.unwrap_or(target), last)
+            }
+        };
+
+        if aiming_at == Some(target) {
+            // Still heading for the same place.
+            let Some(slide) = self.caret_slide else {
+                return (target, false);
+            };
+            let t =
+                slide.start.elapsed().as_secs_f32() / caret::SLIDE_DURATION.as_secs_f32();
+            if t >= 1. {
+                self.caret_slide = None;
+                return (target, false);
+            }
+            return (caret::slide(slide.from, slide.to, t), true);
+        }
+
+        // The caret has been asked to go somewhere new.
+        let explicit_only = animation == CaretAnimation::Explicit;
+        if (explicit_only && !self.caret_moved_explicitly)
+            || !caret::should_slide(drawn, target, line_height)
+        {
+            self.caret_slide = None;
+            return (target, false);
+        }
+
+        // Start from where it is now, so redirecting mid-slide does not jump.
+        self.caret_slide = Some(CaretSlide {
+            from: drawn,
+            to: target,
+            start: Instant::now(),
+        });
+        (drawn, true)
     }
 
     /// Returns the true to let InputElement to render cursor, when Input is focused and current BlinkCursor is visible.
@@ -2670,6 +2794,9 @@ impl EntityInputHandler for InputState {
             return;
         }
 
+        // The caret is about to be pushed along by an edit, not moved on
+        // purpose. `CaretAnimation::Explicit` does not slide for this.
+        self.caret_moved_explicitly = false;
         self.pause_blink_cursor(cx);
 
         // ── auto-closing brackets ──────────────────────────────────────────

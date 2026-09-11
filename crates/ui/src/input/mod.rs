@@ -26,7 +26,8 @@ mod selection;
 
 pub(crate) use clear_button::*;
 pub use caret::{
-    appearance as caret_appearance, CursorBlinking, CursorStyle, SurroundingLinesStyle,
+    appearance as caret_appearance, CaretAnimation, CursorBlinking, CursorStyle,
+    SurroundingLinesStyle,
 };
 pub use cursor::*;
 pub use indent::TabSize;

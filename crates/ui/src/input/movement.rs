@@ -59,6 +59,9 @@ impl InputState {
             },
         );
         self.selected_range = (offset..offset).into();
+        // A key or a click put the caret here, so `CaretAnimation::Explicit`
+        // slides. This is the choke point for both (see the note above).
+        self.caret_moved_explicitly = true;
         self.scroll_to(offset, direction, cx);
         self.pause_blink_cursor(cx);
         self.update_preferred_column();
