@@ -21,7 +21,22 @@ use super::{InputState, LastLayout, mode::InputMode};
 /// A code editor takes the number from `editor.cursorSurroundingLines`
 /// instead (`InputMode::cursor_surrounding_lines`).
 const BOTTOM_MARGIN_ROWS: usize = 3;
-pub(super) const RIGHT_MARGIN: Pixels = px(10.);
+/// How much room to keep to the right of the caret when scrolling it into view.
+///
+/// **This has to clear the vertical scrollbar.** The scrollbar is drawn over
+/// the text at the right edge of the input, and it is drawn *after* the caret,
+/// so a caret parked inside that band is simply covered -- which is what
+/// happened at the end of a horizontally scrolled line (dopamine #324): the
+/// margin was 10px, the scrollbar is 16px, and the caret sat under it.
+///
+/// The extra px beyond the scrollbar's width is room for the caret itself: the
+/// margin positions the caret's *column*, and block and underline carets
+/// extend a glyph's width to the right of it.
+pub(super) const RIGHT_MARGIN: Pixels = px(WIDTH_OF_SCROLLBAR + 8.);
+
+/// `crate::scroll::Scrollbar::width()`, which is not reachable from a `const`
+/// initialiser. Kept next to the margin so the two cannot drift apart.
+const WIDTH_OF_SCROLLBAR: f32 = 4. * 2. + 8.;
 /// The strip between the line numbers and the text that holds fold chevrons.
 pub(super) const FOLD_CHEVRON_WIDTH: Pixels = px(14.);
 
@@ -2079,6 +2094,23 @@ fn split_runs_by_bg_segments(
 
 #[cfg(test)]
 mod tests {
+    /// The caret margin has to clear the scrollbar, or the caret at the end of
+    /// a horizontally scrolled line is drawn underneath it (dopamine #324).
+    ///
+    /// The scrollbar is drawn after the text element, so there is no painting
+    /// order to fix -- the caret simply must not be parked there.
+    #[test]
+    fn the_right_margin_clears_the_scrollbar() {
+        assert_eq!(
+            gpui::px(super::WIDTH_OF_SCROLLBAR),
+            crate::scroll::Scrollbar::width()
+        );
+        assert!(
+            super::RIGHT_MARGIN > crate::scroll::Scrollbar::width(),
+            "the caret would sit under the scrollbar"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -2179,3 +2211,4 @@ mod tests {
         assert_eq!(result[5].color, gpui::blue());
     }
 }
+
