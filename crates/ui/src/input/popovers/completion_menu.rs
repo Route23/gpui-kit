@@ -262,6 +262,24 @@ impl CompletionMenu {
                     window,
                     cx,
                 );
+
+                // Anything the server wants changed elsewhere in the file --
+                // rust-analyzer puts the `use` line for an auto-import here.
+                // Dropping these silently leaves the buffer not compiling,
+                // which is worse than not offering the completion at all.
+                //
+                // Applied **after** the main edit and **back to front**, so the
+                // ranges (which the server computed against the text as it was)
+                // do not shift under each other. An edit that lands after the
+                // caret would shift it, so the ranges are checked first.
+                if let Some(edits) = item.additional_text_edits.as_ref() {
+                    let mut edits = edits.clone();
+                    edits.sort_by_key(|e| {
+                        std::cmp::Reverse(editor.text.position_to_offset(&e.range.start))
+                    });
+                    editor.apply_lsp_edits(&edits, window, cx);
+                }
+
                 editor.completion_inserting = false;
                 // FIXME: Input not get the focus
                 editor.focus(window, cx);
