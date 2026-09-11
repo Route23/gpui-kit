@@ -115,18 +115,24 @@ pub enum SurroundingLinesStyle {
 /// caret is at its strongest right after a keystroke resets the cycle.
 ///
 /// Returns `(opacity, height factor)`, both 0.0..=1.0.
+///
+/// **Only the interpolating styles are shaped here.** [`CursorBlinking::Blink`]
+/// is switched on and off by the 500ms timer in `blink_cursor.rs`, which the
+/// element consults through `InputState::show_cursor`; shaping it a second
+/// time from the phase would multiply two square waves that drift apart --
+/// anti-phase, and the caret never shows at all.
 pub fn appearance(blinking: CursorBlinking, phase: f32) -> (f32, f32) {
     let phase = phase.clamp(0., 1.);
     // 1 at both ends of the cycle, 0 in the middle.
     let wave = smoothstep((2. * phase - 1.).abs());
 
     match blinking {
-        CursorBlinking::Blink => (if phase < 0.5 { 1. } else { 0. }, 1.),
+        // Drawn at all => drawn fully. The timer owns the on/off.
+        CursorBlinking::Blink | CursorBlinking::Solid => (1., 1.),
         CursorBlinking::Smooth => (wave, 1.),
         // Never reaches 0: "phase" dims the caret, it does not hide it.
         CursorBlinking::Phase => (0.35 + 0.65 * wave, 1.),
         CursorBlinking::Expand => (1., 0.2 + 0.8 * wave),
-        CursorBlinking::Solid => (1., 1.),
     }
 }
 
@@ -307,14 +313,16 @@ mod tests {
         assert_eq!(thin.size.height, UNDERLINE_THIN_HEIGHT);
     }
 
+    /// The two styles the element must not shape.
+    ///
+    /// `Blink`'s on/off lives in the 500ms timer, which the element reads
+    /// through `show_cursor`. If `appearance` also returned a square wave the
+    /// two would drift into anti-phase and the caret would never be drawn --
+    /// which is exactly what happened on the device before this was fixed.
     #[test]
-    fn blink_is_a_square_wave_and_solid_never_moves() {
-        assert_eq!(appearance(CursorBlinking::Blink, 0.), (1., 1.));
-        assert_eq!(appearance(CursorBlinking::Blink, 0.49), (1., 1.));
-        assert_eq!(appearance(CursorBlinking::Blink, 0.5), (0., 1.));
-        assert_eq!(appearance(CursorBlinking::Blink, 0.99), (0., 1.));
-
-        for phase in [0., 0.25, 0.5, 0.75, 1.] {
+    fn blink_and_solid_are_never_shaped_here() {
+        for phase in [0., 0.25, 0.49, 0.5, 0.75, 0.99, 1.] {
+            assert_eq!(appearance(CursorBlinking::Blink, phase), (1., 1.));
             assert_eq!(appearance(CursorBlinking::Solid, phase), (1., 1.));
         }
     }
