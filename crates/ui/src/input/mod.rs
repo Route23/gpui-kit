@@ -1,5 +1,6 @@
 mod blink_cursor;
 mod brackets;
+mod caret;
 mod change;
 mod comment;
 mod clear_button;
@@ -24,6 +25,9 @@ mod whitespace;
 mod selection;
 
 pub(crate) use clear_button::*;
+pub use caret::{
+    appearance as caret_appearance, CursorBlinking, CursorStyle, SurroundingLinesStyle,
+};
 pub use cursor::*;
 pub use indent::TabSize;
 pub use input::*;

@@ -11,11 +11,15 @@ use smallvec::SmallVec;
 
 use crate::{
     ActiveTheme as _, Colorize, PixelsExt, Root,
-    input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, brackets, text_wrapper::LineLayout},
+    input::{RopeExt as _, brackets, caret, text_wrapper::LineLayout},
 };
 
 use super::{InputState, LastLayout, mode::InputMode};
 
+/// Rows kept below the caret in an input that is not a code editor.
+///
+/// A code editor takes the number from `editor.cursorSurroundingLines`
+/// instead (`InputMode::cursor_surrounding_lines`).
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 /// The strip between the line numbers and the text that holds fold chevrons.
@@ -115,16 +119,22 @@ impl TextElement {
         let mut cursor_bounds = None;
 
         // If the input has a fixed height (Otherwise is auto-grow), we need to add a bottom margin to the input.
+        let margin_rows = if state.mode.is_code_editor() {
+            usize::from(state.mode.cursor_surrounding_lines())
+        } else {
+            BOTTOM_MARGIN_ROWS
+        };
         let top_bottom_margin = if state.mode.is_auto_grow() {
             line_height
-        } else if visible_range.len() < BOTTOM_MARGIN_ROWS * 8 {
+        } else if margin_rows == 0 || visible_range.len() < BOTTOM_MARGIN_ROWS * 8 {
             line_height
         } else {
-            BOTTOM_MARGIN_ROWS * line_height
+            margin_rows * line_height
         };
 
         // The cursor corresponds to the current cursor position in the text no only the line.
         let mut cursor_pos = None;
+        let mut cursor_advance = None;
         let mut cursor_start = None;
         let mut cursor_end = None;
 
@@ -150,6 +160,16 @@ impl TextElement {
                     if let Some(pos) = line.position_for_index(offset, line_height) {
                         current_row = Some(row);
                         cursor_pos = Some(line_origin + pos);
+                        // How wide the glyph under the caret is, for the block
+                        // and underline shapes. `x_for_index` snaps to the next
+                        // glyph, so probing one byte ahead steps over a
+                        // multi-byte character without decoding it here. At the
+                        // end of a line there is nothing ahead and the caret
+                        // falls back to a minimum width.
+                        cursor_advance = line
+                            .position_for_index(offset + 1, line_height)
+                            .filter(|next| next.y == pos.y)
+                            .map(|next| next.x - pos.x);
                     }
                 }
                 if cursor_start.is_none() {
@@ -242,18 +262,27 @@ impl TextElement {
             }
 
             // cursor bounds
-            let cursor_height = match state.size {
+            //
+            // The shape, the width and the height all come from the mode; a
+            // plain input asks for nothing and gets the bar it always had,
+            // sized from `state.size`.
+            let auto_height = match state.size {
                 crate::Size::Large => 1.,
                 crate::Size::Small => 0.75,
                 _ => 0.85,
-            } * line_height;
+            };
 
-            cursor_bounds = Some(Bounds::new(
+            cursor_bounds = Some(caret::cursor_bounds(
+                state.mode.cursor_style(),
                 point(
                     bounds.left() + cursor_pos.x + line_number_width + scroll_offset.x,
-                    bounds.top() + cursor_pos.y + ((line_height - cursor_height) / 2.),
+                    bounds.top() + cursor_pos.y,
                 ),
-                size(CURSOR_WIDTH, cursor_height),
+                line_height,
+                cursor_advance.unwrap_or(px(0.)),
+                state.mode.cursor_width(),
+                state.mode.cursor_height(),
+                auto_height,
             ));
         }
 
@@ -1792,9 +1821,37 @@ impl Element for TextElement {
         Self::paint_whitespaces(&prepaint.whitespaces, line_height, window, cx);
 
         // Paint blinking cursor
+        //
+        // `Blink` is already on/off by the time it gets here; the fades are
+        // shaped from the phase, and only those need a frame scheduled.
         if focused && show_cursor {
             if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
-                window.paint_quad(fill(cursor_bounds, cx.theme().caret));
+                let state = self.state.read(cx);
+                let blinking = state.mode.cursor_blinking();
+                let style = state.mode.cursor_style();
+                let phase = state.blink_cursor.read(cx).phase();
+                let (opacity, height) = caret::appearance(blinking, phase);
+                let quad = caret::scale_height(cursor_bounds, height);
+                let color = cx.theme().caret.opacity(opacity);
+
+                if style.is_outline() {
+                    // Leave the glyph readable: draw the box, not a fill.
+                    let mut builder = gpui::PathBuilder::stroke(px(1.));
+                    builder.move_to(quad.origin);
+                    builder.line_to(point(quad.right(), quad.top()));
+                    builder.line_to(point(quad.right(), quad.bottom()));
+                    builder.line_to(point(quad.left(), quad.bottom()));
+                    builder.line_to(quad.origin);
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, color);
+                    }
+                } else if opacity > 0. {
+                    window.paint_quad(fill(quad, color));
+                }
+
+                if blinking.needs_animation() {
+                    window.request_animation_frame();
+                }
             }
         }
 
@@ -1877,7 +1934,11 @@ impl Element for TextElement {
         if focused {
             if let Some(first_line) = &prepaint.ghost_first_line {
                 if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
-                    let first_line_x = cursor_bounds.origin.x + cursor_bounds.size.width;
+                    // A block or underline caret is as wide as the glyph it
+                    // covers; the ghost text still starts at the caret, so
+                    // clamp to a bar's width here.
+                    let first_line_x = cursor_bounds.origin.x
+                        + cursor_bounds.size.width.min(caret::DEFAULT_CURSOR_WIDTH);
                     let p = point(first_line_x, cursor_bounds.origin.y);
 
                     // Paint background to cover any existing text

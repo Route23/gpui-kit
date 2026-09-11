@@ -1,14 +1,24 @@
 use std::rc::Rc;
 use std::{cell::RefCell, ops::Range};
 
-use gpui::{App, SharedString};
+use gpui::{px, App, Pixels, SharedString};
 use ropey::Rope;
 use tree_sitter::InputEdit;
 
 use super::text_wrapper::TextWrapper;
 use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
-use crate::input::{AutoClose, BracketGuides, MatchBrackets, RopeExt as _, TabSize};
+use crate::input::{
+    AutoClose, BracketGuides, CursorBlinking, CursorStyle, MatchBrackets, RopeExt as _,
+    SurroundingLinesStyle, TabSize,
+};
+
+/// How many rows the editor keeps above and below the caret when it scrolls
+/// the caret into view.
+///
+/// This was a bare `3` in `state.rs` and `element.rs` before it was settable,
+/// so it stays the default. VS Code's `editor.cursorSurroundingLines` is 0.
+pub(super) const DEFAULT_SURROUNDING_LINES: u8 = 3;
 
 /// How the line number gutter of a [`InputMode::CodeEditor`] is rendered.
 ///
@@ -184,6 +194,20 @@ pub(crate) enum InputMode {
         comment_insert_space: bool,
         /// Whether Enter carries a line comment onto the next line
         comment_on_newline: bool,
+        /// The shape of the caret
+        cursor_style: CursorStyle,
+        /// How the caret blinks
+        cursor_blinking: CursorBlinking,
+        /// The width of a line caret in px; `0` is the built-in 1.5px
+        cursor_width: u8,
+        /// The height of a line caret as a percent of the line; `0` is auto
+        cursor_height: u8,
+        /// How many rows to keep above and below the caret when scrolling
+        cursor_surrounding_lines: u8,
+        /// When those rows are enforced
+        surrounding_lines_style: SurroundingLinesStyle,
+        /// Whether clicking near an edge scrolls to keep those rows
+        autoscroll_on_clicks: bool,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -228,6 +252,13 @@ impl InputMode {
             highlight_active_bracket_pair: true,
             comment_insert_space: true,
             comment_on_newline: true,
+            cursor_style: CursorStyle::default(),
+            cursor_blinking: CursorBlinking::default(),
+            cursor_width: 0,
+            cursor_height: 0,
+            cursor_surrounding_lines: DEFAULT_SURROUNDING_LINES,
+            surrounding_lines_style: SurroundingLinesStyle::default(),
+            autoscroll_on_clicks: false,
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -451,6 +482,91 @@ impl InputMode {
         }
     }
 
+    /// Return [`CursorStyle::Line`] if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn cursor_style(&self) -> CursorStyle {
+        match self {
+            InputMode::CodeEditor { cursor_style, .. } => *cursor_style,
+            _ => CursorStyle::Line,
+        }
+    }
+
+    /// Return [`CursorBlinking::Blink`] if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn cursor_blinking(&self) -> CursorBlinking {
+        match self {
+            InputMode::CodeEditor {
+                cursor_blinking, ..
+            } => *cursor_blinking,
+            _ => CursorBlinking::Blink,
+        }
+    }
+
+    /// The caret width in px, or `None` for the built-in one.
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn cursor_width(&self) -> Option<Pixels> {
+        match self {
+            InputMode::CodeEditor { cursor_width, .. } if *cursor_width > 0 => {
+                Some(px(f32::from(*cursor_width)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The caret height as a percent of the line, or `0` for auto.
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn cursor_height(&self) -> u8 {
+        match self {
+            InputMode::CodeEditor { cursor_height, .. } => *cursor_height,
+            _ => 0,
+        }
+    }
+
+    /// Return [`DEFAULT_SURROUNDING_LINES`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn cursor_surrounding_lines(&self) -> u8 {
+        match self {
+            InputMode::CodeEditor {
+                cursor_surrounding_lines,
+                ..
+            } => *cursor_surrounding_lines,
+            _ => DEFAULT_SURROUNDING_LINES,
+        }
+    }
+
+    /// Return [`SurroundingLinesStyle::OnMove`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn surrounding_lines_style(&self) -> SurroundingLinesStyle {
+        match self {
+            InputMode::CodeEditor {
+                surrounding_lines_style,
+                ..
+            } => *surrounding_lines_style,
+            _ => SurroundingLinesStyle::OnMove,
+        }
+    }
+
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn autoscroll_on_clicks(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                autoscroll_on_clicks,
+                ..
+            } => *autoscroll_on_clicks,
+            _ => false,
+        }
+    }
+
     /// Return [`BracketGuides::Off`] if the mode is not [`InputMode::CodeEditor`].
     #[allow(unused)]
     #[inline]
@@ -593,13 +709,18 @@ impl InputMode {
 
 #[cfg(test)]
 mod tests {
+    use gpui::px;
     use ropey::Rope;
 
     use crate::{
         highlighter::DiagnosticSet,
         input::{
-            AutoClose, BracketGuides, MatchBrackets, TabSize,
-            mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace},
+            AutoClose, BracketGuides, CursorBlinking, CursorStyle, MatchBrackets,
+            SurroundingLinesStyle, TabSize,
+            mode::{
+                DEFAULT_SURROUNDING_LINES, FoldingControls, InputMode, LineNumbers,
+                RenderWhitespace,
+            },
         },
     };
 
@@ -622,6 +743,14 @@ mod tests {
         assert!(mode.highlight_active_bracket_pair());
         assert!(mode.comment_insert_space(), "`// a` like VS Code");
         assert!(mode.comment_on_newline(), "Enter keeps the comment going");
+        // Every caret default is the caret we had before it was settable.
+        assert_eq!(mode.cursor_style(), CursorStyle::Line);
+        assert_eq!(mode.cursor_blinking(), CursorBlinking::Blink);
+        assert_eq!(mode.cursor_width(), None, "the built-in 1.5px");
+        assert_eq!(mode.cursor_height(), 0, "auto, from the input size");
+        assert_eq!(mode.cursor_surrounding_lines(), 3, "was a bare 3");
+        assert_eq!(mode.surrounding_lines_style(), SurroundingLinesStyle::OnMove);
+        assert!(!mode.autoscroll_on_clicks(), "off like Zed");
         assert_eq!(mode.language_name(), "rust");
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
@@ -642,6 +771,13 @@ mod tests {
             highlight_active_bracket_pair: true,
             comment_insert_space: true,
             comment_on_newline: true,
+            cursor_style: CursorStyle::Block,
+            cursor_blinking: CursorBlinking::Solid,
+            cursor_width: 3,
+            cursor_height: 60,
+            cursor_surrounding_lines: 0,
+            surrounding_lines_style: SurroundingLinesStyle::Always,
+            autoscroll_on_clicks: true,
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),
@@ -656,6 +792,27 @@ mod tests {
         assert_eq!(mode.has_folding(), false, "single line never folds");
         assert_eq!(mode.max_rows(), 1);
         assert_eq!(mode.min_rows(), 1);
+        // Set explicitly above, so they read back rather than falling to the
+        // non-code-editor defaults.
+        assert_eq!(mode.cursor_style(), CursorStyle::Block);
+        assert_eq!(mode.cursor_blinking(), CursorBlinking::Solid);
+        assert_eq!(mode.cursor_width(), Some(px(3.)));
+        assert_eq!(mode.cursor_height(), 60);
+        assert_eq!(mode.cursor_surrounding_lines(), 0);
+        assert_eq!(mode.surrounding_lines_style(), SurroundingLinesStyle::Always);
+        assert!(mode.autoscroll_on_clicks());
+    }
+
+    #[test]
+    fn a_plain_input_keeps_the_caret_it_always_had() {
+        let mode = InputMode::plain_text();
+        assert_eq!(mode.cursor_style(), CursorStyle::Line);
+        assert_eq!(mode.cursor_blinking(), CursorBlinking::Blink);
+        assert_eq!(mode.cursor_width(), None);
+        assert_eq!(mode.cursor_height(), 0);
+        assert_eq!(mode.cursor_surrounding_lines(), DEFAULT_SURROUNDING_LINES);
+        assert_eq!(mode.surrounding_lines_style(), SurroundingLinesStyle::OnMove);
+        assert!(!mode.autoscroll_on_clicks());
     }
 
     #[test]

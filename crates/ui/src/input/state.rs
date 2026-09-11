@@ -20,6 +20,7 @@ use unicode_segmentation::*;
 use super::{
     blink_cursor::BlinkCursor,
     brackets::{self, AutoClose, AutoCloseEdit, BracketGuides, MatchBrackets},
+    caret::{CursorBlinking, CursorStyle, SurroundingLinesStyle},
     comment::{self, EnterComment},
     tags,
     change::Change,
@@ -396,8 +397,9 @@ impl InputState {
                 if window.is_window_active() {
                     let focus_handle = input.focus_handle.clone();
                     if focus_handle.is_focused(window) {
+                        let blinking = input.mode.cursor_blinking();
                         input.blink_cursor.update(cx, |blink_cursor, cx| {
-                            blink_cursor.start(cx);
+                            blink_cursor.start(blinking, cx);
                         });
                     }
                 }
@@ -738,6 +740,181 @@ impl InputState {
             *comment_on_newline = on;
         }
         self
+    }
+
+    /// The shape of the caret, only for [`InputMode::CodeEditor`] mode.
+    pub fn cursor_style(mut self, style: CursorStyle) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor { cursor_style, .. } = &mut self.mode {
+            *cursor_style = style;
+        }
+        self
+    }
+
+    /// The shape of the caret, only for [`InputMode::CodeEditor`] mode.
+    pub fn set_cursor_style(&mut self, style: CursorStyle, _: &mut Window, cx: &mut Context<Self>) {
+        if let InputMode::CodeEditor { cursor_style, .. } = &mut self.mode {
+            *cursor_style = style;
+        }
+        cx.notify();
+    }
+
+    /// How the caret blinks, only for [`InputMode::CodeEditor`] mode.
+    pub fn cursor_blinking(mut self, blinking: CursorBlinking) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            cursor_blinking, ..
+        } = &mut self.mode
+        {
+            *cursor_blinking = blinking;
+        }
+        self
+    }
+
+    /// How the caret blinks, only for [`InputMode::CodeEditor`] mode.
+    pub fn set_cursor_blinking(
+        &mut self,
+        blinking: CursorBlinking,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor {
+            cursor_blinking, ..
+        } = &mut self.mode
+        {
+            *cursor_blinking = blinking;
+        }
+        // The timer only runs for `Blink`, so the style has to be handed over.
+        let blinking = self.mode.cursor_blinking();
+        self.blink_cursor
+            .update(cx, |cursor, cx| cursor.start(blinking, cx));
+        cx.notify();
+    }
+
+    /// The width of a line caret in px (`0` keeps the built-in 1.5px), only
+    /// for [`InputMode::CodeEditor`] mode.
+    pub fn cursor_width(mut self, width: u8) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor { cursor_width, .. } = &mut self.mode {
+            *cursor_width = width;
+        }
+        self
+    }
+
+    /// The width of a line caret in px, only for [`InputMode::CodeEditor`] mode.
+    pub fn set_cursor_width(&mut self, width: u8, _: &mut Window, cx: &mut Context<Self>) {
+        if let InputMode::CodeEditor { cursor_width, .. } = &mut self.mode {
+            *cursor_width = width;
+        }
+        cx.notify();
+    }
+
+    /// The height of a line caret as a percent of the line (`0` is auto),
+    /// only for [`InputMode::CodeEditor`] mode.
+    pub fn cursor_height(mut self, percent: u8) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor { cursor_height, .. } = &mut self.mode {
+            *cursor_height = percent;
+        }
+        self
+    }
+
+    /// The height of a line caret as a percent of the line, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_cursor_height(&mut self, percent: u8, _: &mut Window, cx: &mut Context<Self>) {
+        if let InputMode::CodeEditor { cursor_height, .. } = &mut self.mode {
+            *cursor_height = percent;
+        }
+        cx.notify();
+    }
+
+    /// How many rows to keep above and below the caret, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn cursor_surrounding_lines(mut self, rows: u8) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            cursor_surrounding_lines,
+            ..
+        } = &mut self.mode
+        {
+            *cursor_surrounding_lines = rows;
+        }
+        self
+    }
+
+    /// How many rows to keep above and below the caret, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_cursor_surrounding_lines(
+        &mut self,
+        rows: u8,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor {
+            cursor_surrounding_lines,
+            ..
+        } = &mut self.mode
+        {
+            *cursor_surrounding_lines = rows;
+        }
+        cx.notify();
+    }
+
+    /// When those rows are enforced, only for [`InputMode::CodeEditor`] mode.
+    pub fn surrounding_lines_style(mut self, style: SurroundingLinesStyle) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            surrounding_lines_style,
+            ..
+        } = &mut self.mode
+        {
+            *surrounding_lines_style = style;
+        }
+        self
+    }
+
+    /// When those rows are enforced, only for [`InputMode::CodeEditor`] mode.
+    pub fn set_surrounding_lines_style(
+        &mut self,
+        style: SurroundingLinesStyle,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor {
+            surrounding_lines_style,
+            ..
+        } = &mut self.mode
+        {
+            *surrounding_lines_style = style;
+        }
+        cx.notify();
+    }
+
+    /// Scroll to keep those rows when the caret is placed by a click, only
+    /// for [`InputMode::CodeEditor`] mode.
+    pub fn autoscroll_on_clicks(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor {
+            autoscroll_on_clicks,
+            ..
+        } = &mut self.mode
+        {
+            *autoscroll_on_clicks = on;
+        }
+        self
+    }
+
+    /// Scroll to keep those rows when the caret is placed by a click, only
+    /// for [`InputMode::CodeEditor`] mode.
+    pub fn set_autoscroll_on_clicks(&mut self, on: bool, _: &mut Window, cx: &mut Context<Self>) {
+        if let InputMode::CodeEditor {
+            autoscroll_on_clicks,
+            ..
+        } = &mut self.mode
+        {
+            *autoscroll_on_clicks = on;
+        }
+        cx.notify();
     }
 
     /// Carry a line comment onto the next line on Enter, only for
@@ -1205,8 +1382,9 @@ impl InputState {
     /// Focus the input field.
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window);
+        let blinking = self.mode.cursor_blinking();
         self.blink_cursor.update(cx, |cursor, cx| {
-            cursor.start(cx);
+            cursor.start(blinking, cx);
         });
     }
 
@@ -1908,8 +2086,18 @@ impl InputState {
 
         // Check if row_offset_y is out of the viewport
         // If row offset is not in the viewport, scroll to make it visible
-        let edge_height = if direction.is_some() && self.mode.is_code_editor() {
-            3 * line_height
+        // How many rows to keep either side of the caret. `OnMove` only
+        // enforces them while the caret is being moved with the keyboard;
+        // `autoscroll_on_clicks` extends that to a click placing the caret.
+        let enforced = match self.mode.surrounding_lines_style() {
+            SurroundingLinesStyle::Always => true,
+            SurroundingLinesStyle::OnMove => {
+                direction.is_some() || self.mode.autoscroll_on_clicks()
+            }
+        };
+        let rows = usize::from(self.mode.cursor_surrounding_lines());
+        let edge_height = if enforced && rows > 0 && self.mode.is_code_editor() {
+            rows * line_height
         } else {
             line_height
         };
@@ -2208,14 +2396,24 @@ impl InputState {
 
     /// Returns the true to let InputElement to render cursor, when Input is focused and current BlinkCursor is visible.
     pub(crate) fn show_cursor(&self, window: &Window, cx: &App) -> bool {
-        (self.focus_handle.is_focused(window) || self.is_context_menu_open(cx))
-            && self.blink_cursor.read(cx).visible()
-            && window.is_window_active()
+        if !(self.focus_handle.is_focused(window) || self.is_context_menu_open(cx))
+            || !window.is_window_active()
+        {
+            return false;
+        }
+        match self.mode.cursor_blinking() {
+            // The 500ms timer owns the on/off.
+            CursorBlinking::Blink => self.blink_cursor.read(cx).visible(),
+            // Solid never hides, and the fades are shaped by the element from
+            // `BlinkCursor::phase` -- hiding them here would fight it.
+            _ => true,
+        }
     }
 
     fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let blinking = self.mode.cursor_blinking();
         self.blink_cursor.update(cx, |cursor, cx| {
-            cursor.start(cx);
+            cursor.start(blinking, cx);
         });
         cx.emit(InputEvent::Focus);
     }

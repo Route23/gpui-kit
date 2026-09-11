@@ -5,7 +5,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 
-use super::{InputEvent, blink_cursor::BlinkCursor};
+use super::{InputEvent, blink_cursor::BlinkCursor, caret::CursorBlinking};
 use crate::{ActiveTheme, Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
 pub struct OtpState {
@@ -32,7 +32,7 @@ impl OtpState {
                     let focus_handle = this.focus_handle.clone();
                     if focus_handle.is_focused(window) {
                         this.blink_cursor.update(cx, |blink_cursor, cx| {
-                            blink_cursor.start(cx);
+                            blink_cursor.start(CursorBlinking::default(), cx);
                         });
                     }
                 }
@@ -142,7 +142,7 @@ impl OtpState {
 
     fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.blink_cursor.update(cx, |cursor, cx| {
-            cursor.start(cx);
+            cursor.start(CursorBlinking::default(), cx);
         });
         cx.emit(InputEvent::Focus);
     }
