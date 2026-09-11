@@ -449,12 +449,21 @@ pub fn depths_in(
     out
 }
 
+/// The smallest saturation a coloured bracket gets.
+///
+/// Most themes paint brackets in the plain foreground colour, which is close to
+/// grey — and **rotating the hue of a grey changes nothing**. Deeper levels
+/// therefore get at least this much saturation so the hues are actually
+/// visible. Lightness is never touched, so contrast against the background is
+/// whatever the theme chose.
+const MIN_DEPTH_SATURATION: f32 = 0.45;
+
 /// The colour for a bracket `depth` levels in.
 ///
-/// Only the hue moves; saturation and lightness stay where the theme put them,
-/// so the colours keep their contrast in light themes as well as dark ones.
-/// **Depth 0 is the base colour unchanged**, which keeps the common case
-/// looking exactly like it did before colouring existed.
+/// The hue moves and the saturation is floored; **lightness stays where the
+/// theme put it**, so the colours keep their contrast in light themes as well
+/// as dark ones. **Depth 0 is the base colour unchanged**, which keeps the
+/// common case looking exactly like it did before colouring existed.
 pub fn depth_color(base: Hsla, depth: usize) -> Hsla {
     if depth == 0 {
         return base;
@@ -462,7 +471,11 @@ pub fn depth_color(base: Hsla, depth: usize) -> Hsla {
     // Roughly 100° a step: far enough apart to tell three levels apart at a
     // glance, and it comes back near the base only after five.
     let h = (base.h + 0.28 * depth as f32).fract();
-    Hsla { h, ..base }
+    Hsla {
+        h,
+        s: base.s.max(MIN_DEPTH_SATURATION),
+        ..base
+    }
 }
 
 #[cfg(test)]
@@ -657,8 +670,14 @@ mod tests {
         assert_eq!(depth_color(base, 0), base);
         let one = depth_color(base, 1);
         assert_ne!(one.h, base.h, "the hue moves");
-        assert_eq!((one.s, one.l, one.a), (base.s, base.l, base.a), "nothing else does");
+        assert_eq!((one.l, one.a), (base.l, base.a), "lightness is left alone");
         assert!((0.0..1.0).contains(&depth_color(base, 7).h), "the hue stays in range");
+
+        // A grey base would show no hue at all, so deeper levels get saturated.
+        let grey = Hsla { h: 0.0, s: 0.02, l: 0.9, a: 1.0 };
+        assert_eq!(depth_color(grey, 0), grey, "the outermost level is untouched");
+        assert!(depth_color(grey, 1).s >= MIN_DEPTH_SATURATION);
+        assert_eq!(depth_color(grey, 1).l, grey.l, "still as bright as the theme wanted");
     }
 
     #[test]
