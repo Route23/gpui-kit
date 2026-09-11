@@ -585,6 +585,25 @@ impl InputState {
         self
     }
 
+    /// Colour bracket pairs by nesting depth, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn bracket_colors(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor { bracket_colors, .. } = &mut self.mode {
+            *bracket_colors = on;
+        }
+        self
+    }
+
+    /// Colour bracket pairs by nesting depth, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_bracket_colors(&mut self, on: bool, _: &mut Window, cx: &mut Context<Self>) {
+        if let InputMode::CodeEditor { bracket_colors, .. } = &mut self.mode {
+            *bracket_colors = on;
+        }
+        cx.notify();
+    }
+
     /// Set when the matching bracket is outlined, only for
     /// [`InputMode::CodeEditor`] mode.
     pub fn set_match_brackets(

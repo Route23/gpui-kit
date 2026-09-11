@@ -588,6 +588,33 @@ impl SyntaxHighlighter {
     /// let range = 0..code.len();
     /// let styles = highlighter.styles(&range, &theme);
     /// ```
+    /// The byte ranges in `range` that are string or comment text.
+    ///
+    /// Brackets inside them are not code — a `(` in `"a (b"` has no partner —
+    /// so anything that pairs brackets has to skip these. Reuses the same
+    /// query pass `styles` runs, and the result is merged and sorted.
+    pub fn skipped_ranges(&self, range: &Range<usize>) -> Vec<Range<usize>> {
+        let mut out: Vec<Range<usize>> = self
+            .match_styles(range.clone())
+            .into_iter()
+            .filter(|item| {
+                item.name.starts_with("string") || item.name.starts_with("comment")
+            })
+            .map(|item| item.range)
+            .collect();
+        out.sort_by_key(|r| r.start);
+        // Overlapping captures (a string inside an injection, say) would make
+        // callers test the same offset twice; merge them instead.
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(out.len());
+        for r in out {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        merged
+    }
+
     pub fn styles(
         &self,
         range: &Range<usize>,

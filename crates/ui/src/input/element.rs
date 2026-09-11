@@ -447,6 +447,19 @@ impl TextElement {
         paths
     }
 
+    /// The string and comment spans inside `range`, or nothing when the
+    /// highlighter has not parsed yet (the first frame after opening a file).
+    fn skipped_ranges(state: &InputState, range: &Range<usize>) -> Vec<Range<usize>> {
+        let InputMode::CodeEditor { highlighter, .. } = &state.mode else {
+            return vec![];
+        };
+        let highlighter = highlighter.borrow();
+        let Some(highlighter) = highlighter.as_ref() else {
+            return vec![];
+        };
+        highlighter.skipped_ranges(range)
+    }
+
     /// Outline the bracket the caret is next to and the one it matches.
     ///
     /// The scan is bounded by what is on screen: a partner further away could
@@ -463,12 +476,17 @@ impl TextElement {
         if matches!(mode, brackets::MatchBrackets::Never) {
             return vec![];
         }
+        // Brackets inside strings and comments are not code, so the scan has to
+        // skip them. The captures come from the same query the highlighter
+        // already runs — no walking the tree by hand.
+        let skip = Self::skipped_ranges(&state, &last_layout.visible_range_offset);
         let Some((open, close)) = brackets::match_at(
             &state.text,
             state.cursor(),
             state.mode.language_name(),
             mode,
             last_layout.visible_range_offset.clone(),
+            &skip,
         ) else {
             return vec![];
         };
@@ -878,8 +896,69 @@ impl TextElement {
         // Combine marker styles
         styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
 
+        // Colour bracket pairs by nesting depth (VS Code's
+        // `bracketPairColorization`).
+        //
+        // **Overwritten, not layered.** `combine_highlights` folds overlapping
+        // styles through an unordered set, so layering a colour on top of the
+        // `punctuation.bracket` one the syntax pass already produced would pick
+        // a winner at random and flicker between frames.
+        if state.mode.bracket_colors() {
+            let skip = highlighter.skipped_ranges(&visible_byte_range);
+            let base = cx
+                .theme()
+                .highlight_theme
+                .style("punctuation.bracket")
+                .and_then(|s| s.color)
+                .or(cx.theme().highlight_theme.style.editor_foreground)
+                .unwrap_or(cx.theme().foreground);
+            let colors: Vec<(Range<usize>, Hsla)> = brackets::depths_in(
+                text,
+                visible_byte_range.clone(),
+                state.mode.language_name(),
+                &skip,
+            )
+            .into_iter()
+            .map(|(range, depth)| (range, brackets::depth_color(base, depth)))
+            .collect();
+            styles = overwrite_colors(styles, &colors);
+        }
+
         Some(styles)
     }
+}
+
+/// Force `color` onto the styles covering each range in `overlay`.
+///
+/// Ranges that straddle an overlay entry are split so the rest of the run keeps
+/// its own colour. `overlay` is sorted and its entries never overlap (they are
+/// single brackets), so one pass is enough.
+fn overwrite_colors(
+    styles: Vec<(Range<usize>, HighlightStyle)>,
+    overlay: &[(Range<usize>, Hsla)],
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    if overlay.is_empty() {
+        return styles;
+    }
+    let mut out = Vec::with_capacity(styles.len() + overlay.len() * 2);
+    for (range, style) in styles {
+        let mut at = range.start;
+        for (hit, color) in overlay.iter().filter(|(r, _)| {
+            r.start < range.end && r.end > range.start
+        }) {
+            if hit.start > at {
+                out.push((at..hit.start, style));
+            }
+            let mut colored = style;
+            colored.color = Some(*color);
+            out.push((hit.start.max(range.start)..hit.end.min(range.end), colored));
+            at = hit.end.min(range.end);
+        }
+        if at < range.end {
+            out.push((at..range.end, style));
+        }
+    }
+    out
 }
 
 pub(super) struct PrepaintState {

@@ -10,6 +10,7 @@
 
 use std::ops::Range;
 
+use gpui::Hsla;
 use ropey::Rope;
 
 use crate::input::RopeExt as _;
@@ -243,6 +244,7 @@ pub fn match_at(
     language: &str,
     mode: MatchBrackets,
     bounds: Range<usize>,
+    skip: &[Range<usize>],
 ) -> Option<(Range<usize>, Range<usize>)> {
     if matches!(mode, MatchBrackets::Never) {
         return None;
@@ -254,21 +256,34 @@ pub fn match_at(
     // The character after the caret first, then the one before it: that is the
     // order VS Code resolves ties in.
     if let Some(next) = text.char_at(offset) {
-        if let Some(found) = partner_of(text, offset, next, &pairs, &bounds) {
-            return Some(found);
+        if !is_skipped(offset, skip) {
+            if let Some(found) = partner_of(text, offset, next, &pairs, &bounds, skip) {
+                return Some(found);
+            }
         }
     }
     if let Some(prev) = prev_char(text, offset) {
         let start = offset - prev.len_utf8();
-        if let Some(found) = partner_of(text, start, prev, &pairs, &bounds) {
-            return Some(found);
+        if !is_skipped(start, skip) {
+            if let Some(found) = partner_of(text, start, prev, &pairs, &bounds, skip) {
+                return Some(found);
+            }
         }
     }
 
     if matches!(mode, MatchBrackets::Near) {
         return None;
     }
-    enclosing(text, offset, &pairs, &bounds)
+    enclosing(text, offset, &pairs, &bounds, skip)
+}
+
+/// Whether `offset` falls inside a string or a comment.
+///
+/// `skip` is sorted and merged (see `SyntaxHighlighter::skipped_ranges`), so a
+/// binary search would do; the list is a handful of entries per screen, and a
+/// scan keeps the caller free to pass anything sorted.
+fn is_skipped(offset: usize, skip: &[Range<usize>]) -> bool {
+    skip.iter().any(|r| r.contains(&offset))
 }
 
 /// The pair `ch` at `at` belongs to, scanning in the direction it opens.
@@ -278,13 +293,14 @@ fn partner_of(
     ch: char,
     pairs: &[Pair],
     bounds: &Range<usize>,
+    skip: &[Range<usize>],
 ) -> Option<(Range<usize>, Range<usize>)> {
     if let Some(p) = pairs.iter().find(|p| p.open == ch) {
-        let close = scan_forward(text, at + ch.len_utf8(), *p, bounds)?;
+        let close = scan_forward(text, at + ch.len_utf8(), *p, bounds, skip)?;
         return Some((at..at + ch.len_utf8(), close..close + p.close.len_utf8()));
     }
     if let Some(p) = pairs.iter().find(|p| p.close == ch) {
-        let open = scan_backward(text, at, *p, bounds)?;
+        let open = scan_backward(text, at, *p, bounds, skip)?;
         return Some((open..open + p.open.len_utf8(), at..at + ch.len_utf8()));
     }
     None
@@ -296,6 +312,7 @@ fn enclosing(
     offset: usize,
     pairs: &[Pair],
     bounds: &Range<usize>,
+    skip: &[Range<usize>],
 ) -> Option<(Range<usize>, Range<usize>)> {
     // Walk back to the nearest opener that is still unclosed, whichever kind it
     // is, then find its partner going forward.
@@ -305,12 +322,15 @@ fn enclosing(
     while at > start {
         let ch = prev_char_from(text, at)?;
         at -= ch.len_utf8();
+        if is_skipped(at, skip) {
+            continue;
+        }
         if let Some(i) = pairs.iter().position(|p| p.close == ch) {
             depth[i] += 1;
         } else if let Some(i) = pairs.iter().position(|p| p.open == ch) {
             if depth[i] == 0 {
                 let p = pairs[i];
-                let close = scan_forward(text, at + ch.len_utf8(), p, bounds)?;
+                let close = scan_forward(text, at + ch.len_utf8(), p, bounds, skip)?;
                 return Some((at..at + ch.len_utf8(), close..close + p.close.len_utf8()));
             }
             depth[i] -= 1;
@@ -320,12 +340,22 @@ fn enclosing(
 }
 
 /// The offset of `p.close` that matches an opener just before `from`.
-fn scan_forward(text: &Rope, from: usize, p: Pair, bounds: &Range<usize>) -> Option<usize> {
+fn scan_forward(
+    text: &Rope,
+    from: usize,
+    p: Pair,
+    bounds: &Range<usize>,
+    skip: &[Range<usize>],
+) -> Option<usize> {
     let end = bounds.end.min(text.len());
     let mut depth = 0usize;
     let mut at = from;
     while at < end {
         let ch = text.char_at(at)?;
+        if is_skipped(at, skip) {
+            at += ch.len_utf8();
+            continue;
+        }
         if ch == p.open {
             depth += 1;
         } else if ch == p.close {
@@ -340,13 +370,22 @@ fn scan_forward(text: &Rope, from: usize, p: Pair, bounds: &Range<usize>) -> Opt
 }
 
 /// The offset of `p.open` that matches a closer at `from`.
-fn scan_backward(text: &Rope, from: usize, p: Pair, bounds: &Range<usize>) -> Option<usize> {
+fn scan_backward(
+    text: &Rope,
+    from: usize,
+    p: Pair,
+    bounds: &Range<usize>,
+    skip: &[Range<usize>],
+) -> Option<usize> {
     let start = bounds.start.min(from);
     let mut depth = 0usize;
     let mut at = from;
     while at > start {
         let ch = prev_char_from(text, at)?;
         at -= ch.len_utf8();
+        if is_skipped(at, skip) {
+            continue;
+        }
         if ch == p.close {
             depth += 1;
         } else if ch == p.open {
@@ -365,6 +404,65 @@ fn prev_char_from(text: &Rope, at: usize) -> Option<char> {
         return None;
     }
     text.chars_at(at).reversed().next()
+}
+
+/// Every bracket in `range`, with the nesting depth it sits at.
+///
+/// Depth counts from 0 **inside `range`**: the screen usually starts in the
+/// middle of a file, and a scan that tried to recover the true depth would have
+/// to read from the top of the buffer on every frame. A closer with nothing
+/// open in front of it gets no depth at all (it is left uncoloured).
+///
+/// `skip` is the string and comment spans — brackets in there are not code.
+pub fn depths_in(
+    text: &Rope,
+    range: Range<usize>,
+    language: &str,
+    skip: &[Range<usize>],
+) -> Vec<(Range<usize>, usize)> {
+    let pairs: Vec<Pair> = pairs_for(language)
+        .into_iter()
+        .filter(|p| p.open != p.close)
+        .collect();
+    let end = range.end.min(text.len());
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut at = range.start;
+    while at < end {
+        let Some(ch) = text.char_at(at) else { break };
+        let len = ch.len_utf8();
+        if is_skipped(at, skip) {
+            at += len;
+            continue;
+        }
+        if pairs.iter().any(|p| p.open == ch) {
+            out.push((at..at + len, depth));
+            depth += 1;
+        } else if pairs.iter().any(|p| p.close == ch) {
+            if depth > 0 {
+                depth -= 1;
+                out.push((at..at + len, depth));
+            }
+        }
+        at += len;
+    }
+    out
+}
+
+/// The colour for a bracket `depth` levels in.
+///
+/// Only the hue moves; saturation and lightness stay where the theme put them,
+/// so the colours keep their contrast in light themes as well as dark ones.
+/// **Depth 0 is the base colour unchanged**, which keeps the common case
+/// looking exactly like it did before colouring existed.
+pub fn depth_color(base: Hsla, depth: usize) -> Hsla {
+    if depth == 0 {
+        return base;
+    }
+    // Roughly 100° a step: far enough apart to tell three levels apart at a
+    // glance, and it comes back near the base only after five.
+    let h = (base.h + 0.28 * depth as f32).fract();
+    Hsla { h, ..base }
 }
 
 #[cfg(test)]
@@ -444,7 +542,7 @@ mod tests {
         let offset = text.find('|').expect("mark the caret with |");
         let rope = Rope::from(text.replace('|', ""));
         let len = rope.len();
-        match_at(&rope, offset, "rust", mode, 0..len)
+        match_at(&rope, offset, "rust", mode, 0..len, &[])
     }
 
     #[test]
@@ -492,12 +590,75 @@ mod tests {
     #[test]
     fn the_scan_stops_at_the_bounds() {
         let rope = Rope::from("(aaaaaaaaaa)");
-        assert_eq!(match_at(&rope, 0, "rust", MatchBrackets::Near, 0..12), Some((0..1, 11..12)));
         assert_eq!(
-            match_at(&rope, 0, "rust", MatchBrackets::Near, 0..5),
+            match_at(&rope, 0, "rust", MatchBrackets::Near, 0..12, &[]),
+            Some((0..1, 11..12))
+        );
+        assert_eq!(
+            match_at(&rope, 0, "rust", MatchBrackets::Near, 0..5, &[]),
             None,
             "the partner is off screen, so there is nothing to draw"
         );
+    }
+
+    #[test]
+    fn a_bracket_in_a_string_is_not_code() {
+        // `f("(" )` — the `(` inside the string must not take part.
+        let text = "f(\"(\")";
+        let rope = Rope::from(text);
+        let len = rope.len();
+        let skip = vec![2..5];
+        // From the real `(` the partner is the last char, not the one in the string.
+        assert_eq!(
+            match_at(&rope, 1, "rust", MatchBrackets::Near, 0..len, &skip),
+            Some((1..2, 5..6))
+        );
+        // Standing next to the one inside the string lights nothing.
+        assert_eq!(
+            match_at(&rope, 3, "rust", MatchBrackets::Near, 0..len, &skip),
+            None
+        );
+        // Without the skip list the string's `(` eats the real closer and the
+        // outer pair finds nothing at all — that was the bug.
+        assert_eq!(
+            match_at(&rope, 1, "rust", MatchBrackets::Near, 0..len, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn depths_count_from_zero_inside_the_range() {
+        let rope = Rope::from("((a)b)");
+        let out = depths_in(&rope, 0..rope.len(), "rust", &[]);
+        assert_eq!(
+            out,
+            vec![(0..1, 0), (1..2, 1), (3..4, 1), (5..6, 0)],
+            "openers and their closers share a depth"
+        );
+    }
+
+    #[test]
+    fn a_closer_with_nothing_open_gets_no_colour() {
+        let rope = Rope::from(")a(");
+        let out = depths_in(&rope, 0..rope.len(), "rust", &[]);
+        assert_eq!(out, vec![(2..3, 0)], "the stray closer is left alone");
+    }
+
+    #[test]
+    fn depths_skip_strings() {
+        let rope = Rope::from("(\"(\")");
+        let out = depths_in(&rope, 0..rope.len(), "rust", &[1..4]);
+        assert_eq!(out, vec![(0..1, 0), (4..5, 0)]);
+    }
+
+    #[test]
+    fn depth_zero_keeps_the_base_colour() {
+        let base = Hsla { h: 0.1, s: 0.5, l: 0.6, a: 1.0 };
+        assert_eq!(depth_color(base, 0), base);
+        let one = depth_color(base, 1);
+        assert_ne!(one.h, base.h, "the hue moves");
+        assert_eq!((one.s, one.l, one.a), (base.s, base.l, base.a), "nothing else does");
+        assert!((0.0..1.0).contains(&depth_color(base, 7).h), "the hue stays in range");
     }
 
     #[test]

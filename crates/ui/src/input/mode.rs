@@ -170,6 +170,8 @@ pub(crate) enum InputMode {
         auto_close: AutoClose,
         /// When the matching bracket is outlined
         match_brackets: MatchBrackets,
+        /// Whether bracket pairs are coloured by nesting depth
+        bracket_colors: bool,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -207,6 +209,7 @@ impl InputMode {
             folding_controls: FoldingControls::default(),
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
+            bracket_colors: true,
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -366,6 +369,16 @@ impl InputMode {
         }
     }
 
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn bracket_colors(&self) -> bool {
+        match self {
+            InputMode::CodeEditor { bracket_colors, .. } => *bracket_colors,
+            _ => false,
+        }
+    }
+
     /// Return [`MatchBrackets::Never`] if the mode is not [`InputMode::CodeEditor`].
     #[allow(unused)]
     #[inline]
@@ -510,6 +523,7 @@ mod tests {
         assert_eq!(mode.folding_controls(), FoldingControls::Always);
         assert_eq!(mode.auto_close(), AutoClose::default(), "on like VS Code");
         assert_eq!(mode.match_brackets(), MatchBrackets::Always);
+        assert!(mode.bracket_colors(), "on like VS Code");
         assert_eq!(mode.language_name(), "rust");
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
@@ -523,6 +537,7 @@ mod tests {
             folding_controls: FoldingControls::default(),
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
+            bracket_colors: true,
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),
