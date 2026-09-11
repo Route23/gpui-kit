@@ -460,6 +460,131 @@ impl TextElement {
         highlighter.skipped_ranges(range)
     }
 
+    /// A vertical guide from each bracket pair's opener down to its closer.
+    ///
+    /// Same mechanics as the indent guides (`indent.rs`): walk the visible rows
+    /// accumulating y, and remember that a row hidden by a fold has no wrapped
+    /// lines and therefore no height — a guide must not stretch across one.
+    ///
+    /// One `Path` per colour, because `paint_path` takes a single colour.
+    fn layout_bracket_guides(
+        &self,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        cx: &App,
+    ) -> Vec<(Path<Pixels>, Hsla)> {
+        let state = self.state.read(cx);
+        let guides = state.mode.bracket_guides();
+        if matches!(guides, brackets::BracketGuides::Off) {
+            return vec![];
+        }
+
+        let skip = Self::skipped_ranges(&state, &last_layout.visible_range_offset);
+        let language = state.mode.language_name();
+        let mut pairs = brackets::pairs_in(
+            &state.text,
+            last_layout.visible_range_offset.clone(),
+            language,
+            &skip,
+        );
+        if matches!(guides, brackets::BracketGuides::Active) {
+            // Only the pair the caret sits in — `Always` so it finds the
+            // enclosing one even when the caret is not next to a bracket.
+            let active = brackets::match_at(
+                &state.text,
+                state.cursor(),
+                language,
+                brackets::MatchBrackets::Always,
+                last_layout.visible_range_offset.clone(),
+                &skip,
+            );
+            let Some((open, close)) = active else {
+                return vec![];
+            };
+            pairs.retain(|(o, c, _)| *o == open && *c == close);
+        }
+        if pairs.is_empty() {
+            return vec![];
+        }
+
+        // Where each visible row starts, in bytes and in pixels.
+        let line_height = last_layout.line_height;
+        let mut tops: Vec<(usize, usize, Pixels, usize)> = Vec::new();
+        let mut offset_y = last_layout.visible_top;
+        let mut row_offset = last_layout.visible_range_offset.start;
+        for row in last_layout.visible_range.clone() {
+            let Some(line) = last_layout.line(row) else {
+                continue;
+            };
+            let rows = line.wrapped_lines.len();
+            tops.push((row, row_offset, offset_y, rows));
+            row_offset += line.len() + 1;
+            offset_y += rows * line_height;
+        }
+
+        // The row a byte belongs to is the last one that starts at or before it.
+        let row_of = |offset: usize| {
+            tops.iter()
+                .rfind(|(_, start, _, _)| *start <= offset)
+                .copied()
+        };
+
+        let base = Self::bracket_base_color(cx);
+        let mut by_color: Vec<(Hsla, gpui::PathBuilder)> = Vec::new();
+        for (open, close, depth) in pairs {
+            let (Some((o_row, o_start, o_top, o_rows)), Some((_, c_start, c_top, _))) =
+                (row_of(open.start), row_of(close.start))
+            else {
+                continue;
+            };
+            if o_start == c_start || o_rows == 0 {
+                // Same row (or folded away): nothing to connect.
+                continue;
+            }
+            let Some(line) = last_layout.line(o_row) else {
+                continue;
+            };
+            let Some(pos) = line.position_for_index(open.start - o_start, line_height) else {
+                continue;
+            };
+            let x = pos.x + last_layout.line_number_width;
+            let top = o_top + pos.y + line_height;
+            let bottom = c_top;
+            if bottom <= top {
+                continue;
+            }
+
+            let color = brackets::depth_color(base, depth).opacity(0.7);
+            let builder = match by_color.iter_mut().find(|(c, _)| *c == color) {
+                Some((_, b)) => b,
+                None => {
+                    by_color.push((color, gpui::PathBuilder::stroke(px(1.))));
+                    &mut by_color.last_mut().expect("just pushed").1
+                }
+            };
+            builder.move_to(point(x, top));
+            builder.line_to(point(x, bottom));
+        }
+
+        by_color
+            .into_iter()
+            .filter_map(|(color, mut builder)| {
+                builder.translate(bounds.origin);
+                builder.build().ok().map(|path| (path, color))
+            })
+            .collect()
+    }
+
+    /// The colour bracket depth colouring counts up from.
+    fn bracket_base_color(cx: &App) -> Hsla {
+        cx.theme()
+            .highlight_theme
+            .style("punctuation.bracket")
+            .and_then(|s| s.color)
+            .or(cx.theme().highlight_theme.style.editor_foreground)
+            .unwrap_or(cx.theme().foreground)
+    }
+
     /// Outline the bracket the caret is next to and the one it matches.
     ///
     /// The scan is bounded by what is on screen: a partner further away could
@@ -982,6 +1107,8 @@ pub(super) struct PrepaintState {
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
+    /// One vertical guide per bracket pair, grouped by colour
+    bracket_guide_paths: Vec<(Path<Pixels>, Hsla)>,
     whitespaces: Vec<crate::input::whitespace::PlacedMark>,
     fold_chevrons: Vec<crate::input::fold::FoldChevron>,
     /// The chevron strip, so the cursor turns into a hand over it.
@@ -1414,6 +1541,7 @@ impl Element for TextElement {
         let hover_definition_hitbox = self.layout_hover_definition_hitbox(state, window, cx);
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
+        let bracket_guide_paths = self.layout_bracket_guides(&last_layout, &bounds, cx);
         let whitespaces = self.layout_whitespaces(state, &bounds, &last_layout);
         let fold_chevrons =
             self.layout_fold_chevrons(state, &last_layout, text_size, &text_style, window, cx);
@@ -1445,6 +1573,7 @@ impl Element for TextElement {
             hover_definition_hitbox,
             document_color_paths,
             indent_guides_path,
+            bracket_guide_paths,
             whitespaces,
             fold_chevrons,
             fold_gutter_hitbox,
@@ -1548,6 +1677,11 @@ impl Element for TextElement {
         // Paint indent guides
         if let Some(path) = prepaint.indent_guides_path.take() {
             window.paint_path(path, cx.theme().border.opacity(0.85));
+        }
+
+        // Paint bracket pair guides, in the colour of the pair they belong to
+        for (path, color) in prepaint.bracket_guide_paths.iter() {
+            window.paint_path(path.clone(), *color);
         }
 
         // Paint selections

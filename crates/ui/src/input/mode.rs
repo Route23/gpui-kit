@@ -8,7 +8,7 @@ use tree_sitter::InputEdit;
 use super::text_wrapper::TextWrapper;
 use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
-use crate::input::{AutoClose, MatchBrackets, RopeExt as _, TabSize};
+use crate::input::{AutoClose, BracketGuides, MatchBrackets, RopeExt as _, TabSize};
 
 /// How the line number gutter of a [`InputMode::CodeEditor`] is rendered.
 ///
@@ -172,6 +172,8 @@ pub(crate) enum InputMode {
         match_brackets: MatchBrackets,
         /// Whether bracket pairs are coloured by nesting depth
         bracket_colors: bool,
+        /// Which bracket pairs get a guide line
+        bracket_guides: BracketGuides,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
     },
@@ -210,6 +212,7 @@ impl InputMode {
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,
+            bracket_guides: BracketGuides::default(),
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -369,6 +372,16 @@ impl InputMode {
         }
     }
 
+    /// Return [`BracketGuides::Off`] if the mode is not [`InputMode::CodeEditor`].
+    #[allow(unused)]
+    #[inline]
+    pub(super) fn bracket_guides(&self) -> BracketGuides {
+        match self {
+            InputMode::CodeEditor { bracket_guides, .. } => *bracket_guides,
+            _ => BracketGuides::Off,
+        }
+    }
+
     /// Return false if the mode is not [`InputMode::CodeEditor`].
     #[allow(unused)]
     #[inline]
@@ -506,7 +519,7 @@ mod tests {
     use crate::{
         highlighter::DiagnosticSet,
         input::{
-            AutoClose, MatchBrackets, TabSize,
+            AutoClose, BracketGuides, MatchBrackets, TabSize,
             mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace},
         },
     };
@@ -524,6 +537,7 @@ mod tests {
         assert_eq!(mode.auto_close(), AutoClose::default(), "on like VS Code");
         assert_eq!(mode.match_brackets(), MatchBrackets::Always);
         assert!(mode.bracket_colors(), "on like VS Code");
+        assert_eq!(mode.bracket_guides(), BracketGuides::Off, "off like VS Code");
         assert_eq!(mode.language_name(), "rust");
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
@@ -538,6 +552,7 @@ mod tests {
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,
+            bracket_guides: BracketGuides::default(),
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),

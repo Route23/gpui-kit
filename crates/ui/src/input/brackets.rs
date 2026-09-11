@@ -458,6 +458,75 @@ pub fn depths_in(
 /// whatever the theme chose.
 const MIN_DEPTH_SATURATION: f32 = 0.45;
 
+/// Which bracket pairs get a guide line.
+///
+/// Mirrors VS Code's `editor.guides.bracketPairs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BracketGuides {
+    /// Draw nothing.
+    #[default]
+    Off,
+    /// Only the pair the caret is in.
+    Active,
+    /// Every pair on screen.
+    All,
+}
+
+impl From<bool> for BracketGuides {
+    fn from(on: bool) -> Self {
+        if on {
+            BracketGuides::All
+        } else {
+            BracketGuides::Off
+        }
+    }
+}
+
+/// Every bracket pair that opens **and** closes inside `range`, with its depth.
+///
+/// The same scan as [`depths_in`], keeping a stack so each closer can be paired
+/// with the opener it belongs to. A pair whose opener is above `range` has no
+/// entry: recovering it would mean reading from the top of the buffer on every
+/// frame, and a guide for it could only be drawn from the top of the screen
+/// anyway.
+pub fn pairs_in(
+    text: &Rope,
+    range: Range<usize>,
+    language: &str,
+    skip: &[Range<usize>],
+) -> Vec<(Range<usize>, Range<usize>, usize)> {
+    let pairs: Vec<Pair> = pairs_for(language)
+        .into_iter()
+        .filter(|p| p.open != p.close)
+        .collect();
+    let end = range.end.min(text.len());
+    let mut open: Vec<(Range<usize>, char, usize)> = Vec::new();
+    let mut out = Vec::new();
+    let mut at = range.start;
+    while at < end {
+        let Some(ch) = text.char_at(at) else { break };
+        let len = ch.len_utf8();
+        if is_skipped(at, skip) {
+            at += len;
+            continue;
+        }
+        if pairs.iter().any(|p| p.open == ch) {
+            let depth = open.len();
+            open.push((at..at + len, ch, depth));
+        } else if let Some(p) = pairs.iter().find(|p| p.close == ch) {
+            // Only close the innermost opener of the same kind; a stray closer
+            // of another kind leaves the stack alone.
+            if let Some(ix) = open.iter().rposition(|(_, c, _)| *c == p.open) {
+                let (opener, _, depth) = open.remove(ix);
+                out.push((opener, at..at + len, depth));
+            }
+        }
+        at += len;
+    }
+    out.sort_by_key(|(o, _, _)| o.start);
+    out
+}
+
 /// The colour for a bracket `depth` levels in.
 ///
 /// The hue moves and the saturation is floored; **lightness stays where the
@@ -662,6 +731,34 @@ mod tests {
         let rope = Rope::from("(\"(\")");
         let out = depths_in(&rope, 0..rope.len(), "rust", &[1..4]);
         assert_eq!(out, vec![(0..1, 0), (4..5, 0)]);
+    }
+
+    #[test]
+    fn pairs_carry_their_opener_and_depth() {
+        let rope = Rope::from("((a)b)");
+        let out = pairs_in(&rope, 0..rope.len(), "rust", &[]);
+        assert_eq!(out, vec![(0..1, 5..6, 0), (1..2, 3..4, 1)]);
+    }
+
+    #[test]
+    fn an_opener_with_no_closer_is_dropped() {
+        let rope = Rope::from("(a");
+        assert!(pairs_in(&rope, 0..rope.len(), "rust", &[]).is_empty());
+    }
+
+    #[test]
+    fn pairs_skip_strings() {
+        // `("(")` — the bracket in the string must not close the real one.
+        let rope = Rope::from("(\"(\")");
+        let out = pairs_in(&rope, 0..rope.len(), "rust", &[1..4]);
+        assert_eq!(out, vec![(0..1, 4..5, 0)]);
+    }
+
+    #[test]
+    fn a_closer_of_another_kind_does_not_pop_the_stack() {
+        let rope = Rope::from("(]a)");
+        let out = pairs_in(&rope, 0..rope.len(), "rust", &[]);
+        assert_eq!(out, vec![(0..1, 3..4, 0)]);
     }
 
     #[test]

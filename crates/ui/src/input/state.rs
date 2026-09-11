@@ -19,7 +19,7 @@ use unicode_segmentation::*;
 
 use super::{
     blink_cursor::BlinkCursor,
-    brackets::{self, AutoClose, AutoCloseEdit, MatchBrackets},
+    brackets::{self, AutoClose, AutoCloseEdit, BracketGuides, MatchBrackets},
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
@@ -593,6 +593,30 @@ impl InputState {
             *bracket_colors = on;
         }
         self
+    }
+
+    /// Draw a guide line down each bracket pair, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn bracket_guides(mut self, guides: impl Into<BracketGuides>) -> Self {
+        debug_assert!(self.mode.is_code_editor());
+        if let InputMode::CodeEditor { bracket_guides, .. } = &mut self.mode {
+            *bracket_guides = guides.into();
+        }
+        self
+    }
+
+    /// Draw a guide line down each bracket pair, only for
+    /// [`InputMode::CodeEditor`] mode.
+    pub fn set_bracket_guides(
+        &mut self,
+        guides: impl Into<BracketGuides>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputMode::CodeEditor { bracket_guides, .. } = &mut self.mode {
+            *bracket_guides = guides.into();
+        }
+        cx.notify();
     }
 
     /// Colour bracket pairs by nesting depth, only for
