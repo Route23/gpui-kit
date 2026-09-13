@@ -20,6 +20,12 @@ use crate::input::{
 /// so it stays the default. VS Code's `editor.cursorSurroundingLines` is 0.
 pub(super) const DEFAULT_SURROUNDING_LINES: u8 = 3;
 
+/// The default smallest width of the line number gutter, in digits.
+///
+/// Four matches what most editors reserve, so a file does not shift sideways
+/// the moment it grows past 999 lines.
+pub(super) const DEFAULT_MIN_LINE_NUMBER_DIGITS: usize = 4;
+
 /// How the line number gutter of a [`InputMode::CodeEditor`] is rendered.
 ///
 /// Mirrors VS Code's `editor.lineNumbers`.
@@ -168,6 +174,18 @@ pub(crate) enum InputMode {
         rows: usize,
         /// How the line number gutter is rendered
         line_number: LineNumbers,
+        /// The smallest number of digits the line number gutter reserves.
+        ///
+        /// The gutter never shrinks below what the last line number needs, so
+        /// this only widens it — useful to keep the text from shifting as a
+        /// file grows past a power of ten.
+        min_line_number_digits: usize,
+        /// Whether the empty line a trailing newline creates gets a number.
+        ///
+        /// A buffer ending in `\n` has one more (empty) line. Turning this off
+        /// leaves that row blank in the gutter; the row itself stays, so the
+        /// caret can still be placed on it.
+        render_final_newline: bool,
         language: SharedString,
         indent_guides: bool,
         /// Which whitespace characters are drawn as visible marks
@@ -241,6 +259,8 @@ impl InputMode {
             language: language.into(),
             highlighter: Rc::new(RefCell::new(None)),
             line_number: LineNumbers::default(),
+            min_line_number_digits: 4,
+            render_final_newline: true,
             indent_guides: true,
             render_whitespace: RenderWhitespace::default(),
             folding: true,
@@ -541,6 +561,31 @@ impl InputMode {
         }
     }
 
+    /// Return [`DEFAULT_MIN_LINE_NUMBER_DIGITS`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn min_line_number_digits(&self) -> usize {
+        match self {
+            InputMode::CodeEditor {
+                min_line_number_digits,
+                ..
+            } => *min_line_number_digits,
+            _ => DEFAULT_MIN_LINE_NUMBER_DIGITS,
+        }
+    }
+
+    /// Return `true` if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn render_final_newline(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                render_final_newline,
+                ..
+            } => *render_final_newline,
+            _ => true,
+        }
+    }
+
     /// Return [`DEFAULT_SURROUNDING_LINES`] if the mode is not
     /// [`InputMode::CodeEditor`].
     #[allow(unused)]
@@ -776,6 +821,8 @@ mod tests {
         assert_eq!(mode.min_rows(), 1);
 
         let mode = InputMode::CodeEditor {
+            min_line_number_digits: 4,
+            render_final_newline: true,
             multi_line: false,
             line_number: LineNumbers::On,
             indent_guides: true,

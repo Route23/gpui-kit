@@ -818,12 +818,11 @@ impl TextElement {
         window: &mut Window,
     ) -> (Pixels, usize) {
         let total_lines = text.lines_len();
-        let line_number_len = match total_lines {
-            0..=9999 => 5,
-            10000..=99999 => 6,
-            100000..=999999 => 7,
-            _ => 8,
-        };
+        // What the last number actually needs, never below the caller's floor.
+        // The extra column is the gap between the number and the text; drop it
+        // and the two run together.
+        let digits = total_lines.max(1).to_string().len();
+        let line_number_len = digits.max(state.mode.min_line_number_digits()) + 1;
 
         let line_number_width = if state.mode.line_number() {
             let empty_line_number = window.text_system().shape_line(
@@ -1550,6 +1549,13 @@ impl Element for TextElement {
 
         let state = self.state.read(cx);
         let line_numbers_mode = state.mode.line_numbers();
+        // The row a trailing newline leaves behind, when it is not to be
+        // numbered. A buffer ending in `\n` has one more (empty) line; an
+        // empty buffer has a single line and no trailing newline to blame.
+        let unnumbered_final_row = (!state.mode.render_final_newline()
+            && state.text.len() > 0
+            && state.text.char_at(state.text.len().saturating_sub(1)) == Some('\n'))
+        .then(|| state.text.lines_len().saturating_sub(1));
         let line_numbers = if line_numbers_mode.is_visible() {
             let mut line_numbers = vec![];
             let other_line_runs = vec![TextRun {
@@ -1583,6 +1589,10 @@ impl Element for TextElement {
                 // row blank. Pad to `line_number_len` either way so the shaped
                 // line keeps matching the `TextRun` length below.
                 let line_no: SharedString = match line_numbers_mode.number_for(ix, current_row) {
+                    // The trailing newline's row, when it is not numbered.
+                    // Blank rather than skipped: the entry has to stay so the
+                    // index keeps matching the row.
+                    _ if Some(ix) == unnumbered_final_row => " ".repeat(line_number_len),
                     Some(no) => format!("{:>width$}", no, width = line_number_len),
                     None => " ".repeat(line_number_len),
                 }

@@ -565,6 +565,40 @@ impl InputState {
         cx.notify();
     }
 
+    /// Set the smallest width of the line number gutter in digits, only for
+    /// [`InputMode::CodeEditor`] mode.
+    ///
+    /// The gutter never shrinks below what the last line number needs, so this
+    /// only widens it.
+    pub fn min_line_number_digits(mut self, digits: usize) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            min_line_number_digits: d,
+            ..
+        } = &mut self.mode
+        {
+            *d = digits;
+        }
+        self
+    }
+
+    /// Number the empty line a trailing newline creates, only for
+    /// [`InputMode::CodeEditor`] mode.
+    ///
+    /// Turning this off leaves that row blank in the gutter. The row itself
+    /// stays, so the caret can still be placed on it.
+    pub fn render_final_newline(mut self, render: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            render_final_newline: r,
+            ..
+        } = &mut self.mode
+        {
+            *r = render;
+        }
+        self
+    }
+
     /// Enable folding, only for [`InputMode::CodeEditor`] mode.
     pub fn folding(mut self, folding: bool) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
