@@ -752,6 +752,57 @@ impl InputState {
         self
     }
 
+    /// Mark every other run of the selected text, only for
+    /// [`InputMode::CodeEditor`].
+    ///
+    /// `max_len` is in characters; a longer selection is left alone.
+    /// `multiline` decides whether a selection that spans rows counts.
+    pub fn selection_highlight(mut self, on: bool, max_len: u16, multiline: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            selection_highlight,
+            selection_highlight_max_len,
+            selection_highlight_multiline,
+            ..
+        } = &mut self.mode
+        {
+            *selection_highlight = on;
+            *selection_highlight_max_len = max_len;
+            *selection_highlight_multiline = multiline;
+        }
+        self
+    }
+
+    /// Round the corners of the selection, only for
+    /// [`InputMode::CodeEditor`].
+    pub fn rounded_selection(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            rounded_selection, ..
+        } = &mut self.mode
+        {
+            *rounded_selection = on;
+        }
+        self
+    }
+
+    /// Copy the caret's row when nothing is selected, only for
+    /// [`InputMode::CodeEditor`].
+    ///
+    /// Cutting takes the row away too, the way VS Code's
+    /// `editor.emptySelectionClipboard` does.
+    pub fn empty_selection_clipboard(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            empty_selection_clipboard,
+            ..
+        } = &mut self.mode
+        {
+            *empty_selection_clipboard = on;
+        }
+        self
+    }
+
     /// Mark out the row the caret is on this way, only for
     /// [`InputMode::CodeEditor`].
     pub fn line_highlight(mut self, how: LineHighlight) -> Self {
@@ -2568,22 +2619,57 @@ impl InputState {
     }
 
     pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
+        let Some(range) = self.copy_range() else {
             return;
-        }
+        };
 
-        let selected_text = self.text.slice(self.selected_range).to_string();
+        let selected_text = self.text.slice(range).to_string();
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
     }
 
-    pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            return;
+    /// What copying takes: the selection, or the caret's whole row.
+    ///
+    /// `None` when there is nothing to copy -- an empty selection with
+    /// `empty_selection_clipboard` off.
+    fn copy_range(&self) -> Option<Range<usize>> {
+        if !self.selected_range.is_empty() {
+            return Some(self.selected_range.into());
         }
+        if !self.mode.empty_selection_clipboard() {
+            return None;
+        }
+        Some(self.caret_row_range())
+    }
 
-        let selected_text = self.text.slice(self.selected_range).to_string();
+    /// The caret's row, **including the line break that ends it**.
+    ///
+    /// Not `line_end_offset`: that stops before the newline, and a row pasted
+    /// without its break runs into whatever it lands on. Taking the next
+    /// row's start instead also keeps a CRLF whole.
+    fn caret_row_range(&self) -> Range<usize> {
+        let row = self.text.offset_to_point(self.cursor()).row;
+        let start = self.text.line_start_offset(row);
+        let end = if row + 1 < self.text.lines_len() {
+            self.text.line_start_offset(row + 1)
+        } else {
+            self.text.len()
+        };
+        start..end
+    }
+
+    pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(range) = self.copy_range() else {
+            return;
+        };
+
+        let selected_text = self.text.slice(range.clone()).to_string();
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
 
+        // **`replace_text_in_range_silent(None, ..)` takes out whatever is
+        // selected**, so the row has to be selected before it can be cut.
+        if self.selected_range.is_empty() {
+            self.selected_range = range.into();
+        }
         self.replace_text_in_range_silent(None, "", window, cx);
     }
 

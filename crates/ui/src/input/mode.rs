@@ -78,6 +78,14 @@ impl LineHighlight {
     }
 }
 
+/// How long a selection may be and still light up its twins, in characters.
+///
+/// VS Code's `editor.selectionHighlightMaxLength` defaults to the same number.
+pub(super) const DEFAULT_SELECTION_HIGHLIGHT_MAX_LEN: u16 = 200;
+
+/// The corner radius of a selection, when the corners are rounded.
+pub(super) const SELECTION_CORNER_RADIUS: Pixels = px(3.);
+
 /// The columns of clear space between the code and an end-of-row diagnostic.
 ///
 /// Zed's `diagnostics.inline.padding` defaults to the same number.
@@ -335,6 +343,16 @@ pub(crate) enum InputMode {
         inlay_hint_font_size: f32,
         /// Whether a chip is drawn behind an inlay hint.
         inlay_hint_background: bool,
+        /// Whether every other run of the selected text is marked too.
+        selection_highlight: bool,
+        /// How long the selection may be and still do that, in characters.
+        selection_highlight_max_len: u16,
+        /// Whether a selection that spans rows counts.
+        selection_highlight_multiline: bool,
+        /// Whether the selection's corners are rounded.
+        rounded_selection: bool,
+        /// Whether copying with nothing selected takes the caret's row.
+        empty_selection_clipboard: bool,
         /// How the row the caret is on is marked out.
         line_highlight: LineHighlight,
         /// Whether that mark is only drawn while the editor has focus.
@@ -446,6 +464,11 @@ impl InputMode {
             inlay_hint_font_family: None,
             inlay_hint_font_size: 0.,
             inlay_hint_background: false,
+            selection_highlight: true,
+            selection_highlight_max_len: DEFAULT_SELECTION_HIGHLIGHT_MAX_LEN,
+            selection_highlight_multiline: true,
+            rounded_selection: true,
+            empty_selection_clipboard: true,
             line_highlight: LineHighlight::All,
             line_highlight_focused_only: false,
             padding_top: 0,
@@ -882,6 +905,69 @@ impl InputMode {
         }
     }
 
+    /// Return true if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn selection_highlight(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                selection_highlight, ..
+            } => *selection_highlight,
+            _ => true,
+        }
+    }
+
+    /// Return [`DEFAULT_SELECTION_HIGHLIGHT_MAX_LEN`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn selection_highlight_max_len(&self) -> usize {
+        let n = match self {
+            InputMode::CodeEditor {
+                selection_highlight_max_len,
+                ..
+            } => *selection_highlight_max_len,
+            _ => DEFAULT_SELECTION_HIGHLIGHT_MAX_LEN,
+        };
+        n as usize
+    }
+
+    /// Return true if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn selection_highlight_multiline(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                selection_highlight_multiline,
+                ..
+            } => *selection_highlight_multiline,
+            _ => true,
+        }
+    }
+
+    /// Return true if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn rounded_selection(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                rounded_selection, ..
+            } => *rounded_selection,
+            _ => true,
+        }
+    }
+
+    /// Return true if the mode is not [`InputMode::CodeEditor`].
+    ///
+    /// **Only code editors take a whole row** -- a one-line input has no row
+    /// to take, and a plain multi-line box is not where anyone expects it.
+    #[inline]
+    pub(super) fn empty_selection_clipboard(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                empty_selection_clipboard,
+                ..
+            } => *empty_selection_clipboard,
+            _ => false,
+        }
+    }
+
     /// Return [`LineHighlight::All`] if the mode is not
     /// [`InputMode::CodeEditor`] -- that is what every input did before this
     /// was settable.
@@ -1195,6 +1281,7 @@ mod tests {
             SurroundingLinesStyle, TabSize,
             mode::{
                 DEFAULT_INLINE_DIAGNOSTIC_PADDING, DEFAULT_MAX_FOLD_REGIONS,
+                DEFAULT_SELECTION_HIGHLIGHT_MAX_LEN,
                 DEFAULT_SURROUNDING_LINES, FoldingControls, InlayModifier, InputMode,
                 LineHighlight, LineNumbers, RenderWhitespace, WrapAt,
             },
@@ -1250,6 +1337,15 @@ mod tests {
             "ガターも本文も塗るのが今までの見た目"
         );
         assert!(!mode.line_highlight_focused_only(), "フォーカスを見ない");
+        // 選択まわり（#253 / ADR-0092）。**VS Code と同じ既定。**
+        assert!(mode.selection_highlight(), "同じ語を光らせる");
+        assert_eq!(
+            mode.selection_highlight_max_len(),
+            usize::from(DEFAULT_SELECTION_HIGHLIGHT_MAX_LEN)
+        );
+        assert!(mode.selection_highlight_multiline());
+        assert!(mode.rounded_selection());
+        assert!(mode.empty_selection_clipboard());
         assert_eq!(mode.padding_top(), px(0.), "#224 で消したまま");
         assert_eq!(mode.padding_bottom(), px(0.));
         assert_eq!(mode.inline_diagnostic_min_column(), 0, "行末のすぐ後ろ");
@@ -1296,6 +1392,11 @@ mod tests {
             inlay_hint_font_family: None,
             inlay_hint_font_size: 0.,
             inlay_hint_background: false,
+            selection_highlight: true,
+            selection_highlight_max_len: DEFAULT_SELECTION_HIGHLIGHT_MAX_LEN,
+            selection_highlight_multiline: true,
+            rounded_selection: true,
+            empty_selection_clipboard: true,
             line_highlight: LineHighlight::All,
             line_highlight_focused_only: false,
             padding_top: 0,

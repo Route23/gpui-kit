@@ -41,6 +41,60 @@ pub(super) const RIGHT_MARGIN: Pixels = px(WIDTH_OF_SCROLLBAR + 8.);
 /// `crate::scroll::Scrollbar::width()`, which is not reachable from a `const`
 /// initialiser. Kept next to the margin so the two cannot drift apart.
 const WIDTH_OF_SCROLLBAR: f32 = 4. * 2. + 8.;
+/// Trace `points` as a closed polygon with its corners rounded by `radius`.
+///
+/// **The polygon is not convex.** A selection whose rows differ in width has
+/// step-out corners on the left (see the `points` walk above), and rounding
+/// those the same way is what makes the shape read as one block rather than
+/// a stack of boxes. The radius is cut down to half of the shorter of the two
+/// sides at every corner, so a one-character selection -- or the 6px stub an
+/// empty row gets -- cannot fold through itself.
+fn round_corners(builder: &mut gpui::PathBuilder, points: &[Point<Pixels>], radius: Pixels) {
+    let n = points.len();
+    if n < 3 {
+        let mut iter = points.iter();
+        if let Some(first) = iter.next() {
+            builder.move_to(*first);
+            for p in iter {
+                builder.line_to(*p);
+            }
+        }
+        return;
+    }
+
+    /// How far along `from` -> `to` the corner is cut, at most `radius`.
+    fn cut(from: Point<Pixels>, to: Point<Pixels>, radius: Pixels) -> Point<Pixels> {
+        let dx = f32::from(to.x - from.x);
+        let dy = f32::from(to.y - from.y);
+        let len = dx.hypot(dy);
+        if len <= 0. {
+            return to;
+        }
+        let r = f32::from(radius).min(len / 2.);
+        let t = r / len;
+        point(from.x + px(dx * t), from.y + px(dy * t))
+    }
+
+    let start = cut(points[0], points[1], radius);
+    builder.move_to(start);
+    for i in 1..=n {
+        let corner = points[i % n];
+        let next = points[(i + 1) % n];
+        // Stop short of the corner, curve through it, carry on.
+        builder.line_to(cut(corner, points[i - 1], radius));
+        builder.curve_to(cut(corner, next, radius), corner);
+    }
+    builder.close();
+}
+
+/// The corner radius the selection and its twins are drawn with, if any.
+fn selection_radius(state: &InputState) -> Option<Pixels> {
+    state
+        .mode
+        .rounded_selection()
+        .then_some(crate::input::mode::SELECTION_CORNER_RADIUS)
+}
+
 /// The strip between the line numbers and the text that holds fold chevrons.
 pub(super) const FOLD_CHEVRON_WIDTH: Pixels = px(14.);
 
@@ -328,7 +382,21 @@ impl TextElement {
         last_layout: &LastLayout,
         bounds: &Bounds<Pixels>,
     ) -> Option<Path<Pixels>> {
-        Self::layout_match_range_with(range, last_layout, bounds, None)
+        Self::layout_match_range_with(range, last_layout, bounds, None, None)
+    }
+
+    /// The same box with its corners rounded by `radius`.
+    ///
+    /// Only the filled boxes take a radius: the bracket outline is a stroke
+    /// that has to sit exactly on the glyph's box, and the document colour
+    /// swatches are tiny.
+    pub(crate) fn layout_match_range_rounded(
+        range: Range<usize>,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        radius: Option<Pixels>,
+    ) -> Option<Path<Pixels>> {
+        Self::layout_match_range_with(range, last_layout, bounds, None, radius)
     }
 
     /// The same box as [`Self::layout_match_range`], stroked instead of filled
@@ -339,6 +407,7 @@ impl TextElement {
         last_layout: &LastLayout,
         bounds: &Bounds<Pixels>,
         stroke: Option<Pixels>,
+        radius: Option<Pixels>,
     ) -> Option<Path<Pixels>> {
         if range.is_empty() {
             return None;
@@ -458,19 +527,25 @@ impl TextElement {
         // print_points_as_svg_path(&line_corners, &points);
 
         let path_origin = bounds.origin + point(line_number_width, px(0.));
-        let first_p = *points.get(0).unwrap();
+        let points: Vec<Point<Pixels>> = points.iter().map(|p| path_origin + *p).collect();
         let mut builder = match stroke {
             Some(width) => gpui::PathBuilder::stroke(width),
             None => gpui::PathBuilder::fill(),
         };
-        builder.move_to(path_origin + first_p);
-        for p in points.iter().skip(1) {
-            builder.line_to(path_origin + *p);
-        }
-        // A stroked outline has to come back to where it started, or the box is
-        // missing one side.
-        if stroke.is_some() {
-            builder.line_to(path_origin + first_p);
+        match radius {
+            Some(radius) if radius > px(0.) => round_corners(&mut builder, &points, radius),
+            _ => {
+                let first_p = points[0];
+                builder.move_to(first_p);
+                for p in points.iter().skip(1) {
+                    builder.line_to(*p);
+                }
+                // A stroked outline has to come back to where it started, or
+                // the box is missing one side.
+                if stroke.is_some() {
+                    builder.line_to(first_p);
+                }
+            }
         }
 
         builder.build().ok()
@@ -501,6 +576,50 @@ impl TextElement {
         }
 
         paths
+    }
+
+    /// Every other run of the selected text that is on screen.
+    ///
+    /// The selection itself is left out -- it is already drawn, in a stronger
+    /// colour. Only what is visible is looked at: [`Self::layout_match_range`]
+    /// throws away anything outside the viewport anyway, and the scan is over
+    /// the visible slice rather than the document (see
+    /// [`super::selection::occurrences`] for why that matters during a drag).
+    fn layout_selection_highlights(
+        &self,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        cx: &App,
+    ) -> Vec<Path<Pixels>> {
+        let state = self.state.read(cx);
+        if !state.mode.selection_highlight() || state.masked {
+            return vec![];
+        }
+        let selected: Range<usize> = state.selected_range.into();
+        let (start, end) = (selected.start.min(selected.end), selected.start.max(selected.end));
+        if start == end || end > state.text.len() {
+            return vec![];
+        }
+        let needle = state.text.slice(start..end).to_string();
+        if needle.chars().count() > state.mode.selection_highlight_max_len() {
+            return vec![];
+        }
+        if needle.contains('\n') && !state.mode.selection_highlight_multiline() {
+            return vec![];
+        }
+
+        let visible = last_layout.visible_range_offset.clone();
+        if visible.start >= visible.end || visible.end > state.text.len() {
+            return vec![];
+        }
+        let haystack = state.text.slice(visible.clone()).to_string();
+        let radius = selection_radius(state);
+        super::selection::occurrences(&needle, &haystack, visible.start, &(start..end))
+            .into_iter()
+            .filter_map(|range| {
+                Self::layout_match_range_rounded(range, last_layout, bounds, radius)
+            })
+            .collect()
     }
 
     /// The string and comment spans inside `range`, or nothing when the
@@ -693,7 +812,7 @@ impl TextElement {
         [open, close]
             .into_iter()
             .filter_map(|range| {
-                Self::layout_match_range_with(range, last_layout, bounds, Some(px(1.)))
+                Self::layout_match_range_with(range, last_layout, bounds, Some(px(1.)), None)
             })
             .collect()
     }
@@ -761,7 +880,7 @@ impl TextElement {
         let range = start_ix.max(last_layout.visible_range_offset.start)
             ..end_ix.min(last_layout.visible_range_offset.end);
 
-        Self::layout_match_range(range, &last_layout, bounds)
+        Self::layout_match_range_rounded(range, &last_layout, bounds, selection_radius(state))
     }
 
     /// Calculate the visible range of lines in the viewport.
@@ -1179,6 +1298,8 @@ pub(super) struct PrepaintState {
     selection_path: Option<Path<Pixels>>,
     hover_highlight_path: Option<Path<Pixels>>,
     search_match_paths: Vec<(Path<Pixels>, bool)>,
+    /// Every other run of the selected text, faintly marked.
+    selection_highlight_paths: Vec<Path<Pixels>>,
     /// The outlines of the bracket next to the caret and its partner
     bracket_match_paths: Vec<Path<Pixels>>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
@@ -1575,6 +1696,8 @@ impl Element for TextElement {
         last_layout.cursor_bounds = cursor_bounds;
 
         let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
+        let selection_highlight_paths =
+            self.layout_selection_highlights(&last_layout, &bounds, cx);
         let selection_path = self.layout_selections(&last_layout, &mut bounds, cx);
         let hover_highlight_path = self.layout_hover_highlight(&last_layout, &mut bounds, cx);
         let bracket_match_paths = self.layout_bracket_match(&last_layout, &bounds, cx);
@@ -1696,6 +1819,7 @@ impl Element for TextElement {
             current_row,
             selection_path,
             search_match_paths,
+            selection_highlight_paths,
             bracket_match_paths,
             hover_highlight_path,
             hover_definition_hitbox,
@@ -1873,6 +1997,11 @@ impl Element for TextElement {
         // Paint selections
         if window.is_window_active() {
             let secondary_selection = cx.theme().selection.saturation(0.1);
+            // The selection's twins, in the same faint colour the inactive
+            // search matches use -- they mean the same thing to the reader.
+            for path in prepaint.selection_highlight_paths.iter() {
+                window.paint_path(path.clone(), secondary_selection);
+            }
             for (path, is_active) in prepaint.search_match_paths.iter() {
                 window.paint_path(path.clone(), secondary_selection);
 

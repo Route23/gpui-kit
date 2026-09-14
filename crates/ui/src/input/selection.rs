@@ -168,3 +168,75 @@ mod tests {
         }
     }
 }
+
+/// Where else the selected text appears, within the slice handed in.
+///
+/// # Why a scan of its own
+///
+/// [`super::search::SearchMatcher`] exists, but it copies the **whole**
+/// document into a `String` and rebuilds an Aho-Corasick automaton whenever
+/// the text changes. The selection changes on every frame of a drag, so that
+/// bill would come due sixty times a second. Looking through what is on
+/// screen is a memcmp over a few hundred lines.
+///
+/// `needle` is the selected text, `haystack` the visible slice, `offset` the
+/// byte position the slice starts at, and `skip` the selection itself, which
+/// is already drawn and must not be drawn twice. Returned ranges are absolute
+/// byte offsets into the document.
+///
+/// Empty or whitespace-only selections match nothing: every space in the file
+/// lighting up is noise, not information.
+pub(super) fn occurrences(
+    needle: &str,
+    haystack: &str,
+    offset: usize,
+    skip: &std::ops::Range<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    if needle.trim().is_empty() {
+        return vec![];
+    }
+    let mut out = vec![];
+    let mut at = 0;
+    while let Some(found) = haystack[at..].find(needle) {
+        let start = offset + at + found;
+        let end = start + needle.len();
+        if !(start == skip.start && end == skip.end) {
+            out.push(start..end);
+        }
+        at += found + needle.len();
+    }
+    out
+}
+
+#[cfg(test)]
+mod occurrence_tests {
+    use super::occurrences;
+
+    #[test]
+    fn it_finds_the_other_runs_and_skips_the_selection() {
+        let text = "let row = row + 1;";
+        // The selection is the first `row`, at 4..7.
+        let got = occurrences("row", text, 0, &(4..7));
+        assert_eq!(got, vec![10..13]);
+    }
+
+    #[test]
+    fn it_counts_from_where_the_slice_starts() {
+        let got = occurrences("ab", "xxabxx", 100, &(0..0));
+        assert_eq!(got, vec![102..104]);
+    }
+
+    /// Every space in the file lighting up is noise, not information.
+    #[test]
+    fn whitespace_matches_nothing() {
+        assert!(occurrences(" ", "a b c", 0, &(1..2)).is_empty());
+        assert!(occurrences("", "abc", 0, &(0..0)).is_empty());
+        assert!(occurrences("\n  ", "a\n  b", 0, &(1..4)).is_empty());
+    }
+
+    /// Runs that overlap are not both matches -- `aa` in `aaa` is one.
+    #[test]
+    fn matches_do_not_overlap() {
+        assert_eq!(occurrences("aa", "aaaa", 0, &(99..99)), vec![0..2, 2..4]);
+    }
+}
