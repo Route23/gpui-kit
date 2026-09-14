@@ -29,13 +29,79 @@ fn is_blank(line: &str) -> bool {
     line.chars().all(char::is_whitespace)
 }
 
+/// What a supplied range is for.
+///
+/// Mirrors LSP's `FoldingRangeKind`; anything the server does not name is a
+/// plain region.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FoldKind {
+    #[default]
+    Region,
+    Comment,
+    Imports,
+}
+
+/// A fold range handed in from outside, instead of being read off the
+/// indentation.
+///
+/// Rows are 0-based and **inclusive on both ends**, the way LSP reports them:
+/// `start_row` stays visible (it heads the fold) and everything up to and
+/// including `end_row` is hidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldRange {
+    pub start_row: usize,
+    pub end_row: usize,
+    pub kind: FoldKind,
+}
+
+/// The rows a supplied range hides, or `None` when no range heads `row`.
+///
+/// The same end-exclusive shape [`fold_range`] returns, so the two can be used
+/// interchangeably.
+fn supplied_range(ranges: &[FoldRange], row: usize) -> Option<Range<usize>> {
+    ranges
+        .iter()
+        .find(|r| r.start_row == row && r.end_row > r.start_row)
+        .map(|r| r.start_row + 1..r.end_row + 1)
+}
+
 /// The rows hidden by folding at `row`, or `None` when `row` heads no fold.
 ///
 /// End-exclusive, and never contains `row` itself.
 ///
-/// Blank lines inside the region are absorbed but do **not** extend it, so the
-/// blank lines between two blocks stay visible rather than being swallowed by
-/// the block above (VS Code's `offSide: false`).
+/// **When ranges are supplied, only they are consulted** -- indentation is not
+/// mixed in. A language server that answers knows the language better than the
+/// indentation rule does, and mixing the two would put chevrons on rows the
+/// server deliberately left out (VS Code behaves the same way).
+pub(super) fn fold_range_with(
+    text: &Rope,
+    row: usize,
+    tab: TabSize,
+    supplied: Option<&[FoldRange]>,
+) -> Option<Range<usize>> {
+    match supplied {
+        Some(ranges) => supplied_range(ranges, row),
+        None => fold_range(text, row, tab),
+    }
+}
+
+/// Whether `row` heads a fold, honouring supplied ranges.
+///
+/// **Must agree with [`fold_range_with`]** -- the gutter asks this one and the
+/// click asks the other, and a disagreement puts a chevron on a row that does
+/// not fold.
+pub(super) fn is_foldable_with(
+    text: &Rope,
+    row: usize,
+    tab: TabSize,
+    supplied: Option<&[FoldRange]>,
+) -> bool {
+    match supplied {
+        Some(ranges) => supplied_range(ranges, row).is_some(),
+        None => is_foldable(text, row, tab),
+    }
+}
+
 pub(super) fn fold_range(text: &Rope, row: usize, tab: TabSize) -> Option<Range<usize>> {
     let rows = text.lines_len();
     if row + 1 >= rows {
@@ -99,10 +165,15 @@ pub(super) fn is_foldable(text: &Rope, row: usize, tab: TabSize) -> bool {
 /// The sorted, de-duplicated union of every fold's hidden rows.
 ///
 /// Nested folds overlap; the union is what the wrapper needs.
-pub(super) fn hidden_rows(text: &Rope, headers: &[usize], tab: TabSize) -> Vec<usize> {
+pub(super) fn hidden_rows(
+    text: &Rope,
+    headers: &[usize],
+    tab: TabSize,
+    supplied: Option<&[FoldRange]>,
+) -> Vec<usize> {
     let mut rows: Vec<usize> = headers
         .iter()
-        .filter_map(|&row| fold_range(text, row, tab))
+        .filter_map(|&row| fold_range_with(text, row, tab, supplied))
         .flatten()
         .collect();
     rows.sort_unstable();
@@ -140,6 +211,37 @@ pub(super) fn adjust_folded_rows(
     });
 }
 
+/// Move supplied ranges to keep up with an edit.
+///
+/// A range the edit touched is **dropped**: what it used to cover is anyone's
+/// guess once the text under it changed. Ranges below shift; ranges above are
+/// untouched. Same rule as [`adjust_folded_rows`], applied to both ends.
+pub(super) fn adjust_fold_ranges(
+    ranges: &mut Vec<FoldRange>,
+    edit_rows: RangeInclusive<usize>,
+    delta: isize,
+) {
+    ranges.retain_mut(|r| {
+        if r.end_row < *edit_rows.start() {
+            return true;
+        }
+        if r.start_row <= *edit_rows.end() {
+            return false;
+        }
+        match (
+            r.start_row.checked_add_signed(delta),
+            r.end_row.checked_add_signed(delta),
+        ) {
+            (Some(start), Some(end)) => {
+                r.start_row = start;
+                r.end_row = end;
+                true
+            }
+            _ => false,
+        }
+    });
+}
+
 /// Where a caret pushed into a hidden row should come to rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SnapDirection {
@@ -159,7 +261,57 @@ impl InputState {
 
     /// Whether `row` heads a fold, folded or not.
     pub(super) fn is_foldable(&self, row: usize) -> bool {
-        self.mode.has_folding() && is_foldable(&self.text, row, self.mode.tab_size())
+        self.mode.has_folding()
+            && is_foldable_with(
+                &self.text,
+                row,
+                self.mode.tab_size(),
+                self.supplied_folds.as_deref(),
+            )
+    }
+
+    /// Use these ranges instead of the indentation rule.
+    ///
+    /// Hands folding over to whoever knows the language -- a language server's
+    /// `textDocument/foldingRange`, for instance. Passing an empty list still
+    /// takes over (nothing folds); call [`InputState::clear_fold_ranges`] to
+    /// go back to indentation.
+    pub fn set_fold_ranges(&mut self, ranges: Vec<FoldRange>, cx: &mut Context<Self>) {
+        self.supplied_folds = Some(ranges);
+        self.update_folds();
+        cx.notify();
+    }
+
+    /// Go back to reading fold ranges off the indentation.
+    pub fn clear_fold_ranges(&mut self, cx: &mut Context<Self>) {
+        if self.supplied_folds.take().is_none() {
+            return;
+        }
+        self.update_folds();
+        cx.notify();
+    }
+
+    /// Fold every supplied range marked [`FoldKind::Imports`].
+    ///
+    /// Does nothing while folding is off or no ranges have been supplied --
+    /// the indentation rule has no notion of an import block.
+    pub fn fold_imports(&mut self, cx: &mut Context<Self>) {
+        if !self.mode.has_folding() {
+            return;
+        }
+        let Some(ranges) = self.supplied_folds.as_ref() else {
+            return;
+        };
+        let rows: Vec<usize> = ranges
+            .iter()
+            .filter(|r| r.kind == FoldKind::Imports && r.end_row > r.start_row)
+            .map(|r| r.start_row)
+            .collect();
+        for row in rows {
+            if !self.is_folded(row) {
+                self.toggle_fold(row, cx);
+            }
+        }
     }
 
     /// Fold or unfold the region headed by `row`.
@@ -173,7 +325,17 @@ impl InputState {
         if let Some(ix) = self.folded_rows.iter().position(|&r| r == row) {
             self.folded_rows.remove(ix);
         } else {
-            let Some(hidden) = fold_range(&self.text, row, self.mode.tab_size()) else {
+            // The cap is checked here too, not only in `fold_all`: folding one
+            // row at a time must not sneak past it.
+            if self.folded_rows.len() >= self.mode.max_fold_regions() {
+                return;
+            }
+            let Some(hidden) = fold_range_with(
+                &self.text,
+                row,
+                self.mode.tab_size(),
+                self.supplied_folds.as_deref(),
+            ) else {
                 return;
             };
             // Never leave the caret inside a region the user cannot see.
@@ -200,10 +362,12 @@ impl InputState {
         }
 
         let tab = self.mode.tab_size();
+        let supplied = self.supplied_folds.clone();
+        let cap = self.mode.max_fold_regions();
         let mut headers: Vec<usize> = vec![];
         let mut row = 0;
-        while row < self.text.lines_len() {
-            if let Some(range) = fold_range(&self.text, row, tab) {
+        while row < self.text.lines_len() && headers.len() < cap {
+            if let Some(range) = fold_range_with(&self.text, row, tab, supplied.as_deref()) {
                 headers.push(row);
                 // Skip the body: the outermost fold already hides it.
                 row = range.end;
@@ -278,14 +442,17 @@ impl InputState {
 
         let tab = self.mode.tab_size();
         let text = self.text.clone();
-        self.folded_rows.retain(|&row| is_foldable(&text, row, tab));
-        let rows = hidden_rows(&text, &self.folded_rows, tab);
+        let supplied = self.supplied_folds.clone();
+        let s = supplied.as_deref();
+        self.folded_rows
+            .retain(|&row| is_foldable_with(&text, row, tab, s));
+        let rows = hidden_rows(&text, &self.folded_rows, tab, s);
         self.text_wrapper.set_hidden_rows(rows);
     }
 
     /// Keep the fold headers pointing at the same blocks across an edit.
     pub(super) fn shift_folds_for_edit(&mut self, old_text: &Rope, edited: &Range<usize>) {
-        if self.folded_rows.is_empty() {
+        if self.folded_rows.is_empty() && self.supplied_folds.is_none() {
             return;
         }
 
@@ -293,6 +460,12 @@ impl InputState {
         let end_row = old_text.offset_to_point(edited.end.min(old_text.len())).row;
         let delta = self.text.lines_len() as isize - old_text.lines_len() as isize;
         adjust_folded_rows(&mut self.folded_rows, start_row..=end_row, delta);
+        // Supplied ranges go stale the same way headers do. Whoever supplied
+        // them is expected to ask again; until then the surviving ranges keep
+        // pointing at the right blocks.
+        if let Some(ranges) = self.supplied_folds.as_mut() {
+            adjust_fold_ranges(ranges, start_row..=end_row, delta);
+        }
     }
 
     /// Push an offset that landed on a hidden row out to a visible one.
@@ -467,6 +640,54 @@ impl InputState {
         None
     }
 
+    /// Unfold the row that was clicked past the end of its text.
+    ///
+    /// Returns `true` when the click was swallowed. Only ever fires on a
+    /// **folded** row, and only to the right of the text -- clicking the text
+    /// itself still places the caret.
+    ///
+    /// `closest_index_for_x` clamps anything past the line to the line end, so
+    /// nothing downstream can tell "on the last glyph" from "400px past it".
+    /// The x test has to happen here.
+    pub(super) fn handle_click_after_end_of_line(
+        &mut self,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.mode.has_folding() || !self.mode.unfold_on_click_after_end_of_line() {
+            return false;
+        }
+        if event.button != MouseButton::Left || event.click_count != 1 {
+            return false;
+        }
+        let Some(row) = self.row_for_mouse_position(event.position) else {
+            return false;
+        };
+        if !self.is_folded(row) {
+            return false;
+        }
+        let (Some(last_layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds)
+        else {
+            return false;
+        };
+        let Some(width) = last_layout
+            .line(row)
+            .and_then(|l| l.wrapped_lines.last())
+            .map(|l| l.width)
+        else {
+            return false;
+        };
+        // `last_bounds` carries the scroll offset, which is what the text was
+        // drawn against.
+        let text_end = bounds.origin.x + last_layout.line_number_width + width;
+        if event.position.x <= text_end {
+            return false;
+        }
+        self.toggle_fold(row, cx);
+        cx.stop_propagation();
+        true
+    }
+
     /// Remember which gutter row the pointer is over, for
     /// [`FoldingControls::MouseOver`].
     ///
@@ -624,6 +845,71 @@ fn main() {
         assert_eq!(fold_range(&text, 0, tab()), Some(1..3));
     }
 
+    fn ranges() -> Vec<FoldRange> {
+        vec![
+            FoldRange { start_row: 0, end_row: 2, kind: FoldKind::Imports },
+            FoldRange { start_row: 4, end_row: 9, kind: FoldKind::Region },
+            // Degenerate: a server may report a one-line "range".
+            FoldRange { start_row: 11, end_row: 11, kind: FoldKind::Comment },
+        ]
+    }
+
+    /// Supplied ranges take over completely -- indentation is not mixed in.
+    #[test]
+    fn supplied_ranges_replace_the_indentation_rule() {
+        let text = Rope::from(NESTED);
+        let r = ranges();
+        let s = Some(r.as_slice());
+
+        assert_eq!(fold_range_with(&text, 0, tab(), s), Some(1..3));
+        assert_eq!(fold_range_with(&text, 4, tab(), s), Some(5..10));
+        // A row the server did not name does not fold, however it is indented.
+        assert_eq!(fold_range_with(&text, 1, tab(), s), None);
+        // start == end is not a fold.
+        assert_eq!(fold_range_with(&text, 11, tab(), s), None);
+        // No table: the indentation rule, unchanged.
+        assert_eq!(
+            fold_range_with(&text, 0, tab(), None),
+            fold_range(&text, 0, tab())
+        );
+    }
+
+    /// The two entry points must agree for supplied ranges too.
+    #[test]
+    fn is_foldable_with_agrees_with_fold_range_with() {
+        let text = Rope::from(NESTED);
+        let r = ranges();
+        let s = Some(r.as_slice());
+        for row in 0..text.lines_len() {
+            assert_eq!(
+                is_foldable_with(&text, row, tab(), s),
+                fold_range_with(&text, row, tab(), s).is_some(),
+                "row {row}"
+            );
+        }
+    }
+
+    /// An edit drops the ranges it touched and shifts the ones below.
+    #[test]
+    fn supplied_ranges_move_with_an_edit() {
+        let mut r = ranges();
+        // Two rows inserted above everything.
+        adjust_fold_ranges(&mut r, 0..=0, 2);
+        assert_eq!(
+            r,
+            vec![
+                FoldRange { start_row: 6, end_row: 11, kind: FoldKind::Region },
+                FoldRange { start_row: 13, end_row: 13, kind: FoldKind::Comment },
+            ],
+            "the range the edit landed in is dropped, the rest shift"
+        );
+
+        let mut r = ranges();
+        // An edit below everything changes nothing.
+        adjust_fold_ranges(&mut r, 20..=20, 1);
+        assert_eq!(r, ranges());
+    }
+
     /// The cheap predicate must never disagree with the real computation.
     #[test]
     fn is_foldable_agrees_with_fold_range() {
@@ -650,10 +936,10 @@ fn main() {
     fn hidden_rows_unions_nested_folds() {
         let text = Rope::from(NESTED);
         // Both the outer and the inner fold: the union counts row 2 once.
-        assert_eq!(hidden_rows(&text, &[0, 1], tab()), vec![1, 2, 3]);
-        assert_eq!(hidden_rows(&text, &[1], tab()), vec![2]);
+        assert_eq!(hidden_rows(&text, &[0, 1], tab(), None), vec![1, 2, 3]);
+        assert_eq!(hidden_rows(&text, &[1], tab(), None), vec![2]);
         // A header that no longer folds contributes nothing.
-        assert_eq!(hidden_rows(&text, &[2], tab()), Vec::<usize>::new());
+        assert_eq!(hidden_rows(&text, &[2], tab(), None), Vec::<usize>::new());
     }
 
     #[test]

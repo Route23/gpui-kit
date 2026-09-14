@@ -37,6 +37,7 @@ pub use lsp::*;
 pub use mask_pattern::MaskPattern;
 pub use brackets::{AutoClose, BracketGuides, MatchBrackets, Pair};
 pub use comment::CommentTokens;
+pub use fold::{FoldKind, FoldRange};
 pub use mode::{FoldingControls, LineNumbers, RenderWhitespace, WrapAt};
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};
 pub use otp_input::*;

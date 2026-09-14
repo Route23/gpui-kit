@@ -354,6 +354,9 @@ pub struct InputState {
     /// the text every time, so a stale header can only fold the wrong block --
     /// never hide bytes with no way to reveal them.
     pub(super) folded_rows: Vec<usize>,
+    /// Fold ranges handed in from outside (a language server), instead of the
+    /// indentation rule. `None` = read them off the indentation.
+    pub(super) supplied_folds: Option<Vec<crate::input::FoldRange>>,
     /// The row the pointer is over in the fold gutter, for
     /// [`FoldingControls::MouseOver`].
     pub(super) hovered_gutter_row: Option<usize>,
@@ -454,6 +457,7 @@ impl InputState {
             clean_on_escape: false,
             soft_wrap: true,
             folded_rows: Vec::new(),
+            supplied_folds: None,
             hovered_gutter_row: None,
             loading: false,
             pattern: None,
@@ -595,6 +599,42 @@ impl InputState {
         } = &mut self.mode
         {
             *r = render;
+        }
+        self
+    }
+
+    /// Draw a band behind a folded row, only for [`InputMode::CodeEditor`].
+    pub fn fold_highlight(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { fold_highlight, .. } = &mut self.mode {
+            *fold_highlight = on;
+        }
+        self
+    }
+
+    /// Cap how many regions can be folded at once, only for
+    /// [`InputMode::CodeEditor`].
+    pub fn max_fold_regions(mut self, max: u32) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            max_fold_regions, ..
+        } = &mut self.mode
+        {
+            *max_fold_regions = max;
+        }
+        self
+    }
+
+    /// Unfold a folded row when it is clicked past the end of its text, only
+    /// for [`InputMode::CodeEditor`].
+    pub fn unfold_on_click_after_end_of_line(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            unfold_on_click_after_end_of_line,
+            ..
+        } = &mut self.mode
+        {
+            *unfold_on_click_after_end_of_line = on;
         }
         self
     }
@@ -2007,6 +2047,11 @@ impl InputState {
         // before the caret is moved, so clicking a chevron neither jumps the
         // caret nor starts a drag-selection.
         if self.handle_fold_gutter_click(event, cx) {
+            return;
+        }
+        // Then the row itself: clicking past the end of a folded line opens it
+        // (`editor.unfoldOnClickAfterEndOfLine`), before the caret moves.
+        if self.handle_click_after_end_of_line(event, cx) {
             return;
         }
 

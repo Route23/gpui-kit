@@ -26,6 +26,13 @@ pub(super) const DEFAULT_SURROUNDING_LINES: u8 = 3;
 /// the moment it grows past 999 lines.
 pub(super) const DEFAULT_MIN_LINE_NUMBER_DIGITS: usize = 4;
 
+/// The most fold regions [`InputState::fold_all`] will create, and the most
+/// folds that can be open at once.
+///
+/// VS Code's `editor.foldingMaximumRegions` defaults to the same number. It is
+/// a guard for very large files, not a limit anyone should reach by hand.
+pub(super) const DEFAULT_MAX_FOLD_REGIONS: u32 = 5_000;
+
 /// Where soft wrapping breaks a long line.
 ///
 /// Only consulted while soft wrap is on; mirrors the non-`off` half of VS
@@ -218,6 +225,12 @@ pub(crate) enum InputMode {
         folding: bool,
         /// When the fold chevrons are visible
         folding_controls: FoldingControls,
+        /// Whether a folded row gets a band behind it.
+        fold_highlight: bool,
+        /// How many regions may be folded at once.
+        max_fold_regions: u32,
+        /// Whether clicking past the end of a folded row unfolds it.
+        unfold_on_click_after_end_of_line: bool,
         /// Which auto-closing behaviours are on
         auto_close: AutoClose,
         /// When the matching bracket is outlined
@@ -291,6 +304,9 @@ impl InputMode {
             render_whitespace: RenderWhitespace::default(),
             folding: true,
             folding_controls: FoldingControls::default(),
+            fold_highlight: false,
+            max_fold_regions: DEFAULT_MAX_FOLD_REGIONS,
+            unfold_on_click_after_end_of_line: false,
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,
@@ -612,6 +628,40 @@ impl InputMode {
         }
     }
 
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn fold_highlight(&self) -> bool {
+        match self {
+            InputMode::CodeEditor { fold_highlight, .. } => *fold_highlight,
+            _ => false,
+        }
+    }
+
+    /// Return [`DEFAULT_MAX_FOLD_REGIONS`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn max_fold_regions(&self) -> usize {
+        let n = match self {
+            InputMode::CodeEditor {
+                max_fold_regions, ..
+            } => *max_fold_regions,
+            _ => DEFAULT_MAX_FOLD_REGIONS,
+        };
+        n as usize
+    }
+
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn unfold_on_click_after_end_of_line(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                unfold_on_click_after_end_of_line,
+                ..
+            } => *unfold_on_click_after_end_of_line,
+            _ => false,
+        }
+    }
+
     /// Return [`WrapAt::EditorWidth`] if the mode is not
     /// [`InputMode::CodeEditor`].
     #[inline]
@@ -824,8 +874,8 @@ mod tests {
             AutoClose, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle, MatchBrackets,
             SurroundingLinesStyle, TabSize,
             mode::{
-                DEFAULT_SURROUNDING_LINES, FoldingControls, InputMode, LineNumbers,
-                RenderWhitespace, WrapAt,
+                DEFAULT_MAX_FOLD_REGIONS, DEFAULT_SURROUNDING_LINES, FoldingControls, InputMode,
+                LineNumbers, RenderWhitespace, WrapAt,
             },
         },
     };
@@ -883,6 +933,9 @@ mod tests {
             render_whitespace: RenderWhitespace::None,
             folding: true,
             folding_controls: FoldingControls::default(),
+            fold_highlight: false,
+            max_fold_regions: DEFAULT_MAX_FOLD_REGIONS,
+            unfold_on_click_after_end_of_line: false,
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,

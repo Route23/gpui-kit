@@ -1753,6 +1753,32 @@ impl Element for TextElement {
             }
         }
 
+        // Paint the band behind folded rows, under everything else.
+        //
+        // Its own walk rather than a branch inside the active-line loop below:
+        // that one only runs when the line number gutter is on, and folding
+        // does not need the gutter.
+        if state.mode.fold_highlight() && !state.folded_rows.is_empty() {
+            let color = cx.theme().selection.opacity(0.5);
+            let mut fold_y = invisible_top_padding;
+            for row in visible_range.clone() {
+                let Some(line) = prepaint.last_layout.line(row) else {
+                    continue;
+                };
+                let height = line_height * line.wrapped_lines.len() as f32;
+                if state.is_folded(row) && height > px(0.) {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(input_bounds.origin.x, origin.y + fold_y),
+                            size(bounds.size.width, height),
+                        ),
+                        color,
+                    ));
+                }
+                fold_y += height;
+            }
+        }
+
         let active_line_color = cx.theme().highlight_theme.style.editor_active_line;
 
         // Paint active line
