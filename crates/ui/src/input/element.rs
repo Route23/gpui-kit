@@ -1911,7 +1911,13 @@ impl Element for TextElement {
                                 point(hint_p.x - INLAY_CHIP_PAD, hint_p.y + px(1.)),
                                 size(hint.width + INLAY_CHIP_PAD * 2., line_height - px(2.)),
                             ),
-                            cx.theme().secondary,
+                            // **`secondary` では見えない** —— dopamine では
+                            // それも編集面と同じ色に落ちている。地色に本文の
+                            // 色を薄く混ぜると、どの配色でも 1 段浮く
+                            // （`hint_background` と同じ作り）。
+                            cx.theme()
+                                .editor_background()
+                                .blend(cx.theme().foreground.alpha(0.10)),
                         )
                         .corner_radii(px(3.)),
                     );
