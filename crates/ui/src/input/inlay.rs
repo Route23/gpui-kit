@@ -74,6 +74,15 @@ impl InputState {
         cx.notify();
     }
 
+    /// Whether any inlay hints have been supplied.
+    ///
+    /// Says nothing about whether they are on screen -- a modifier may be
+    /// hiding them. The caller uses this to tell "none supplied yet" from
+    /// "supplied, and there were none for this file".
+    pub fn has_inlay_hints(&self) -> bool {
+        !self.inlay_rows.is_empty()
+    }
+
     /// Whether the hints are visible this frame.
     ///
     /// The modifier *flips* what the editor is doing, the way Zed's
