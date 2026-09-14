@@ -47,6 +47,37 @@ pub(super) const DEFAULT_HOVER_HIDING_DELAY: u16 = 0;
 /// a guard for very large files, not a limit anyone should reach by hand.
 pub(super) const DEFAULT_MAX_FOLD_REGIONS: u32 = 5_000;
 
+/// How the row the caret is on is marked out.
+///
+/// Mirrors VS Code's `editor.renderLineHighlight` and Zed's
+/// `current_line_highlight`, which offer the same four.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LineHighlight {
+    /// Nothing is drawn.
+    None,
+    /// Only the line number gutter.
+    Gutter,
+    /// Only the text.
+    Line,
+    /// Both -- what the editor did before this was settable.
+    #[default]
+    All,
+}
+
+impl LineHighlight {
+    /// Whether the text of the caret's row gets a band.
+    #[inline]
+    pub fn highlights_line(self) -> bool {
+        matches!(self, LineHighlight::Line | LineHighlight::All)
+    }
+
+    /// Whether the gutter of the caret's row gets a band.
+    #[inline]
+    pub fn highlights_gutter(self) -> bool {
+        matches!(self, LineHighlight::Gutter | LineHighlight::All)
+    }
+}
+
 /// The columns of clear space between the code and an end-of-row diagnostic.
 ///
 /// Zed's `diagnostics.inline.padding` defaults to the same number.
@@ -304,6 +335,18 @@ pub(crate) enum InputMode {
         inlay_hint_font_size: f32,
         /// Whether a chip is drawn behind an inlay hint.
         inlay_hint_background: bool,
+        /// How the row the caret is on is marked out.
+        line_highlight: LineHighlight,
+        /// Whether that mark is only drawn while the editor has focus.
+        line_highlight_focused_only: bool,
+        /// Blank space above the first row, in px.
+        ///
+        /// Part of the content, not the frame: it scrolls away, the gutter's
+        /// colour runs behind it, and every offset the editor measures starts
+        /// below it.
+        padding_top: u16,
+        /// Blank space below the last row, in px.
+        padding_bottom: u16,
         /// How many columns of clear space go between the code and the
         /// diagnostic drawn at the end of the row.
         inline_diagnostic_padding: u8,
@@ -403,6 +446,10 @@ impl InputMode {
             inlay_hint_font_family: None,
             inlay_hint_font_size: 0.,
             inlay_hint_background: false,
+            line_highlight: LineHighlight::All,
+            line_highlight_focused_only: false,
+            padding_top: 0,
+            padding_bottom: 0,
             inline_diagnostic_padding: DEFAULT_INLINE_DIAGNOSTIC_PADDING,
             inline_diagnostic_min_column: 0,
             inlay_hints_on: true,
@@ -835,6 +882,47 @@ impl InputMode {
         }
     }
 
+    /// Return [`LineHighlight::All`] if the mode is not
+    /// [`InputMode::CodeEditor`] -- that is what every input did before this
+    /// was settable.
+    #[inline]
+    pub(super) fn line_highlight(&self) -> LineHighlight {
+        match self {
+            InputMode::CodeEditor { line_highlight, .. } => *line_highlight,
+            _ => LineHighlight::All,
+        }
+    }
+
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn line_highlight_focused_only(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                line_highlight_focused_only,
+                ..
+            } => *line_highlight_focused_only,
+            _ => false,
+        }
+    }
+
+    /// Return 0 if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn padding_top(&self) -> Pixels {
+        match self {
+            InputMode::CodeEditor { padding_top, .. } => px(f32::from(*padding_top)),
+            _ => px(0.),
+        }
+    }
+
+    /// Return 0 if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn padding_bottom(&self) -> Pixels {
+        match self {
+            InputMode::CodeEditor { padding_bottom, .. } => px(f32::from(*padding_bottom)),
+            _ => px(0.),
+        }
+    }
+
     /// Return [`DEFAULT_INLINE_DIAGNOSTIC_PADDING`] if the mode is not
     /// [`InputMode::CodeEditor`].
     #[inline]
@@ -1108,7 +1196,7 @@ mod tests {
             mode::{
                 DEFAULT_INLINE_DIAGNOSTIC_PADDING, DEFAULT_MAX_FOLD_REGIONS,
                 DEFAULT_SURROUNDING_LINES, FoldingControls, InlayModifier, InputMode,
-                LineNumbers, RenderWhitespace, WrapAt,
+                LineHighlight, LineNumbers, RenderWhitespace, WrapAt,
             },
         },
     };
@@ -1155,6 +1243,15 @@ mod tests {
             DEFAULT_INLINE_DIAGNOSTIC_PADDING,
             "Zed と同じ"
         );
+        // 現在行の強調と余白（#255 / ADR-0090）。**どれも今までどおり。**
+        assert_eq!(
+            mode.line_highlight(),
+            LineHighlight::All,
+            "ガターも本文も塗るのが今までの見た目"
+        );
+        assert!(!mode.line_highlight_focused_only(), "フォーカスを見ない");
+        assert_eq!(mode.padding_top(), px(0.), "#224 で消したまま");
+        assert_eq!(mode.padding_bottom(), px(0.));
         assert_eq!(mode.inline_diagnostic_min_column(), 0, "行末のすぐ後ろ");
         assert_eq!(mode.inlay_hint_modifier(), InlayModifier::None);
         assert_eq!(mode.inlay_hint_font_family(), None, "the editor's font");
@@ -1199,6 +1296,10 @@ mod tests {
             inlay_hint_font_family: None,
             inlay_hint_font_size: 0.,
             inlay_hint_background: false,
+            line_highlight: LineHighlight::All,
+            line_highlight_focused_only: false,
+            padding_top: 0,
+            padding_bottom: 0,
             inline_diagnostic_padding: DEFAULT_INLINE_DIAGNOSTIC_PADDING,
             inline_diagnostic_min_column: 0,
             inlay_hints_on: true,

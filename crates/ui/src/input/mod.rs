@@ -42,7 +42,9 @@ pub use comment::CommentTokens;
 pub use fold::{FoldKind, FoldRange};
 pub use inlay::InlayRow;
 pub use inline_diag::InlineDiagnostic;
-pub use mode::{FoldingControls, InlayModifier, LineNumbers, RenderWhitespace, WrapAt};
+pub use mode::{
+    FoldingControls, InlayModifier, LineHighlight, LineNumbers, RenderWhitespace, WrapAt,
+};
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};
 pub use otp_input::*;
 pub use state::*;

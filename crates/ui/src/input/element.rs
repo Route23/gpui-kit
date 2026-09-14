@@ -158,7 +158,10 @@ impl TextElement {
         let mut cursor_end = None;
 
         let mut prev_lines_offset = 0;
-        let mut offset_y = px(0.);
+        // **The content starts below the pad** (dopamine #255 / ADR-0090).
+        // The caret's y and the scroll-into-view both come out of this walk,
+        // so seeding it here keeps them with the text instead of a pad above it.
+        let mut offset_y = state.mode.padding_top();
         for (ix, wrap_line) in text_wrapper.lines.iter().enumerate() {
             let row = ix;
             let line_origin = point(px(0.), offset_y);
@@ -775,9 +778,12 @@ impl TextElement {
     ) -> (Range<usize>, Pixels) {
         // Add extra rows to avoid showing empty space when scroll to bottom.
         let extra_rows = 1;
-        let mut visible_top = px(0.);
+        // The pad above the first row is part of the content: the first row
+        // genuinely starts that far down, so every walk seeded from
+        // `visible_top` moves with it (dopamine #255 / ADR-0090).
+        let mut visible_top = state.mode.padding_top();
         if state.mode.is_single_line() {
-            return (0..1, visible_top);
+            return (0..1, px(0.));
         }
 
         // `visible_range` is a range of **buffer rows**, so it has to be seeded
@@ -794,7 +800,7 @@ impl TextElement {
         };
 
         let mut visible_range = 0..total_rows;
-        let mut line_bottom = px(0.);
+        let mut line_bottom = visible_top;
         for (ix, line) in state.text_wrapper.lines.iter().enumerate() {
             let wrapped_height = line.height(line_height);
             line_bottom += wrapped_height;
@@ -1523,8 +1529,14 @@ impl Element for TextElement {
             } else {
                 longest_line_width
             },
-            (total_wrapped_lines as f32 * line_height + empty_bottom_height + ghost_lines_height)
-                .max(bounds.size.height),
+            (total_wrapped_lines as f32 * line_height
+                + empty_bottom_height
+                + ghost_lines_height
+                // Without these the last row cannot be scrolled to, and the
+                // pad below it would never come into view (#255 / ADR-0090).
+                + state.mode.padding_top()
+                + state.mode.padding_bottom())
+            .max(bounds.size.height),
         );
 
         // `position_for_index` for example
@@ -1806,23 +1818,34 @@ impl Element for TextElement {
         }
 
         let active_line_color = cx.theme().highlight_theme.style.editor_active_line;
+        // How the caret's row is marked out (dopamine #255 / ADR-0090).
+        // `focused` was worked out at the top of `paint`.
+        let line_highlight = state.mode.line_highlight();
+        let highlight_row = (!state.mode.line_highlight_focused_only() || focused)
+            .then_some(prepaint.current_row)
+            .flatten();
 
-        // Paint active line
-        let mut offset_y = px(0.);
-        if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
-            offset_y += invisible_top_padding;
-
-            // Each item is the normal lines.
-            for (ix, lines) in line_numbers.iter().enumerate() {
+        // Paint the band behind the caret's row.
+        //
+        // **Walked over the laid-out lines, not the line numbers.** It used to
+        // hang off `prepaint.line_numbers`, so turning the gutter off took the
+        // band with it -- the two have nothing to do with each other.
+        if line_highlight.highlights_line() {
+            let mut offset_y = invisible_top_padding;
+            for (ix, line) in prepaint.last_layout.lines.iter().enumerate() {
                 let row = visible_range.start + ix;
-                let is_active = prepaint.current_row == Some(row);
-                let p = point(input_bounds.origin.x, origin.y + offset_y);
-                let height = line_height * lines.len() as f32;
-                // Paint the current line background
-                if is_active {
+                let height = line.size(line_height).height;
+                if Some(row) == highlight_row {
                     if let Some(bg_color) = active_line_color {
+                        // The gutter has its own band; this one starts where
+                        // the text does so `Line` and `Gutter` can be told
+                        // apart.
+                        let x = input_bounds.origin.x + prepaint.last_layout.line_number_width;
                         window.paint_quad(fill(
-                            Bounds::new(p, size(bounds.size.width, height)),
+                            Bounds::new(
+                                point(x, origin.y + offset_y),
+                                size(bounds.size.width, height),
+                            ),
                             bg_color,
                         ));
                     }
@@ -2073,11 +2096,9 @@ impl Element for TextElement {
                 let row = visible_range.start + ix;
 
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
-                let is_active = prepaint.current_row == Some(row);
-
                 let height = line_height * lines.len() as f32;
                 // paint active line number background
-                if is_active {
+                if line_highlight.highlights_gutter() && Some(row) == highlight_row {
                     if let Some(bg_color) = active_line_color {
                         window.paint_quad(fill(
                             Bounds::new(p, size(prepaint.last_layout.line_number_width, height)),

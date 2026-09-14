@@ -27,7 +27,10 @@ use super::{
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
-    mode::{FoldingControls, InlayModifier, InputMode, LineNumbers, RenderWhitespace, WrapAt},
+    mode::{
+        FoldingControls, InlayModifier, InputMode, LineHighlight, LineNumbers,
+        RenderWhitespace, WrapAt,
+    },
     number_input,
     text_wrapper::TextWrapper,
 };
@@ -745,6 +748,49 @@ impl InputState {
         } = &mut self.mode
         {
             *inlay_hint_font_size = size.max(0.);
+        }
+        self
+    }
+
+    /// Mark out the row the caret is on this way, only for
+    /// [`InputMode::CodeEditor`].
+    pub fn line_highlight(mut self, how: LineHighlight) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { line_highlight, .. } = &mut self.mode {
+            *line_highlight = how;
+        }
+        self
+    }
+
+    /// Only mark out the caret's row while the editor has focus, only for
+    /// [`InputMode::CodeEditor`].
+    pub fn line_highlight_focused_only(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            line_highlight_focused_only,
+            ..
+        } = &mut self.mode
+        {
+            *line_highlight_focused_only = on;
+        }
+        self
+    }
+
+    /// Leave this much blank space above the first row and below the last, in
+    /// px, only for [`InputMode::CodeEditor`].
+    ///
+    /// The space is part of the content: it scrolls away, and every offset the
+    /// editor measures starts below it.
+    pub fn editor_padding(mut self, top: u16, bottom: u16) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            padding_top,
+            padding_bottom,
+            ..
+        } = &mut self.mode
+        {
+            *padding_top = top;
+            *padding_bottom = bottom;
         }
         self
     }
@@ -2397,7 +2443,9 @@ impl InputState {
 
         let row = point.row;
 
-        let mut row_offset_y = px(0.);
+        // Starts below the pad, like every other walk (#255 / ADR-0090) --
+        // this one is not seeded from `visible_top`.
+        let mut row_offset_y = self.mode.padding_top();
         for (ix, wrap_line) in self.text_wrapper.lines.iter().enumerate() {
             if ix == row {
                 break;
