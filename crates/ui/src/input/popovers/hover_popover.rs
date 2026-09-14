@@ -351,7 +351,11 @@ impl Element for Popover {
                     return;
                 }
                 state.hover_popover_hovered = on_popover;
-                if on_popover || on_symbol {
+                // Being on the popover only counts as "still wanted" when it
+                // is sticky; otherwise moving onto it starts the clock like
+                // anywhere else.
+                let keep = on_symbol || (on_popover && state.mode.hover_sticky());
+                if keep {
                     state.cancel_hover_hide();
                 } else {
                     state.schedule_hover_hide(cx);
