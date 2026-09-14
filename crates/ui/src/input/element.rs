@@ -14,7 +14,11 @@ use crate::{
     input::{RopeExt as _, brackets, caret, text_wrapper::LineLayout},
 };
 
-use super::{InputState, LastLayout, mode::{InputMode, WrapAt}};
+use super::{
+    InputState, LastLayout,
+    inlay::{INLAY_CHIP_PAD, INLAY_GAP},
+    mode::{InputMode, WrapAt},
+};
 
 /// Rows kept below the caret in an input that is not a code editor.
 ///
@@ -1184,6 +1188,8 @@ pub(super) struct PrepaintState {
     /// The `…` badge drawn after a folded header, keyed by index into
     /// `LastLayout::lines`.
     fold_markers: Vec<(usize, ShapedLine)>,
+    /// The inlay hints drawn after the end of a row, keyed the same way.
+    inlay_hints: Vec<(usize, ShapedLine)>,
     bounds: Bounds<Pixels>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
@@ -1661,6 +1667,8 @@ impl Element for TextElement {
         });
         let fold_markers =
             self.layout_fold_markers(state, &last_layout, text_size, &text_style, window, cx);
+        let inlay_hints =
+            self.layout_inlay_hints(state, &last_layout, text_size, &text_style, window, cx);
 
         PrepaintState {
             bounds,
@@ -1683,6 +1691,7 @@ impl Element for TextElement {
             fold_chevrons,
             fold_gutter_hitbox,
             fold_markers,
+            inlay_hints,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -1744,6 +1753,7 @@ impl Element for TextElement {
 
         let mut mask_offset_y = px(0.);
         let state = self.state.read(cx);
+        let inlay_chip = state.mode.inlay_hint_background();
         if state.masked && state.text.len() > 0 {
             // Move down offset for vertical centering the *****
             if cfg!(target_os = "macos") {
@@ -1878,6 +1888,35 @@ impl Element for TextElement {
                     p.y + line_height * (line.wrapped_lines.len().saturating_sub(1)) as f32,
                 );
                 _ = marker.paint(marker_p, line_height, window, cx);
+            }
+
+            // The inlay hints for this row, after the end of it -- and after
+            // the fold badge when the row has both. Nothing reads these glyphs
+            // for offsets, so the code itself does not move (see `inlay.rs`).
+            if let Some((_, hint)) = prepaint.inlay_hints.iter().find(|(hix, _)| *hix == ix) {
+                let last = line.wrapped_lines.last();
+                let badge = prepaint
+                    .fold_markers
+                    .iter()
+                    .find(|(mix, _)| *mix == ix)
+                    .map_or(px(0.), |(_, m)| m.width + px(4.));
+                let hint_p = point(
+                    p.x + last.map_or(px(0.), |l| l.width) + badge + INLAY_GAP,
+                    p.y + line_height * (line.wrapped_lines.len().saturating_sub(1)) as f32,
+                );
+                if inlay_chip {
+                    window.paint_quad(
+                        gpui::fill(
+                            Bounds::new(
+                                point(hint_p.x - INLAY_CHIP_PAD, hint_p.y + px(1.)),
+                                size(hint.width + INLAY_CHIP_PAD * 2., line_height - px(2.)),
+                            ),
+                            cx.theme().secondary,
+                        )
+                        .corner_radii(px(3.)),
+                    );
+                }
+                _ = hint.paint(hint_p, line_height, window, cx);
             }
 
             offset_y += line.size(line_height).height;

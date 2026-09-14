@@ -47,6 +47,37 @@ pub(super) const DEFAULT_HOVER_HIDING_DELAY: u16 = 0;
 /// a guard for very large files, not a limit anyone should reach by hand.
 pub(super) const DEFAULT_MAX_FOLD_REGIONS: u32 = 5_000;
 
+/// Which modifier flips inlay hints while it is held down.
+///
+/// Mirrors Zed's `inlay_hints.toggle_on_modifiers_press`: holding the key
+/// inverts whatever the editor is doing right now, so it both reveals hints
+/// that are off and hides hints that are on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InlayModifier {
+    /// No key flips them; the hints stay as they are.
+    #[default]
+    None,
+    Control,
+    /// The option/alt key.
+    Alt,
+    /// The command key.
+    Platform,
+    Shift,
+}
+
+impl InlayModifier {
+    /// Whether `modifiers` holds this key down.
+    pub(super) fn held(self, modifiers: &gpui::Modifiers) -> bool {
+        match self {
+            InlayModifier::None => false,
+            InlayModifier::Control => modifiers.control,
+            InlayModifier::Alt => modifiers.alt,
+            InlayModifier::Platform => modifiers.platform,
+            InlayModifier::Shift => modifiers.shift,
+        }
+    }
+}
+
 /// Where soft wrapping breaks a long line.
 ///
 /// Only consulted while soft wrap is on; mirrors the non-`off` half of VS
@@ -262,6 +293,19 @@ pub(crate) enum InputMode {
         hover_sticky: bool,
         /// Whether the popover prefers the space above the line.
         hover_above: bool,
+        /// The font inlay hints are drawn in; `None` takes the editor's.
+        inlay_hint_font_family: Option<SharedString>,
+        /// The size inlay hints are drawn at in px; `0` is 90% of the text.
+        inlay_hint_font_size: f32,
+        /// Whether a chip is drawn behind an inlay hint.
+        inlay_hint_background: bool,
+        /// Whether the supplied inlay hints are shown with no key held.
+        ///
+        /// `false` together with an [`InlayModifier`] is "hidden until the key
+        /// is held" -- the hints are still supplied, just out of the way.
+        inlay_hints_on: bool,
+        /// Which modifier flips inlay hints while it is held.
+        inlay_hint_modifier: InlayModifier,
         /// Which auto-closing behaviours are on
         auto_close: AutoClose,
         /// When the matching bracket is outlined
@@ -343,6 +387,11 @@ impl InputMode {
             hover_hiding_delay: 0,
             hover_sticky: true,
             hover_above: true,
+            inlay_hint_font_family: None,
+            inlay_hint_font_size: 0.,
+            inlay_hint_background: false,
+            inlay_hints_on: true,
+            inlay_hint_modifier: InlayModifier::None,
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,
@@ -747,6 +796,64 @@ impl InputMode {
         }
     }
 
+    /// Return `None` if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn inlay_hint_font_family(&self) -> Option<SharedString> {
+        match self {
+            InputMode::CodeEditor {
+                inlay_hint_font_family,
+                ..
+            } => inlay_hint_font_family.clone(),
+            _ => None,
+        }
+    }
+
+    /// Return `0.` if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn inlay_hint_font_size(&self) -> f32 {
+        match self {
+            InputMode::CodeEditor {
+                inlay_hint_font_size,
+                ..
+            } => *inlay_hint_font_size,
+            _ => 0.,
+        }
+    }
+
+    /// Return true if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn inlay_hints_on(&self) -> bool {
+        match self {
+            InputMode::CodeEditor { inlay_hints_on, .. } => *inlay_hints_on,
+            _ => true,
+        }
+    }
+
+    /// Return false if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn inlay_hint_background(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                inlay_hint_background,
+                ..
+            } => *inlay_hint_background,
+            _ => false,
+        }
+    }
+
+    /// Return [`InlayModifier::None`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn inlay_hint_modifier(&self) -> InlayModifier {
+        match self {
+            InputMode::CodeEditor {
+                inlay_hint_modifier,
+                ..
+            } => *inlay_hint_modifier,
+            _ => InlayModifier::None,
+        }
+    }
+
     /// Return [`WrapAt::EditorWidth`] if the mode is not
     /// [`InputMode::CodeEditor`].
     #[inline]
@@ -959,8 +1066,8 @@ mod tests {
             AutoClose, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle, MatchBrackets,
             SurroundingLinesStyle, TabSize,
             mode::{
-                DEFAULT_MAX_FOLD_REGIONS, DEFAULT_SURROUNDING_LINES, FoldingControls, InputMode,
-                LineNumbers, RenderWhitespace, WrapAt,
+                DEFAULT_MAX_FOLD_REGIONS, DEFAULT_SURROUNDING_LINES, FoldingControls,
+                InlayModifier, InputMode, LineNumbers, RenderWhitespace, WrapAt,
             },
         },
     };
@@ -999,6 +1106,13 @@ mod tests {
         );
         assert!(mode.rulers().is_empty(), "no rulers like VS Code");
         assert!(mode.hover(), "the popover was always shown before this");
+        // Inlay hints draw nothing until someone supplies rows, so the
+        // defaults only have to keep the look they had with none.
+        assert!(mode.inlay_hints_on(), "no modifier to hold, so shown");
+        assert_eq!(mode.inlay_hint_modifier(), InlayModifier::None);
+        assert_eq!(mode.inlay_hint_font_family(), None, "the editor's font");
+        assert_eq!(mode.inlay_hint_font_size(), 0., "90% of the code");
+        assert!(!mode.inlay_hint_background(), "no chip like VS Code");
         assert_eq!(mode.hover_delay(), 150, "was a bare 150");
         assert_eq!(
             mode.hover_hiding_delay(),
@@ -1035,6 +1149,11 @@ mod tests {
             hover_hiding_delay: 0,
             hover_sticky: true,
             hover_above: true,
+            inlay_hint_font_family: None,
+            inlay_hint_font_size: 0.,
+            inlay_hint_background: false,
+            inlay_hints_on: true,
+            inlay_hint_modifier: InlayModifier::None,
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,
@@ -1184,5 +1303,25 @@ mod tests {
         assert_eq!(every10.number_for(19, None), Some(20));
         // 0 would divide by zero; clamp to 1 (= every line).
         assert_eq!(LineNumbers::Interval(0).number_for(4, None), Some(5));
+    }
+
+    /// The modifier **flips** what the editor is doing, the way Zed's
+    /// `toggle_on_modifiers_press` does -- it is not a plain "show while
+    /// held", or turning the hints on would make the key do nothing.
+    #[test]
+    fn the_modifier_flips_the_hints_either_way() {
+        let held = gpui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let none = gpui::Modifiers::default();
+
+        assert!(InlayModifier::Alt.held(&held));
+        assert!(!InlayModifier::Alt.held(&none));
+        assert!(!InlayModifier::Control.held(&held), "a different key");
+        assert!(
+            !InlayModifier::None.held(&held),
+            "no key flips them when none is set"
+        );
     }
 }

@@ -27,7 +27,7 @@ use super::{
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
-    mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace, WrapAt},
+    mode::{FoldingControls, InlayModifier, InputMode, LineNumbers, RenderWhitespace, WrapAt},
     number_input,
     text_wrapper::TextWrapper,
 };
@@ -357,6 +357,12 @@ pub struct InputState {
     /// Fold ranges handed in from outside (a language server), instead of the
     /// indentation rule. `None` = read them off the indentation.
     pub(super) supplied_folds: Option<Vec<crate::input::FoldRange>>,
+    /// Inlay hints to draw at the end of a row, keyed by row.
+    ///
+    /// Kept out of [`InputMode`] on purpose: the mode is already a large
+    /// variant, and this grows with the file rather than with the settings.
+    /// Sorted by row so the paint loop can look a row up quickly.
+    pub(super) inlay_rows: Vec<crate::input::InlayRow>,
     /// The row the pointer is over in the fold gutter, for
     /// [`FoldingControls::MouseOver`].
     pub(super) hovered_gutter_row: Option<usize>,
@@ -466,6 +472,7 @@ impl InputState {
             soft_wrap: true,
             folded_rows: Vec::new(),
             supplied_folds: None,
+            inlay_rows: Vec::new(),
             hovered_gutter_row: None,
             loading: false,
             pattern: None,
@@ -698,6 +705,81 @@ impl InputState {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { hover_above, .. } = &mut self.mode {
             *hover_above = on;
+        }
+        self
+    }
+
+    /// Draw inlay hints in this font, only for [`InputMode::CodeEditor`].
+    ///
+    /// `None` -- or an empty name -- takes the editor's own font.
+    pub fn inlay_hint_font_family(mut self, font: Option<impl Into<SharedString>>) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            inlay_hint_font_family,
+            ..
+        } = &mut self.mode
+        {
+            *inlay_hint_font_family = font
+                .map(Into::into)
+                .filter(|f: &SharedString| !f.trim().is_empty());
+        }
+        self
+    }
+
+    /// Draw inlay hints at this size in px, only for
+    /// [`InputMode::CodeEditor`].
+    ///
+    /// `0` draws them at 90% of the editor's text, the way VS Code's
+    /// `editor.inlayHints.fontSize` reads `0`.
+    pub fn inlay_hint_font_size(mut self, size: f32) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            inlay_hint_font_size,
+            ..
+        } = &mut self.mode
+        {
+            *inlay_hint_font_size = size.max(0.);
+        }
+        self
+    }
+
+    /// Show the supplied inlay hints with no key held, only for
+    /// [`InputMode::CodeEditor`].
+    ///
+    /// `false` with an [`InlayModifier`] set means "hidden until the key is
+    /// held"; `false` with no modifier means they never show.
+    pub fn inlay_hints_on(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { inlay_hints_on, .. } = &mut self.mode {
+            *inlay_hints_on = on;
+        }
+        self
+    }
+
+    /// Draw a chip behind each inlay hint, only for
+    /// [`InputMode::CodeEditor`].
+    pub fn inlay_hint_background(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            inlay_hint_background,
+            ..
+        } = &mut self.mode
+        {
+            *inlay_hint_background = on;
+        }
+        self
+    }
+
+    /// Flip inlay hints while this modifier is held, only for
+    /// [`InputMode::CodeEditor`].
+    pub fn inlay_hint_modifier(mut self, modifier: InlayModifier) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            inlay_hint_modifier,
+            ..
+        } = &mut self.mode
+        {
+            *inlay_hint_modifier = modifier;
         }
         self
     }

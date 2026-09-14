@@ -277,6 +277,18 @@ impl RenderOnce for Input {
             .key_context(crate::input::CONTEXT)
             .track_focus(&state.focus_handle.clone())
             .tab_index(self.tab_index)
+            // Inlay hints that a modifier flips have to be redrawn the moment
+            // the key goes down or up; nothing else in the frame changes, so
+            // without this the editor simply would not repaint.
+            .when(
+                state.mode.inlay_hint_modifier() != crate::input::InlayModifier::None,
+                |this| {
+                    let state = self.state.clone();
+                    this.on_modifiers_changed(move |_, _, cx| {
+                        state.update(cx, |_, cx| cx.notify());
+                    })
+                },
+            )
             .when(!state.disabled, |this| {
                 this.on_action(window.listener_for(&self.state, InputState::backspace))
                     .on_action(window.listener_for(&self.state, InputState::delete))
