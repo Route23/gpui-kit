@@ -355,6 +355,60 @@ impl InputState {
         cx.notify();
     }
 
+    /// The rows that head a fold that is closed right now.
+    ///
+    /// Sorted, and only the *headers* -- the rows hidden inside a fold are not
+    /// listed. Hand the same list back to [`InputState::set_folded_rows`] to
+    /// put the editor back the way it was.
+    pub fn folded_rows(&self) -> &[usize] {
+        &self.folded_rows
+    }
+
+    /// Close exactly these folds, opening anything else.
+    ///
+    /// A row that heads no fold is dropped: the list may have been remembered
+    /// from a version of the file that has since been edited, and folding
+    /// something else instead would be worse than folding nothing. Rows past
+    /// the cap ([`InputMode::max_fold_regions`]) are dropped too.
+    ///
+    /// Does nothing at all while folding is off, or while no fold ranges have
+    /// been supplied yet and the text has none by indentation -- the caller
+    /// has to wait for [`InputState::set_fold_ranges`] before a remembered set
+    /// can be honoured.
+    pub fn set_folded_rows(&mut self, rows: &[usize], cx: &mut Context<Self>) {
+        if !self.mode.has_folding() {
+            return;
+        }
+        let tab = self.mode.tab_size();
+        let supplied = self.supplied_folds.clone();
+        let cap = self.mode.max_fold_regions();
+        let mut headers: Vec<usize> = rows
+            .iter()
+            .copied()
+            .filter(|row| {
+                *row < self.text.lines_len()
+                    && fold_range_with(&self.text, *row, tab, supplied.as_deref()).is_some()
+            })
+            .take(cap)
+            .collect();
+        headers.sort_unstable();
+        headers.dedup();
+        if headers == self.folded_rows {
+            return;
+        }
+
+        self.folded_rows = headers;
+        let cursor = self.cursor();
+        self.update_folds();
+        // The caret may now be inside a fold; pull it to the nearest edge.
+        let snapped = self.snap_out_of_fold(cursor, SnapDirection::Nearest);
+        if snapped != cursor {
+            self.selected_range = (snapped..snapped).into();
+            self.preferred_column = None;
+        }
+        cx.notify();
+    }
+
     /// Fold every foldable row that is not already inside another fold.
     pub fn fold_all(&mut self, cx: &mut Context<Self>) {
         if !self.mode.has_folding() {

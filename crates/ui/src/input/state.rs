@@ -1760,6 +1760,54 @@ impl InputState {
         self.focus(window, cx);
     }
 
+    /// Put the cursor at a (0-based) [`Position`] **without taking focus**.
+    ///
+    /// [`InputState::set_cursor_position`] focuses the input, which is right
+    /// when a jump was asked for and wrong when a pane is being put back the
+    /// way it was: restoring three background editors must not steal the
+    /// window from the one in front.
+    pub fn set_cursor_position_quietly(
+        &mut self,
+        position: impl Into<Position>,
+        cx: &mut Context<Self>,
+    ) {
+        let position: Position = position.into();
+        let offset = self.text.position_to_offset(&position);
+
+        self.move_to(offset, None, cx);
+        self.update_preferred_column();
+    }
+
+    /// The buffer row at the top of the viewport, as of the last frame.
+    ///
+    /// `None` before the first layout. **Rows, not pixels** -- a remembered
+    /// pixel offset means something else after a font size or a wrap width
+    /// changes, a row does not.
+    pub fn first_visible_row(&self) -> Option<usize> {
+        self.last_layout
+            .as_ref()
+            .map(|l| l.visible_range.start)
+    }
+
+    /// Scroll so `row` sits at the top of the viewport.
+    ///
+    /// Goes through `deferred_scroll_offset`, so it can be called before the
+    /// first layout -- which is exactly when a restored position arrives.
+    pub fn scroll_to_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        let line_height = self
+            .last_layout
+            .as_ref()
+            .map_or(px(0.), |l| l.line_height);
+        let mut y = px(0.);
+        for line in self.text_wrapper.lines.iter().take(row) {
+            y += line.height(line_height);
+        }
+        let mut offset = self.scroll_handle.offset();
+        offset.y = -y;
+        self.deferred_scroll_offset = Some(offset);
+        cx.notify();
+    }
+
     /// Focus the input field.
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window);
