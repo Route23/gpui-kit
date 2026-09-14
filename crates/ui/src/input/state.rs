@@ -363,6 +363,11 @@ pub struct InputState {
     /// variant, and this grows with the file rather than with the settings.
     /// Sorted by row so the paint loop can look a row up quickly.
     pub(super) inlay_rows: Vec<crate::input::InlayRow>,
+    /// Diagnostics to draw at the end of a row, keyed by row.
+    ///
+    /// Built from the same list the squiggles are built from, so the two
+    /// cannot disagree. Sorted by row for the paint loop.
+    pub(super) inline_diagnostics: Vec<crate::input::InlineDiagnostic>,
     /// The row the pointer is over in the fold gutter, for
     /// [`FoldingControls::MouseOver`].
     pub(super) hovered_gutter_row: Option<usize>,
@@ -473,6 +478,7 @@ impl InputState {
             folded_rows: Vec::new(),
             supplied_folds: None,
             inlay_rows: Vec::new(),
+            inline_diagnostics: Vec::new(),
             hovered_gutter_row: None,
             loading: false,
             pattern: None,
@@ -739,6 +745,37 @@ impl InputState {
         } = &mut self.mode
         {
             *inlay_hint_font_size = size.max(0.);
+        }
+        self
+    }
+
+    /// Keep this many columns clear between the code and an end-of-row
+    /// diagnostic, only for [`InputMode::CodeEditor`].
+    pub fn inline_diagnostic_padding(mut self, columns: u8) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            inline_diagnostic_padding,
+            ..
+        } = &mut self.mode
+        {
+            *inline_diagnostic_padding = columns;
+        }
+        self
+    }
+
+    /// Start an end-of-row diagnostic at this column at the earliest, only for
+    /// [`InputMode::CodeEditor`].
+    ///
+    /// Lines that reach past it push their diagnostic further right; short
+    /// lines line up here instead of following the code.
+    pub fn inline_diagnostic_min_column(mut self, column: u16) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            inline_diagnostic_min_column,
+            ..
+        } = &mut self.mode
+        {
+            *inline_diagnostic_min_column = column;
         }
         self
     }

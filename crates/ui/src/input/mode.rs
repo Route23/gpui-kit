@@ -47,6 +47,11 @@ pub(super) const DEFAULT_HOVER_HIDING_DELAY: u16 = 0;
 /// a guard for very large files, not a limit anyone should reach by hand.
 pub(super) const DEFAULT_MAX_FOLD_REGIONS: u32 = 5_000;
 
+/// The columns of clear space between the code and an end-of-row diagnostic.
+///
+/// Zed's `diagnostics.inline.padding` defaults to the same number.
+pub(super) const DEFAULT_INLINE_DIAGNOSTIC_PADDING: u8 = 4;
+
 /// Which modifier flips inlay hints while it is held down.
 ///
 /// Mirrors Zed's `inlay_hints.toggle_on_modifiers_press`: holding the key
@@ -299,6 +304,14 @@ pub(crate) enum InputMode {
         inlay_hint_font_size: f32,
         /// Whether a chip is drawn behind an inlay hint.
         inlay_hint_background: bool,
+        /// How many columns of clear space go between the code and the
+        /// diagnostic drawn at the end of the row.
+        inline_diagnostic_padding: u8,
+        /// The column an end-of-row diagnostic starts at, at the earliest.
+        ///
+        /// Short lines would otherwise put their diagnostics right against
+        /// the code, at a different x on every row.
+        inline_diagnostic_min_column: u16,
         /// Whether the supplied inlay hints are shown with no key held.
         ///
         /// `false` together with an [`InlayModifier`] is "hidden until the key
@@ -390,6 +403,8 @@ impl InputMode {
             inlay_hint_font_family: None,
             inlay_hint_font_size: 0.,
             inlay_hint_background: false,
+            inline_diagnostic_padding: DEFAULT_INLINE_DIAGNOSTIC_PADDING,
+            inline_diagnostic_min_column: 0,
             inlay_hints_on: true,
             inlay_hint_modifier: InlayModifier::None,
             auto_close: AutoClose::default(),
@@ -820,6 +835,31 @@ impl InputMode {
         }
     }
 
+    /// Return [`DEFAULT_INLINE_DIAGNOSTIC_PADDING`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn inline_diagnostic_padding(&self) -> u8 {
+        match self {
+            InputMode::CodeEditor {
+                inline_diagnostic_padding,
+                ..
+            } => *inline_diagnostic_padding,
+            _ => DEFAULT_INLINE_DIAGNOSTIC_PADDING,
+        }
+    }
+
+    /// Return 0 if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn inline_diagnostic_min_column(&self) -> u16 {
+        match self {
+            InputMode::CodeEditor {
+                inline_diagnostic_min_column,
+                ..
+            } => *inline_diagnostic_min_column,
+            _ => 0,
+        }
+    }
+
     /// Return true if the mode is not [`InputMode::CodeEditor`].
     #[inline]
     pub(super) fn inlay_hints_on(&self) -> bool {
@@ -1066,8 +1106,9 @@ mod tests {
             AutoClose, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle, MatchBrackets,
             SurroundingLinesStyle, TabSize,
             mode::{
-                DEFAULT_MAX_FOLD_REGIONS, DEFAULT_SURROUNDING_LINES, FoldingControls,
-                InlayModifier, InputMode, LineNumbers, RenderWhitespace, WrapAt,
+                DEFAULT_INLINE_DIAGNOSTIC_PADDING, DEFAULT_MAX_FOLD_REGIONS,
+                DEFAULT_SURROUNDING_LINES, FoldingControls, InlayModifier, InputMode,
+                LineNumbers, RenderWhitespace, WrapAt,
             },
         },
     };
@@ -1109,6 +1150,12 @@ mod tests {
         // Inlay hints draw nothing until someone supplies rows, so the
         // defaults only have to keep the look they had with none.
         assert!(mode.inlay_hints_on(), "no modifier to hold, so shown");
+        assert_eq!(
+            mode.inline_diagnostic_padding(),
+            DEFAULT_INLINE_DIAGNOSTIC_PADDING,
+            "Zed と同じ"
+        );
+        assert_eq!(mode.inline_diagnostic_min_column(), 0, "行末のすぐ後ろ");
         assert_eq!(mode.inlay_hint_modifier(), InlayModifier::None);
         assert_eq!(mode.inlay_hint_font_family(), None, "the editor's font");
         assert_eq!(mode.inlay_hint_font_size(), 0., "90% of the code");
@@ -1152,6 +1199,8 @@ mod tests {
             inlay_hint_font_family: None,
             inlay_hint_font_size: 0.,
             inlay_hint_background: false,
+            inline_diagnostic_padding: DEFAULT_INLINE_DIAGNOSTIC_PADDING,
+            inline_diagnostic_min_column: 0,
             inlay_hints_on: true,
             inlay_hint_modifier: InlayModifier::None,
             auto_close: AutoClose::default(),

@@ -1190,6 +1190,8 @@ pub(super) struct PrepaintState {
     fold_markers: Vec<(usize, ShapedLine)>,
     /// The inlay hints drawn after the end of a row, keyed the same way.
     inlay_hints: Vec<(usize, ShapedLine)>,
+    /// The diagnostics drawn after the end of a row, keyed the same way.
+    inline_diagnostics: Vec<(usize, ShapedLine)>,
     bounds: Bounds<Pixels>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
@@ -1669,6 +1671,8 @@ impl Element for TextElement {
             self.layout_fold_markers(state, &last_layout, text_size, &text_style, window, cx);
         let inlay_hints =
             self.layout_inlay_hints(state, &last_layout, text_size, &text_style, window, cx);
+        let inline_diagnostics = self
+            .layout_inline_diagnostics(state, &last_layout, text_size, &text_style, window, cx);
 
         PrepaintState {
             bounds,
@@ -1692,6 +1696,7 @@ impl Element for TextElement {
             fold_gutter_hitbox,
             fold_markers,
             inlay_hints,
+            inline_diagnostics,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -1754,6 +1759,17 @@ impl Element for TextElement {
         let mut mask_offset_y = px(0.);
         let state = self.state.read(cx);
         let inlay_chip = state.mode.inlay_hint_background();
+        // The width of one column, measured the way the rulers measure it
+        // (#256). Hoisted: `state` is borrowed from `cx`, and the paint loop
+        // may not reborrow it.
+        let inline_diagnostic_padding = f32::from(state.mode.inline_diagnostic_padding());
+        let inline_diagnostic_min_column = f32::from(state.mode.inline_diagnostic_min_column());
+        let text_style = window.text_style();
+        let column_advance = crate::input::rulers::column_advance(
+            &text_style,
+            text_style.font_size.to_pixels(window.rem_size()),
+            window,
+        );
         if state.masked && state.text.len() > 0 {
             // Move down offset for vertical centering the *****
             if cfg!(target_os = "macos") {
@@ -1923,6 +1939,41 @@ impl Element for TextElement {
                     );
                 }
                 _ = hint.paint(hint_p, line_height, window, cx);
+            }
+
+            // The row's diagnostic, after the code and after the hints
+            // (#256 / ADR-0089). Like the hints, these glyphs are nobody's
+            // byte offsets -- the squiggle under the code is what marks the
+            // place; this only says what it says.
+            if let Some((_, diag)) = prepaint
+                .inline_diagnostics
+                .iter()
+                .find(|(dix, _)| *dix == ix)
+            {
+                let last = line.wrapped_lines.last();
+                let badge = prepaint
+                    .fold_markers
+                    .iter()
+                    .find(|(mix, _)| *mix == ix)
+                    .map_or(px(0.), |(_, m)| m.width + px(4.));
+                let hint = prepaint
+                    .inlay_hints
+                    .iter()
+                    .find(|(hix, _)| *hix == ix)
+                    .map_or(px(0.), |(_, h)| h.width + INLAY_GAP);
+                // At least `min_column`, so short rows line up instead of
+                // each starting wherever their code happens to end.
+                let least = p.x + column_advance * inline_diagnostic_min_column;
+                let after_code = p.x
+                    + last.map_or(px(0.), |l| l.width)
+                    + badge
+                    + hint
+                    + column_advance * inline_diagnostic_padding;
+                let diag_p = point(
+                    after_code.max(least),
+                    p.y + line_height * (line.wrapped_lines.len().saturating_sub(1)) as f32,
+                );
+                _ = diag.paint(diag_p, line_height, window, cx);
             }
 
             offset_y += line.size(line_height).height;
