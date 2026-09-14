@@ -27,7 +27,7 @@ use super::{
     change::Change,
     element::TextElement,
     mask_pattern::MaskPattern,
-    mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace},
+    mode::{FoldingControls, InputMode, LineNumbers, RenderWhitespace, WrapAt},
     number_input,
     text_wrapper::TextWrapper,
 };
@@ -595,6 +595,30 @@ impl InputState {
         } = &mut self.mode
         {
             *r = render;
+        }
+        self
+    }
+
+    /// Set where soft wrapping breaks a long line, only for
+    /// [`InputMode::CodeEditor`] mode.
+    ///
+    /// Only consulted while soft wrap is on.
+    pub fn wrap_at(mut self, wrap_at: WrapAt) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { wrap_at: w, .. } = &mut self.mode {
+            *w = wrap_at;
+        }
+        self
+    }
+
+    /// Draw a vertical ruler at each of these columns, only for
+    /// [`InputMode::CodeEditor`] mode.
+    ///
+    /// A column past the right edge of the editor is not drawn.
+    pub fn rulers(mut self, columns: Vec<usize>) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { rulers, .. } = &mut self.mode {
+            *rulers = columns.into();
         }
         self
     }

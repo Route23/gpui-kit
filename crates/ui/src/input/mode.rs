@@ -26,6 +26,23 @@ pub(super) const DEFAULT_SURROUNDING_LINES: u8 = 3;
 /// the moment it grows past 999 lines.
 pub(super) const DEFAULT_MIN_LINE_NUMBER_DIGITS: usize = 4;
 
+/// Where soft wrapping breaks a long line.
+///
+/// Only consulted while soft wrap is on; mirrors the non-`off` half of VS
+/// Code's `editor.wordWrap` and Zed's `soft_wrap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WrapAt {
+    /// At whatever fits the viewport -- VS Code's `on`, Zed's `editor_width`.
+    #[default]
+    EditorWidth,
+    /// At a fixed column, however wide the viewport is. Lines longer than the
+    /// column scroll horizontally -- VS Code's `wordWrapColumn`.
+    Column(usize),
+    /// At the column, or the viewport if that is narrower -- VS Code's
+    /// `bounded`.
+    Bounded(usize),
+}
+
 /// How the line number gutter of a [`InputMode::CodeEditor`] is rendered.
 ///
 /// Mirrors VS Code's `editor.lineNumbers`.
@@ -186,6 +203,13 @@ pub(crate) enum InputMode {
         /// leaves that row blank in the gutter; the row itself stays, so the
         /// caret can still be placed on it.
         render_final_newline: bool,
+        /// Where soft wrapping breaks a long line, when soft wrap is on.
+        wrap_at: WrapAt,
+        /// Columns that get a vertical ruler drawn through the whole editor.
+        ///
+        /// Mirrors VS Code's `editor.rulers` and Zed's `wrap_guides`. Empty
+        /// means no rulers; a column past the right edge is simply not drawn.
+        rulers: Rc<[usize]>,
         language: SharedString,
         indent_guides: bool,
         /// Which whitespace characters are drawn as visible marks
@@ -261,6 +285,8 @@ impl InputMode {
             line_number: LineNumbers::default(),
             min_line_number_digits: 4,
             render_final_newline: true,
+            wrap_at: WrapAt::EditorWidth,
+            rulers: Rc::from([] as [usize; 0]),
             indent_guides: true,
             render_whitespace: RenderWhitespace::default(),
             folding: true,
@@ -586,6 +612,25 @@ impl InputMode {
         }
     }
 
+    /// Return [`WrapAt::EditorWidth`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn wrap_at(&self) -> WrapAt {
+        match self {
+            InputMode::CodeEditor { wrap_at, .. } => *wrap_at,
+            _ => WrapAt::EditorWidth,
+        }
+    }
+
+    /// Return an empty slice if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn rulers(&self) -> &[usize] {
+        match self {
+            InputMode::CodeEditor { rulers, .. } => rulers,
+            _ => &[],
+        }
+    }
+
     /// Return [`DEFAULT_SURROUNDING_LINES`] if the mode is not
     /// [`InputMode::CodeEditor`].
     #[allow(unused)]
@@ -771,6 +816,7 @@ impl InputMode {
 mod tests {
     use gpui::px;
     use ropey::Rope;
+    use std::rc::Rc;
 
     use crate::{
         highlighter::DiagnosticSet,
@@ -779,7 +825,7 @@ mod tests {
             SurroundingLinesStyle, TabSize,
             mode::{
                 DEFAULT_SURROUNDING_LINES, FoldingControls, InputMode, LineNumbers,
-                RenderWhitespace,
+                RenderWhitespace, WrapAt,
             },
         },
     };
@@ -812,6 +858,12 @@ mod tests {
         assert_eq!(mode.surrounding_lines_style(), SurroundingLinesStyle::OnMove);
         assert!(!mode.autoscroll_on_clicks(), "off like Zed");
         assert_eq!(
+            mode.wrap_at(),
+            WrapAt::EditorWidth,
+            "soft wrap broke at the viewport before this was settable"
+        );
+        assert!(mode.rulers().is_empty(), "no rulers like VS Code");
+        assert_eq!(
             mode.caret_animation(),
             CaretAnimation::Off,
             "the caret jumped before this existed"
@@ -823,6 +875,8 @@ mod tests {
         let mode = InputMode::CodeEditor {
             min_line_number_digits: 4,
             render_final_newline: true,
+            wrap_at: WrapAt::EditorWidth,
+            rulers: Rc::from([] as [usize; 0]),
             multi_line: false,
             line_number: LineNumbers::On,
             indent_guides: true,

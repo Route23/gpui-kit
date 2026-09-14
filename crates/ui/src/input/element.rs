@@ -14,7 +14,7 @@ use crate::{
     input::{RopeExt as _, brackets, caret, text_wrapper::LineLayout},
 };
 
-use super::{InputState, LastLayout, mode::InputMode};
+use super::{InputState, LastLayout, mode::{InputMode, WrapAt}};
 
 /// Rows kept below the caret in an input that is not a code editor.
 ///
@@ -1174,6 +1174,7 @@ pub(super) struct PrepaintState {
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
+    rulers_path: Option<Path<Pixels>>,
     /// One vertical guide per bracket pair, grouped by colour
     bracket_guide_paths: Vec<(Path<Pixels>, Hsla)>,
     whitespaces: Vec<crate::input::whitespace::PlacedMark>,
@@ -1329,6 +1330,9 @@ impl Element for TextElement {
         let is_empty = text.len() == 0;
         let placeholder = self.placeholder.clone();
 
+        // The element's own rectangle, before the scroll offset moves the
+        // text. Anything pinned to the viewport (rulers) measures from this.
+        let unscrolled_bounds = bounds;
         let mut bounds = bounds;
 
         let (display_text, text_color) = if is_empty {
@@ -1352,7 +1356,17 @@ impl Element for TextElement {
             Self::layout_line_numbers(&state, &text, text_size, &text_style, window);
 
         let wrap_width = if multi_line && state.soft_wrap {
-            Some(bounds.size.width - line_number_width - RIGHT_MARGIN)
+            let viewport = bounds.size.width - line_number_width - RIGHT_MARGIN;
+            // A fixed column has to be measured the same way the rulers are,
+            // or the text would not break on the line that marks it.
+            let column = |n: usize| {
+                crate::input::rulers::column_advance(&text_style, text_size, window) * n as f32
+            };
+            Some(match state.mode.wrap_at() {
+                WrapAt::EditorWidth => viewport,
+                WrapAt::Column(n) => column(n),
+                WrapAt::Bounded(n) => column(n).min(viewport),
+            })
         } else {
             None
         };
@@ -1623,6 +1637,14 @@ impl Element for TextElement {
         let hover_definition_hitbox = self.layout_hover_definition_hitbox(state, window, cx);
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
+        let rulers_path = Self::layout_rulers(
+            state,
+            &unscrolled_bounds,
+            &bounds,
+            &last_layout,
+            &text_style,
+            window,
+        );
         let bracket_guide_paths = self.layout_bracket_guides(&last_layout, &bounds, cx);
         let whitespaces = self.layout_whitespaces(state, &bounds, &last_layout);
         let fold_chevrons =
@@ -1655,6 +1677,7 @@ impl Element for TextElement {
             hover_definition_hitbox,
             document_color_paths,
             indent_guides_path,
+            rulers_path,
             bracket_guide_paths,
             whitespaces,
             fold_chevrons,
@@ -1754,6 +1777,12 @@ impl Element for TextElement {
                 }
                 offset_y += height;
             }
+        }
+
+        // Paint the rulers under the indent guides, and fainter than them:
+        // the two cross each other, and the ruler is the quieter mark.
+        if let Some(path) = prepaint.rulers_path.take() {
+            window.paint_path(path, cx.theme().border.opacity(0.6));
         }
 
         // Paint indent guides
