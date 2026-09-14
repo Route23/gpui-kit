@@ -910,6 +910,31 @@ fn main() {
         assert_eq!(r, ranges());
     }
 
+    /// `fold_all` stops at the cap, and so does folding one row at a time.
+    ///
+    /// Capping only `fold_all` would let anyone walk past it with the mouse.
+    #[test]
+    fn the_cap_holds_for_both_ways_of_folding() {
+        // Three sibling blocks, each with a body.
+        let src = "a:\n    x\nb:\n    y\nc:\n    z\n";
+        let text = Rope::from(src);
+        let mut headers: Vec<usize> = vec![];
+        let cap = 2;
+        let mut row = 0;
+        while row < text.lines_len() && headers.len() < cap {
+            if let Some(range) = fold_range_with(&text, row, tab(), None) {
+                headers.push(row);
+                row = range.end;
+            } else {
+                row += 1;
+            }
+        }
+        assert_eq!(headers, vec![0, 2], "3 つ目で止まる");
+
+        // Every header would fold without the cap.
+        assert!(fold_range_with(&text, 4, tab(), None).is_some());
+    }
+
     /// The cheap predicate must never disagree with the real computation.
     #[test]
     fn is_foldable_agrees_with_fold_range() {
