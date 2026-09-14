@@ -148,17 +148,6 @@ impl InputState {
             self.handle_hover_definition(offset, window, cx);
         } else {
             self.hover_definition.clear();
-            // Away from the symbol the popover belongs to: start the clock.
-            // Still on it: whatever was ticking is stale.
-            let inside = self
-                .hover_popover
-                .as_ref()
-                .is_some_and(|p| p.read(cx).is_same(offset));
-            if inside {
-                self.lsp._hover_hide_task = Task::ready(Ok(()));
-            } else {
-                self.schedule_hover_hide(cx);
-            }
             self.handle_hover_popover(offset, window, cx);
         }
         cx.notify();

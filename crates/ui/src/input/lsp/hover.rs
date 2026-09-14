@@ -32,16 +32,18 @@ impl InputState {
     /// moves arrive to ask about.
     ///
     /// **Rearmed on every move**, so the wait is measured from the last one.
-    pub(super) fn schedule_hover_hide(&mut self, cx: &mut Context<InputState>) {
+    pub(crate) fn schedule_hover_hide(&mut self, cx: &mut Context<InputState>) {
         let ms = u64::from(self.mode.hover_hiding_delay());
-        if ms == 0 || self.hover_popover.is_none() {
+        if ms == 0 || self.hover_popover.is_none() || self.hover_hiding {
             return;
         }
+        self.hover_hiding = true;
         self.lsp._hover_hide_task = cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(ms))
                 .await;
             let _ = this.update(cx, |state, cx| {
+                state.hover_hiding = false;
                 // Sticky: the pointer is on the popover, so it is still wanted.
                 // The popover has to say so -- it occludes, and the editor
                 // stops hearing about the pointer the moment it lands on it.
@@ -54,6 +56,15 @@ impl InputState {
             });
             Ok(())
         });
+    }
+
+    /// The pointer came back before the wait was up.
+    pub(crate) fn cancel_hover_hide(&mut self) {
+        if !self.hover_hiding {
+            return;
+        }
+        self.hover_hiding = false;
+        self.lsp._hover_hide_task = Task::ready(Ok(()));
     }
 
     /// Handle hover trigger LSP request.

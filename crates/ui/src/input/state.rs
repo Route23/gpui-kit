@@ -386,6 +386,8 @@ pub struct InputState {
     /// moment the pointer lands on it -- this cannot be observed from here.
     /// The popover reports it instead.
     pub(super) hover_popover_hovered: bool,
+    /// Whether a hide is already on the clock.
+    pub(super) hover_hiding: bool,
     /// The LSP definitions locations for "Go to Definition" feature.
     pub(super) hover_definition: HoverDefinition,
 
@@ -486,6 +488,7 @@ impl InputState {
             completion_inserting: false,
             hover_popover: None,
             hover_popover_hovered: false,
+            hover_hiding: false,
             hover_definition: HoverDefinition::default(),
             silent_replace_text: false,
             size: Size::default(),

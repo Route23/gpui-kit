@@ -332,6 +332,31 @@ impl Element for Popover {
                     cx.notify();
                 })
             }
+        });
+
+        if !self.report_hovered {
+            return;
+        }
+        // Watching the pointer has to happen at the window, not on the input:
+        // the input only hears about moves inside itself, so a pointer that
+        // leaves the editor altogether would leave the popover up for good --
+        // the very thing the hiding delay exists to stop.
+        let editor = self.editor.clone();
+        let trigger = self.trigger_bounds(cx).unwrap_or_default();
+        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, _, _, cx| {
+            let on_popover = bounds.contains(&event.position);
+            let on_symbol = trigger.contains(&event.position);
+            editor.update(cx, |state, cx| {
+                if state.hover_popover.is_none() {
+                    return;
+                }
+                state.hover_popover_hovered = on_popover;
+                if on_popover || on_symbol {
+                    state.cancel_hover_hide();
+                } else {
+                    state.schedule_hover_hide(cx);
+                }
+            });
         })
     }
 }
