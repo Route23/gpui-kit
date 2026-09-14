@@ -41,7 +41,7 @@ impl HoverPopover {
 }
 
 impl Render for HoverPopover {
-    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let contents = match self.hover.contents.clone() {
             lsp_types::HoverContents::Scalar(scalar) => match scalar {
                 lsp_types::MarkedString::String(s) => s,
@@ -58,12 +58,15 @@ impl Render for HoverPopover {
             lsp_types::HoverContents::Markup(markup) => markup.value,
         };
 
+        let above = self.editor.read(cx).mode.hover_above();
         Popover::new(
             "hover-popover",
             self.editor.clone(),
             self.symbol_range.clone(),
             move |window, cx| render_markdown("message", contents.clone(), window, cx),
         )
+        .prefer_above(above)
+        .report_hovered(true)
         .into_any_element()
     }
 }
@@ -74,6 +77,16 @@ pub(crate) struct Popover {
     editor: Entity<InputState>,
     range: Range<usize>,
     width_limit: Range<Pixels>,
+    /// Which side of the line to try first.
+    ///
+    /// **A preference, not a promise**: the popover is measured before the
+    /// side is picked, so one that does not fit still flips to the other side.
+    prefer_above: bool,
+    /// Whether to report the pointer being over the popover back to the input.
+    ///
+    /// Only the hover popover wants this -- the editor cannot see it for
+    /// itself, because the content occludes.
+    report_hovered: bool,
     content_builder: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
 }
 
@@ -100,8 +113,22 @@ impl Popover {
             range,
             style: StyleRefinement::default(),
             width_limit: px(200.)..px(500.),
+            prefer_above: true,
+            report_hovered: false,
             content_builder: Box::new(move |window, cx| (f)(window, cx).into_any_element()),
         }
+    }
+
+    /// Try the space above the line first (the default), or below.
+    fn prefer_above(mut self, above: bool) -> Self {
+        self.prefer_above = above;
+        self
+    }
+
+    /// Tell the input when the pointer is over the popover.
+    fn report_hovered(mut self, report: bool) -> Self {
+        self.report_hovered = report;
+        self
     }
 
     /// Get the bounds of the range in the editor, if it is visible.
@@ -189,12 +216,22 @@ impl Element for Popover {
 
         let is_open = *open_state.read(cx);
 
+        let editor = self.editor.clone();
+        let report_hovered = self.report_hovered;
         let mut popover = deferred(
             div()
                 .id("hover-popover-content")
                 .when(!is_open, |s| s.invisible())
                 .flex_none()
                 .occlude()
+                .when(report_hovered, |this| {
+                    this.on_hover(move |hovered, _, cx| {
+                        let hovered = *hovered;
+                        editor.update(cx, |state, _| {
+                            state.hover_popover_hovered = hovered;
+                        });
+                    })
+                })
                 .p_1()
                 .text_xs()
                 .popover_style(cx)
@@ -212,13 +249,25 @@ impl Element for Popover {
         let top_space = trigger_bounds.top() - SNAP_TO_EDGE;
         let right_space = window.bounds().size.width - trigger_bounds.left() - SNAP_TO_EDGE;
 
-        let mut pos = point(
+        let bottom_space =
+            window.bounds().size.height - trigger_bounds.bottom() - SNAP_TO_EDGE;
+        let above = point(
             trigger_bounds.left(),
             trigger_bounds.top() - popover_size.height,
         );
-        if popover_size.height > top_space {
-            pos.y = trigger_bounds.bottom();
-        }
+        let below = point(trigger_bounds.left(), trigger_bounds.bottom());
+        // The side that is asked for, unless the popover does not fit there.
+        let mut pos = if self.prefer_above {
+            if popover_size.height > top_space {
+                below
+            } else {
+                above
+            }
+        } else if popover_size.height > bottom_space {
+            above
+        } else {
+            below
+        };
         if popover_size.width > right_space {
             pos.x = trigger_bounds.right() - popover_size.width;
         }

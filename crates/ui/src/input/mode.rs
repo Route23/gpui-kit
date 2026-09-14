@@ -26,6 +26,20 @@ pub(super) const DEFAULT_SURROUNDING_LINES: u8 = 3;
 /// the moment it grows past 999 lines.
 pub(super) const DEFAULT_MIN_LINE_NUMBER_DIGITS: usize = 4;
 
+/// How long the pointer has to rest before the hover popover appears.
+///
+/// This was a bare `150` in `lsp/hover.rs` before it was settable, so it stays
+/// the default. VS Code's `editor.hover.delay` is 300.
+pub(super) const DEFAULT_HOVER_DELAY: u16 = 150;
+
+/// How long to wait after the pointer leaves a symbol before the hover popover
+/// goes away.
+///
+/// **Zero means "do not hide on leave"**, which is what the editor did before
+/// this was settable: the popover only went away when the provider answered
+/// `None` for the new position, or when the input lost focus.
+pub(super) const DEFAULT_HOVER_HIDING_DELAY: u16 = 0;
+
 /// The most fold regions [`InputState::fold_all`] will create, and the most
 /// folds that can be open at once.
 ///
@@ -177,6 +191,12 @@ impl FoldingControls {
     }
 }
 
+/// The variants are lopsided on purpose: `CodeEditor` carries the editor's
+/// whole settings surface, and a plain text field carries three fields. Boxing
+/// the payload to even them out would put an indirection on a value the
+/// element reads several times per frame, and would touch every `match` on the
+/// mode. There is one of these per input, not one per row.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(crate) enum InputMode {
     /// A plain text input mode.
@@ -231,6 +251,17 @@ pub(crate) enum InputMode {
         max_fold_regions: u32,
         /// Whether clicking past the end of a folded row unfolds it.
         unfold_on_click_after_end_of_line: bool,
+        /// Whether the hover popover is shown at all.
+        hover: bool,
+        /// How long the pointer rests before the hover popover appears, in ms.
+        hover_delay: u16,
+        /// How long after the pointer leaves a symbol the popover goes away,
+        /// in ms. Zero leaves it up.
+        hover_hiding_delay: u16,
+        /// Whether the popover stays up while the pointer is over it.
+        hover_sticky: bool,
+        /// Whether the popover prefers the space above the line.
+        hover_above: bool,
         /// Which auto-closing behaviours are on
         auto_close: AutoClose,
         /// When the matching bracket is outlined
@@ -307,6 +338,11 @@ impl InputMode {
             fold_highlight: false,
             max_fold_regions: DEFAULT_MAX_FOLD_REGIONS,
             unfold_on_click_after_end_of_line: false,
+            hover: true,
+            hover_delay: 150,
+            hover_hiding_delay: 0,
+            hover_sticky: true,
+            hover_above: true,
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,
@@ -662,6 +698,55 @@ impl InputMode {
         }
     }
 
+    /// Return true if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn hover(&self) -> bool {
+        match self {
+            InputMode::CodeEditor { hover, .. } => *hover,
+            _ => true,
+        }
+    }
+
+    /// Return [`DEFAULT_HOVER_DELAY`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn hover_delay(&self) -> u16 {
+        match self {
+            InputMode::CodeEditor { hover_delay, .. } => *hover_delay,
+            _ => DEFAULT_HOVER_DELAY,
+        }
+    }
+
+    /// Return [`DEFAULT_HOVER_HIDING_DELAY`] if the mode is not
+    /// [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn hover_hiding_delay(&self) -> u16 {
+        match self {
+            InputMode::CodeEditor {
+                hover_hiding_delay, ..
+            } => *hover_hiding_delay,
+            _ => DEFAULT_HOVER_HIDING_DELAY,
+        }
+    }
+
+    /// Return true if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn hover_sticky(&self) -> bool {
+        match self {
+            InputMode::CodeEditor { hover_sticky, .. } => *hover_sticky,
+            _ => true,
+        }
+    }
+
+    /// Return true if the mode is not [`InputMode::CodeEditor`].
+    #[inline]
+    pub(super) fn hover_above(&self) -> bool {
+        match self {
+            InputMode::CodeEditor { hover_above, .. } => *hover_above,
+            _ => true,
+        }
+    }
+
     /// Return [`WrapAt::EditorWidth`] if the mode is not
     /// [`InputMode::CodeEditor`].
     #[inline]
@@ -913,6 +998,15 @@ mod tests {
             "soft wrap broke at the viewport before this was settable"
         );
         assert!(mode.rulers().is_empty(), "no rulers like VS Code");
+        assert!(mode.hover(), "the popover was always shown before this");
+        assert_eq!(mode.hover_delay(), 150, "was a bare 150");
+        assert_eq!(
+            mode.hover_hiding_delay(),
+            0,
+            "nothing hid the popover on leave before this"
+        );
+        assert!(mode.hover_sticky());
+        assert!(mode.hover_above(), "the placement already tried above first");
         assert_eq!(
             mode.caret_animation(),
             CaretAnimation::Off,
@@ -936,6 +1030,11 @@ mod tests {
             fold_highlight: false,
             max_fold_regions: DEFAULT_MAX_FOLD_REGIONS,
             unfold_on_click_after_end_of_line: false,
+            hover: true,
+            hover_delay: 150,
+            hover_hiding_delay: 0,
+            hover_sticky: true,
+            hover_above: true,
             auto_close: AutoClose::default(),
             match_brackets: MatchBrackets::default(),
             bracket_colors: true,

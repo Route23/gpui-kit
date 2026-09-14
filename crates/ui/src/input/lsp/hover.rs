@@ -23,6 +23,39 @@ pub trait HoverProvider {
 }
 
 impl InputState {
+    /// Hide the hover popover once the pointer has been away long enough.
+    ///
+    /// Zero means "do not hide on leave", which is what the editor did before
+    /// this was settable: the popover only went away when the provider
+    /// answered `None`, or when the input lost focus. That leaves it up for
+    /// good when the pointer leaves the editor entirely -- no more mouse
+    /// moves arrive to ask about.
+    ///
+    /// **Rearmed on every move**, so the wait is measured from the last one.
+    pub(super) fn schedule_hover_hide(&mut self, cx: &mut Context<InputState>) {
+        let ms = u64::from(self.mode.hover_hiding_delay());
+        if ms == 0 || self.hover_popover.is_none() {
+            return;
+        }
+        self.lsp._hover_hide_task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(ms))
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                // Sticky: the pointer is on the popover, so it is still wanted.
+                // The popover has to say so -- it occludes, and the editor
+                // stops hearing about the pointer the moment it lands on it.
+                if state.mode.hover_sticky() && state.hover_popover_hovered {
+                    return;
+                }
+                if state.hover_popover.take().is_some() {
+                    cx.notify();
+                }
+            });
+            Ok(())
+        });
+    }
+
     /// Handle hover trigger LSP request.
     pub(super) fn handle_hover_popover(
         &mut self,
@@ -30,6 +63,15 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<InputState>,
     ) {
+        // Off means off: drop whatever is showing too, or turning it off
+        // looks like it did not take.
+        if !self.mode.hover() {
+            if self.hover_popover.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+
         if self.selecting {
             return;
         }
@@ -49,10 +91,11 @@ impl InputState {
         let mut symbol_range = self.text.word_range(offset).unwrap_or(offset..offset);
         let editor = cx.entity();
         let should_delay = self.hover_popover.is_none();
+        let delay = u64::from(self.mode.hover_delay());
         self.lsp._hover_task = cx.spawn_in(window, async move |_, cx| {
-            if should_delay {
+            if should_delay && delay > 0 {
                 cx.background_executor()
-                    .timer(Duration::from_millis(150))
+                    .timer(Duration::from_millis(delay))
                     .await;
             }
 

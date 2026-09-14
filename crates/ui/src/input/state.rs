@@ -380,6 +380,12 @@ pub struct InputState {
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
     pub(super) hover_popover: Option<Entity<HoverPopover>>,
+    /// Whether the pointer is over the hover popover.
+    ///
+    /// The popover occludes, so the editor's own `mouse_move` stops firing the
+    /// moment the pointer lands on it -- this cannot be observed from here.
+    /// The popover reports it instead.
+    pub(super) hover_popover_hovered: bool,
     /// The LSP definitions locations for "Go to Definition" feature.
     pub(super) hover_definition: HoverDefinition,
 
@@ -479,6 +485,7 @@ impl InputState {
             mouse_context_menu,
             completion_inserting: false,
             hover_popover: None,
+            hover_popover_hovered: false,
             hover_definition: HoverDefinition::default(),
             silent_replace_text: false,
             size: Size::default(),
@@ -635,6 +642,59 @@ impl InputState {
         } = &mut self.mode
         {
             *unfold_on_click_after_end_of_line = on;
+        }
+        self
+    }
+
+    /// Show the hover popover at all, only for [`InputMode::CodeEditor`].
+    pub fn hover(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { hover, .. } = &mut self.mode {
+            *hover = on;
+        }
+        self
+    }
+
+    /// How long the pointer rests before the hover popover appears, in
+    /// milliseconds. Only for [`InputMode::CodeEditor`].
+    pub fn hover_delay(mut self, ms: u16) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { hover_delay, .. } = &mut self.mode {
+            *hover_delay = ms;
+        }
+        self
+    }
+
+    /// How long after the pointer leaves a symbol the hover popover goes away,
+    /// in milliseconds. **Zero leaves it up.** Only for
+    /// [`InputMode::CodeEditor`].
+    pub fn hover_hiding_delay(mut self, ms: u16) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            hover_hiding_delay, ..
+        } = &mut self.mode
+        {
+            *hover_hiding_delay = ms;
+        }
+        self
+    }
+
+    /// Keep the hover popover up while the pointer is over it, only for
+    /// [`InputMode::CodeEditor`].
+    pub fn hover_sticky(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { hover_sticky, .. } = &mut self.mode {
+            *hover_sticky = on;
+        }
+        self
+    }
+
+    /// Prefer the space above the line for the hover popover, only for
+    /// [`InputMode::CodeEditor`].
+    pub fn hover_above(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { hover_above, .. } = &mut self.mode {
+            *hover_above = on;
         }
         self
     }
