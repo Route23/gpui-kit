@@ -113,6 +113,12 @@ pub enum InputEvent {
     PressEnter { secondary: bool },
     Focus,
     Blur,
+    /// Text was pasted from the clipboard, covering `range` (byte offsets).
+    ///
+    /// [`InputEvent::Change`] alone cannot tell a paste from typing, and a
+    /// listener that wants to act on the pasted text needs to know where it
+    /// landed.
+    Pasted { range: Range<usize> },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -2707,6 +2713,10 @@ impl InputState {
 
             self.replace_text_in_range_silent(None, &new_text, window, cx);
             self.scroll_to(self.cursor(), None, cx);
+
+            let end = self.cursor();
+            let start = end.saturating_sub(new_text.len());
+            cx.emit(InputEvent::Pasted { range: start..end });
         }
     }
 
