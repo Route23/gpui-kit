@@ -35,6 +35,10 @@ pub enum IconName {
     Building2,
     Calendar,
     CaseSensitive,
+    /// Match only whole words (⌘F).
+    WholeWord,
+    /// Read the query as a regular expression (⌘F).
+    Regex,
     ChartPie,
     Check,
     ChevronDown,
@@ -133,6 +137,8 @@ impl IconNamed for IconName {
             Self::Building2 => "icons/building-2.svg",
             Self::Calendar => "icons/calendar.svg",
             Self::CaseSensitive => "icons/case-sensitive.svg",
+            Self::WholeWord => "icons/whole-word.svg",
+            Self::Regex => "icons/regex.svg",
             Self::ChartPie => "icons/chart-pie.svg",
             Self::Check => "icons/check.svg",
             Self::ChevronDown => "icons/chevron-down.svg",

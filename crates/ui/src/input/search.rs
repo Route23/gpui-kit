@@ -1,4 +1,5 @@
 use aho_corasick::AhoCorasick;
+use regex::{Regex, RegexBuilder};
 use rust_i18n::t;
 use std::{ops::Range, rc::Rc};
 
@@ -34,15 +35,86 @@ pub(super) fn init(cx: &mut App) {
     )]);
 }
 
+/// How to look for the query.
+///
+/// One struct rather than a widening list of booleans on `update_query` --
+/// every caller has to make the same four decisions, and a struct keeps them
+/// named at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Tell `Foo` from `foo`. Beats `smart_case`.
+    pub case_sensitive: bool,
+    /// Only count a hit when a word starts and ends there.
+    pub whole_word: bool,
+    /// Read the query as a regular expression.
+    pub regex: bool,
+    /// An all-lowercase query ignores case; one capital makes it matter.
+    /// vim, ripgrep and VS Code all settled on this, so it needs no explaining.
+    pub smart_case: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            case_sensitive: false,
+            whole_word: false,
+            regex: false,
+            smart_case: true,
+        }
+    }
+}
+
+impl SearchOptions {
+    /// Does case matter for this query?
+    ///
+    /// `smart_case` only speaks when the reader has not asked for case to
+    /// matter -- an explicit ask always wins.
+    fn case_matters(&self, query: &str) -> bool {
+        if self.case_sensitive {
+            return true;
+        }
+        self.smart_case && query.chars().any(char::is_uppercase)
+    }
+}
+
+/// A built query. Literal until the reader asks for a regular expression.
+#[derive(Debug, Clone)]
+enum Pattern {
+    Literal(AhoCorasick),
+    Regex(Regex),
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
-    pub query: Option<AhoCorasick>,
+    query: Option<Pattern>,
+    options: SearchOptions,
 
     pub(super) matched_ranges: Rc<Vec<Range<usize>>>,
     pub(super) current_match_ix: usize,
     /// Is in replacing mode, if true, the next update will not reset the current match index.
     replacing: bool,
+    /// The reader typed a regular expression that does not parse.
+    ///
+    /// Kept so the panel can say so; matching simply finds nothing. Building
+    /// it must never panic -- the query comes straight from a text field.
+    invalid: bool,
+}
+
+/// Is this part of a word?
+///
+/// `alphanumeric` or `_`, matching `RopeExt::word_range` (what hover and
+/// go-to-definition point at) so that "whole word" means the same thing
+/// everywhere in the editor.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Does a word start at `range.start` and end at `range.end`?
+fn is_whole_word(text: &str, range: &Range<usize>) -> bool {
+    let before = text[..range.start].chars().next_back();
+    let after = text[range.end..].chars().next();
+    !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
 }
 
 impl SearchMatcher {
@@ -50,9 +122,11 @@ impl SearchMatcher {
         Self {
             text: "".into(),
             query: None,
+            options: SearchOptions::default(),
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
             replacing: false,
+            invalid: false,
         }
     }
 
@@ -67,15 +141,28 @@ impl SearchMatcher {
     }
 
     fn update_matches(&mut self) {
-        let mut new_ranges = Vec::new();
+        let mut new_ranges: Vec<Range<usize>> = Vec::new();
         if let Some(query) = &self.query {
             let text = self.text.to_string();
-            // FIXME: Use stream find
-            let matches = query.stream_find_iter(text.as_bytes());
-
-            for query_match in matches.into_iter() {
-                let query_match = query_match.expect("query match for select all action");
-                new_ranges.push(query_match.range());
+            match query {
+                Pattern::Literal(ac) => {
+                    // FIXME: Use stream find
+                    for query_match in ac.stream_find_iter(text.as_bytes()) {
+                        let query_match =
+                            query_match.expect("query match for select all action");
+                        new_ranges.push(query_match.range());
+                    }
+                }
+                // A regular expression can match nothing at all (`a*`); an
+                // empty hit would light up a zero-width box and never advance.
+                Pattern::Regex(re) => new_ranges.extend(
+                    re.find_iter(&text)
+                        .map(|m| m.range())
+                        .filter(|r| r.start < r.end),
+                ),
+            }
+            if self.options.whole_word {
+                new_ranges.retain(|range| is_whole_word(&text, range));
             }
         }
         self.matched_ranges = Rc::new(new_ranges);
@@ -86,18 +173,39 @@ impl SearchMatcher {
     }
 
     /// Update the search query and reset the current match index.
-    pub fn update_query(&mut self, query: &str, case_insensitive: bool) {
-        if query.len() > 0 {
-            self.query = Some(
-                AhoCorasick::builder()
-                    .ascii_case_insensitive(case_insensitive)
-                    .build(&[query.to_string()])
-                    .expect("failed to build AhoCorasick query in SearchMatcher"),
-            );
+    pub fn update_query(&mut self, query: &str, options: SearchOptions) {
+        self.options = options;
+        self.invalid = false;
+        let case_matters = options.case_matters(query);
+
+        self.query = if query.is_empty() {
+            None
+        } else if options.regex {
+            // A half-typed expression (`fn (`) is the normal state of a text
+            // field, not a fault: find nothing and say so, never panic.
+            match RegexBuilder::new(query)
+                .case_insensitive(!case_matters)
+                .build()
+            {
+                Ok(re) => Some(Pattern::Regex(re)),
+                Err(_) => {
+                    self.invalid = true;
+                    None
+                }
+            }
         } else {
-            self.query = None;
-        }
+            AhoCorasick::builder()
+                .ascii_case_insensitive(!case_matters)
+                .build([query])
+                .ok()
+                .map(Pattern::Literal)
+        };
         self.update_matches();
+    }
+
+    /// The reader typed a regular expression that does not parse.
+    pub fn is_invalid(&self) -> bool {
+        self.invalid
     }
 
     /// Returns the number of matches found.
@@ -168,7 +276,10 @@ pub(super) struct SearchPanel {
     editor: Entity<InputState>,
     search_input: Entity<InputState>,
     replace_input: Entity<InputState>,
-    case_insensitive: bool,
+    options: SearchOptions,
+    /// The reader pressed `Aa`. From then on smart case keeps quiet -- an
+    /// explicit ask outranks a guess, for as long as the panel is open.
+    case_decided: bool,
     replace_mode: bool,
     matcher: SearchMatcher,
     input_width: Pixels,
@@ -200,9 +311,11 @@ impl InputState {
             return;
         }
 
+        let options = self.mode.search_options();
+        let seed = self.mode.search_seed_from_selection();
         let search_panel = match self.search_panel.as_ref() {
             Some(panel) => panel.clone(),
-            None => SearchPanel::new(cx.entity(), window, cx),
+            None => SearchPanel::new(cx.entity(), options, window, cx),
         };
 
         let text = self.text.clone();
@@ -210,8 +323,13 @@ impl InputState {
         let selected_text = Rope::from(self.selected_text());
         search_panel.update(cx, |this, cx| {
             this.editor = editor;
+            // **Settings decide how the panel opens, every time.** A panel
+            // that stayed on the last session's toggles would quietly
+            // disagree with what the settings window shows.
+            this.options = options;
+            this.case_decided = false;
             this.matcher.update(&text);
-            this.show(&selected_text, window, cx);
+            this.show(&selected_text, seed, window, cx);
         });
         self.search_panel = Some(search_panel);
         cx.notify();
@@ -219,7 +337,12 @@ impl InputState {
 }
 
 impl SearchPanel {
-    pub fn new(editor: Entity<InputState>, window: &mut Window, cx: &mut App) -> Entity<Self> {
+    pub fn new(
+        editor: Entity<InputState>,
+        options: SearchOptions,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
         let search_input = cx.new(|cx| InputState::new(window, cx));
         let replace_input = cx.new(|cx| InputState::new(window, cx));
 
@@ -241,7 +364,8 @@ impl SearchPanel {
                 editor,
                 search_input,
                 replace_input,
-                case_insensitive: true,
+                options,
+                case_decided: false,
                 replace_mode: false,
                 matcher: SearchMatcher::new(),
                 open: true,
@@ -254,6 +378,7 @@ impl SearchPanel {
     pub(super) fn show(
         &mut self,
         selected_text: &Rope,
+        seed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -261,7 +386,7 @@ impl SearchPanel {
         self.search_input.read(cx).focus_handle.focus(window);
 
         self.search_input.update(cx, |this, cx| {
-            if selected_text.len() > 0 {
+            if seed && selected_text.len() > 0 {
                 // Set value will emit to update_search_query
                 this.set_value(selected_text.to_string(), window, cx);
             }
@@ -271,6 +396,9 @@ impl SearchPanel {
 
     fn update_search_query(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value();
+        // Smart case is a guess about what the reader meant; once they have
+        // pressed `Aa` the guess is no longer wanted.
+        self.options.smart_case = self.options.smart_case && !self.case_decided;
         let visible_range_offset = self
             .editor
             .read(cx)
@@ -278,8 +406,7 @@ impl SearchPanel {
             .as_ref()
             .map(|l| l.visible_range_offset.clone());
 
-        self.matcher
-            .update_query(query.as_str(), self.case_insensitive);
+        self.matcher.update_query(query.as_str(), self.options);
 
         if let Some(visible_range_offset) = visible_range_offset {
             self.matcher
@@ -440,17 +567,51 @@ impl Render for SearchPanel {
                                 Input::new(&self.search_input)
                                     .focus_bordered(false)
                                     .suffix(
-                                        Button::new("case-insensitive")
-                                            .selected(!self.case_insensitive)
-                                            .xsmall()
-                                            .compact()
-                                            .ghost()
-                                            .icon(IconName::CaseSensitive)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.case_insensitive = !this.case_insensitive;
-                                                this.update_search_query(cx);
-                                                cx.notify();
-                                            })),
+                                        h_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                Button::new("case-sensitive")
+                                                    .selected(self.options.case_sensitive)
+                                                    .xsmall()
+                                                    .compact()
+                                                    .ghost()
+                                                    .icon(IconName::CaseSensitive)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.options.case_sensitive =
+                                                            !this.options.case_sensitive;
+                                                        // The reader has spoken; stop guessing.
+                                                        this.case_decided = true;
+                                                        this.update_search_query(cx);
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("whole-word")
+                                                    .selected(self.options.whole_word)
+                                                    .xsmall()
+                                                    .compact()
+                                                    .ghost()
+                                                    .icon(IconName::WholeWord)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.options.whole_word =
+                                                            !this.options.whole_word;
+                                                        this.update_search_query(cx);
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("regex")
+                                                    .selected(self.options.regex)
+                                                    .xsmall()
+                                                    .compact()
+                                                    .ghost()
+                                                    .icon(IconName::Regex)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.options.regex = !this.options.regex;
+                                                        this.update_search_query(cx);
+                                                        cx.notify();
+                                                    })),
+                                            ),
                                     )
                                     .small()
                                     .w_full()
@@ -513,6 +674,12 @@ impl Render for SearchPanel {
                             .when(!has_matches, |this| {
                                 this.text_color(cx.theme().muted_foreground)
                             })
+                            // A regular expression that does not parse reads
+                            // the same as "no matches" unless it is said out
+                            // loud -- the reader is mid-word, not wrong.
+                            .when(self.matcher.is_invalid(), |this| {
+                                this.text_color(cx.theme().danger)
+                            })
                             .text_left()
                             .min_w_16(),
                     )
@@ -567,11 +734,27 @@ impl Render for SearchPanel {
 mod tests {
     use super::*;
 
+    /// Case never matters.
+    fn insensitive() -> SearchOptions {
+        SearchOptions {
+            smart_case: false,
+            ..SearchOptions::default()
+        }
+    }
+
+    /// Case always matters.
+    fn sensitive() -> SearchOptions {
+        SearchOptions {
+            case_sensitive: true,
+            ..SearchOptions::default()
+        }
+    }
+
     #[test]
     fn test_search() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("Hello 世界 this is a Is test string."));
-        matcher.update_query("Is", true);
+        matcher.update_query("Is", insensitive());
 
         assert_eq!(matcher.len(), 3);
         let mut matches = matcher.clone();
@@ -589,7 +772,7 @@ mod tests {
         assert_eq!(matches.current_match_ix, 0);
         assert_eq!(matches.next_back(), Some(23..25));
 
-        matcher.update_query("IS", false);
+        matcher.update_query("IS", sensitive());
         assert_eq!(matcher.len(), 0);
         assert_eq!(matcher.next(), None);
         assert_eq!(matcher.next_back(), None);
@@ -599,7 +782,7 @@ mod tests {
     fn test_search_label() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("Hello 世界 this is a Is test string."));
-        matcher.update_query("Is", true);
+        matcher.update_query("Is", insensitive());
         assert_eq!(matcher.label(), "1/3");
         matcher.next();
         assert_eq!(matcher.label(), "2/3");
@@ -608,8 +791,140 @@ mod tests {
         matcher.next();
         assert_eq!(matcher.label(), "1/3");
 
-        matcher.update_query("IS", false);
+        matcher.update_query("IS", sensitive());
         assert_eq!(matcher.label(), "0/0");
+    }
+
+    /// An all-lowercase query ignores case; one capital makes it matter.
+    #[test]
+    fn smart_case_reads_the_query() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("Foo foo FOO"));
+
+        matcher.update_query("foo", SearchOptions::default());
+        assert_eq!(matcher.len(), 3, "all lowercase should ignore case");
+
+        matcher.update_query("Foo", SearchOptions::default());
+        assert_eq!(matcher.len(), 1, "a capital should make case matter");
+
+        // Turning it off goes back to "case never matters".
+        matcher.update_query("Foo", insensitive());
+        assert_eq!(matcher.len(), 3);
+    }
+
+    /// An explicit ask beats the guess.
+    #[test]
+    fn asking_for_case_outranks_smart_case() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("Foo foo"));
+        matcher.update_query(
+            "foo",
+            SearchOptions {
+                case_sensitive: true,
+                smart_case: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(matcher.len(), 1);
+    }
+
+    #[test]
+    fn whole_word_needs_both_edges() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("for format before for_"));
+        let whole = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::default()
+        };
+
+        matcher.update_query("for", SearchOptions::default());
+        assert_eq!(matcher.len(), 4, "plain matching counts every run");
+
+        matcher.update_query("for", whole);
+        assert_eq!(matcher.len(), 1, "only the bare word counts");
+        assert_eq!(matcher.matched_ranges.as_ref(), &vec![0..3]);
+    }
+
+    /// `_` and non-ASCII letters are word characters, like everywhere else
+    /// in the editor.
+    #[test]
+    fn whole_word_uses_the_editor_word() {
+        assert!(is_word_char('_'));
+        assert!(is_word_char('日'));
+        assert!(!is_word_char('-'));
+
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("word 日本語 word-tail"));
+        matcher.update_query(
+            "word",
+            SearchOptions {
+                whole_word: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(matcher.len(), 2, "a hyphen ends a word, `_` does not");
+    }
+
+    #[test]
+    fn a_regular_expression_matches() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("fn one() {}\nfn two() {}\n"));
+        let re = SearchOptions {
+            regex: true,
+            ..SearchOptions::default()
+        };
+
+        matcher.update_query(r"fn \w+\(", re);
+        assert_eq!(matcher.len(), 2);
+        assert!(!matcher.is_invalid());
+
+        // An expression that can match nothing must not produce empty hits.
+        matcher.update_query("x*", re);
+        assert_eq!(matcher.len(), 0, "zero-width matches are not matches");
+    }
+
+    /// A half-typed expression is the normal state of a text field.
+    #[test]
+    fn a_broken_regular_expression_finds_nothing_and_says_so() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("fn one() {}"));
+        matcher.update_query(
+            "fn (",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(matcher.len(), 0);
+        assert!(matcher.is_invalid(), "the panel has nothing to show for it");
+        assert_eq!(matcher.label(), "0/0");
+
+        // Fixing it clears the mark.
+        matcher.update_query(
+            "fn ",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert!(!matcher.is_invalid());
+        assert_eq!(matcher.len(), 1);
+    }
+
+    /// Both at once: the expression is filtered down to whole words.
+    #[test]
+    fn a_regular_expression_can_also_be_whole_word() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("for format"));
+        matcher.update_query(
+            "fo.",
+            SearchOptions {
+                regex: true,
+                whole_word: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(matcher.len(), 1);
     }
 
     #[test]

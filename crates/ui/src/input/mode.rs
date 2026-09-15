@@ -326,6 +326,10 @@ pub(crate) enum InputMode {
         max_fold_regions: u32,
         /// Whether clicking past the end of a folded row unfolds it.
         unfold_on_click_after_end_of_line: bool,
+        /// How ⌘F looks for what was typed into it.
+        search_options: super::search::SearchOptions,
+        /// Whether opening ⌘F puts the selected text in the search field.
+        search_seed_from_selection: bool,
         /// Whether the hover popover is shown at all.
         hover: bool,
         /// How long the pointer rests before the hover popover appears, in ms.
@@ -456,6 +460,8 @@ impl InputMode {
             fold_highlight: false,
             max_fold_regions: DEFAULT_MAX_FOLD_REGIONS,
             unfold_on_click_after_end_of_line: false,
+            search_options: super::search::SearchOptions::default(),
+            search_seed_from_selection: true,
             hover: true,
             hover_delay: 150,
             hover_hiding_delay: 0,
@@ -837,6 +843,29 @@ impl InputMode {
     pub(super) fn hover(&self) -> bool {
         match self {
             InputMode::CodeEditor { hover, .. } => *hover,
+            _ => true,
+        }
+    }
+
+    /// How ⌘F looks for what was typed into it.
+    ///
+    /// Anything that is not a code editor searches the plain way.
+    #[inline]
+    pub(super) fn search_options(&self) -> super::search::SearchOptions {
+        match self {
+            InputMode::CodeEditor { search_options, .. } => *search_options,
+            _ => super::search::SearchOptions::default(),
+        }
+    }
+
+    /// Whether opening ⌘F puts the selected text in the search field.
+    #[inline]
+    pub(super) fn search_seed_from_selection(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                search_seed_from_selection,
+                ..
+            } => *search_seed_from_selection,
             _ => true,
         }
     }
@@ -1385,7 +1414,9 @@ mod tests {
             max_fold_regions: DEFAULT_MAX_FOLD_REGIONS,
             unfold_on_click_after_end_of_line: false,
             hover: true,
-            hover_delay: 150,
+search_options: crate::input::SearchOptions::default(),
+            search_seed_from_selection: true,
+                        hover_delay: 150,
             hover_hiding_delay: 0,
             hover_sticky: true,
             hover_above: true,

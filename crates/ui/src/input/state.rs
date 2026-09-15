@@ -676,6 +676,31 @@ impl InputState {
 
     /// How long the pointer rests before the hover popover appears, in
     /// milliseconds. Only for [`InputMode::CodeEditor`].
+    /// How ⌘F looks for what was typed into it (#241).
+    ///
+    /// Read when the panel opens, so a change lands on the next ⌘F.
+    pub fn search_options(mut self, options: crate::input::SearchOptions) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { search_options, .. } = &mut self.mode {
+            *search_options = options;
+        }
+        self
+    }
+
+    /// Whether ⌘F starts with the selected text in the search field (#241).
+    pub fn search_seed_from_selection(mut self, seed: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            search_seed_from_selection,
+            ..
+        } = &mut self.mode
+        {
+            *search_seed_from_selection = seed;
+        }
+        self
+    }
+
+    /// Set how long the pointer rests before the hover popover appears.
     pub fn hover_delay(mut self, ms: u16) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { hover_delay, .. } = &mut self.mode {
