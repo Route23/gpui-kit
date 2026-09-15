@@ -208,6 +208,24 @@ impl InputState {
         cx.notify();
     }
 
+    /// Set the tab size after the input was built.
+    ///
+    /// The builder is not enough for a host that reads the indentation out of
+    /// the file it just opened: rebuilding the state to change the width would
+    /// throw away the undo history and the scroll position.
+    ///
+    /// Only for [`InputMode::PlainText`] and [`InputMode::CodeEditor`] mode
+    /// with multi_line.
+    pub fn set_tab_size(&mut self, tab: TabSize, cx: &mut Context<Self>) {
+        debug_assert!(self.mode.is_multi_line() || self.mode.is_code_editor());
+        match &mut self.mode {
+            InputMode::PlainText { tab: t, .. } => *t = tab,
+            InputMode::CodeEditor { tab: t, .. } => *t = tab,
+            _ => return,
+        }
+        cx.notify();
+    }
+
     /// Set the tab size for the input.
     ///
     /// Only for [`InputMode::PlainText`] and [`InputMode::CodeEditor`] mode with multi_line.
