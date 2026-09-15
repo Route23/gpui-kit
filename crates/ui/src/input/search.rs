@@ -511,13 +511,25 @@ impl SearchPanel {
             }
             this.select_all(&super::SelectAll, window, cx);
         });
-        // **Run it here too.** The `Change` above is swallowed when
-        // `search_on_type` is off, and merely scheduled when a debounce is
-        // set -- neither of which should stop a freshly opened panel from
-        // showing what it was seeded with. Free when neither knob is set:
-        // `update_query` waves an unchanged query through.
-        self._query_task = Task::ready(());
-        self.update_search_query(cx);
+        // **Run it here too, but not right now.** The `Change` above is
+        // swallowed when `search_on_type` is off, and merely scheduled when a
+        // debounce is set -- neither of which should stop a freshly opened
+        // panel from showing what it was seeded with.
+        //
+        // It has to be deferred: `show` is reached from
+        // `InputState::on_action_search`, so the **editor** is mid-update and
+        // `update_search_query` reads it. That is also why the subscription
+        // above is safe -- gpui runs event handlers after the update ends.
+        //
+        // Free when neither knob is set: `update_query` waves an unchanged
+        // query through.
+        let panel = cx.entity();
+        cx.defer(move |cx| {
+            panel.update(cx, |this: &mut Self, cx| {
+                this._query_task = Task::ready(());
+                this.update_search_query(cx);
+            });
+        });
     }
 
     /// Look again, now or after the debounce.
