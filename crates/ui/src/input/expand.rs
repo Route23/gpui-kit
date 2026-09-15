@@ -76,10 +76,23 @@ impl InputState {
         if !pairs.iter().any(|p| p.open == here || p.close == here) {
             return false;
         }
-        let Some((open, close)) = self.enclosing_pair(offset) else {
+        let bounds = 0..self.text.len();
+        let skip = self.skipped_spans(&bounds);
+        // A brace inside a string or a comment does not open a block.
+        if skip.iter().any(|r| r.contains(&offset)) {
+            return false;
+        }
+        // **Ask for this bracket's partner, not for what encloses the click.**
+        // `enclosing` walks outward, so clicking the `{` of a block answered
+        // with the block *around* it -- at the top level of a file there is
+        // none, and the double-click did nothing at all.
+        let Some((open, close)) =
+            crate::input::brackets::partner_of(&self.text, offset, here, &pairs, &bounds, &skip)
+        else {
             return false;
         };
-        self.selected_range = (open.start..close.end).into();
+        // What the brackets hold, not the brackets.
+        self.selected_range = (open.end..close.start).into();
         self.selected_word_range = None;
         cx.notify();
         true

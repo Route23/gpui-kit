@@ -295,7 +295,7 @@ fn is_skipped(offset: usize, skip: &[Range<usize>]) -> bool {
 }
 
 /// The pair `ch` at `at` belongs to, scanning in the direction it opens.
-fn partner_of(
+pub(super) fn partner_of(
     text: &Rope,
     at: usize,
     ch: char,
