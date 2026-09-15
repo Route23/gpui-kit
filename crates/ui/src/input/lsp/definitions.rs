@@ -7,7 +7,7 @@ use std::{ops::Range, rc::Rc};
 
 use crate::{
     ActiveTheme,
-    input::{GoToDefinition, InputState, RopeExt, element::TextElement},
+    input::{GoToDefinition, InputEvent, InputState, RopeExt, element::TextElement},
 };
 
 /// Definition provider
@@ -159,6 +159,19 @@ impl InputState {
         location: &lsp_types::LocationLink,
         cx: &mut Context<Self>,
     ) {
+        // **The host may own more than one editor.** `target_uri` is not
+        // compared against this buffer below -- a target in another file
+        // would be turned into an offset in *this* rope and land nowhere
+        // near the definition. A host that says so gets told instead.
+        if self.mode.definitions_open_externally() {
+            let start = location.target_selection_range.start;
+            cx.emit(InputEvent::OpenLocation {
+                uri: location.target_uri.to_string(),
+                line: start.line,
+                character: start.character,
+            });
+            return;
+        }
         if location
             .target_uri
             .scheme()

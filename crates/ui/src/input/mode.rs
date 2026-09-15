@@ -332,6 +332,8 @@ pub(crate) enum InputMode {
         search_seed_from_selection: bool,
         /// How ⌘F behaves once something has been found.
         search_behavior: super::search::SearchBehavior,
+        /// Whether "go to definition" reports the target instead of acting.
+        definitions_open_externally: bool,
         /// Whether the hover popover is shown at all.
         hover: bool,
         /// How long the pointer rests before the hover popover appears, in ms.
@@ -465,6 +467,7 @@ impl InputMode {
             search_options: super::search::SearchOptions::default(),
             search_seed_from_selection: true,
             search_behavior: super::search::SearchBehavior::default(),
+            definitions_open_externally: false,
             hover: true,
             hover_delay: 150,
             hover_hiding_delay: 0,
@@ -858,6 +861,18 @@ impl InputMode {
         match self {
             InputMode::CodeEditor { search_options, .. } => *search_options,
             _ => super::search::SearchOptions::default(),
+        }
+    }
+
+    /// Whether "go to definition" reports the target instead of acting.
+    #[inline]
+    pub(super) fn definitions_open_externally(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                definitions_open_externally,
+                ..
+            } => *definitions_open_externally,
+            _ => false,
         }
     }
 
@@ -1433,6 +1448,7 @@ mod tests {
 search_options: crate::input::SearchOptions::default(),
             search_seed_from_selection: true,
             search_behavior: crate::input::SearchBehavior::default(),
+            definitions_open_externally: false,
                         hover_delay: 150,
             hover_hiding_delay: 0,
             hover_sticky: true,

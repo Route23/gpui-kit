@@ -119,6 +119,23 @@ pub enum InputEvent {
     /// listener that wants to act on the pasted text needs to know where it
     /// landed.
     Pasted { range: Range<usize> },
+    /// A "go to definition" landed somewhere this input cannot take you.
+    ///
+    /// Only emitted when [`InputState::definitions_open_externally`] is set.
+    /// `go_to_definition` otherwise moves the caret inside this buffer --
+    /// which is wrong for a target in **another file**, and is why a host
+    /// that owns more than one editor has to be the one to decide.
+    OpenLocation {
+        /// The target, as the server gave it (`file://…`, `https://…`).
+        uri: String,
+        /// 0-based, as LSP counts.
+        line: u32,
+        /// 0-based, in UTF-16 code units, as LSP counts.
+        character: u32,
+    },
+    /// A link the host handed over with [`InputState::set_link_ranges`] was
+    /// clicked, covering `range` (byte offsets).
+    LinkClicked { range: Range<usize> },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -410,6 +427,10 @@ pub struct InputState {
     pub(super) hover_hiding: bool,
     /// The LSP definitions locations for "Go to Definition" feature.
     pub(super) hover_definition: HoverDefinition,
+    /// Ranges the host said may be clicked (#256). See `links.rs`.
+    pub(super) link_ranges: Vec<Range<usize>>,
+    /// The one the pointer is on **with the modifier held**, if any.
+    pub(super) link_hover: Option<Range<usize>>,
 
     pub lsp: Lsp,
 
@@ -512,6 +533,8 @@ impl InputState {
             hover_popover_hovered: false,
             hover_hiding: false,
             hover_definition: HoverDefinition::default(),
+            link_ranges: Vec::new(),
+            link_hover: None,
             silent_replace_text: false,
             size: Size::default(),
             _subscriptions,
@@ -689,6 +712,24 @@ impl InputState {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { search_options, .. } = &mut self.mode {
             *search_options = options;
+        }
+        self
+    }
+
+    /// Report where a definition landed instead of going there (#256).
+    ///
+    /// A host that owns more than one editor has to decide: the target may
+    /// be in another file, or be an `https://` URL it would rather open in
+    /// its own browser than hand to the operating system. Listen for
+    /// [`InputEvent::OpenLocation`].
+    pub fn definitions_open_externally(mut self, externally: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            definitions_open_externally,
+            ..
+        } = &mut self.mode
+        {
+            *definitions_open_externally = externally;
         }
         self
     }
@@ -2467,6 +2508,15 @@ impl InputState {
             return;
         }
 
+        // **After definitions**, so a symbol that is both still goes to its
+        // definition rather than being opened as a path.
+        if event.modifiers.secondary() {
+            if let Some(range) = self.link_at(offset) {
+                cx.emit(InputEvent::LinkClicked { range });
+                return;
+            }
+        }
+
         // Double click to select word
         if event.button == MouseButton::Left && event.click_count == 2 {
             self.select_word(offset, window, cx);
@@ -2509,6 +2559,10 @@ impl InputState {
 
         // Show diagnostic popover on mouse move
         let offset = self.index_for_mouse_position(event.position);
+        // Links underline only while the modifier is down, like definitions.
+        if self.track_link_hover(offset, event.modifiers.secondary()) {
+            cx.notify();
+        }
         self.handle_mouse_move(offset, event, window, cx);
 
         if self.mode.is_code_editor() {

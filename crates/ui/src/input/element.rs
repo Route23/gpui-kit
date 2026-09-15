@@ -1213,6 +1213,11 @@ impl TextElement {
             styles.push(hover_style);
         }
 
+        // A link the pointer is on, with the modifier held (#256).
+        if let Some(link_style) = self.layout_link_hover(cx) {
+            styles.push(link_style);
+        }
+
         // Combine marker styles
         styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
 
@@ -1304,6 +1309,7 @@ pub(super) struct PrepaintState {
     bracket_match_paths: Vec<Path<Pixels>>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
+    link_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
     rulers_path: Option<Path<Pixels>>,
     /// One vertical guide per bracket pair, grouped by colour
@@ -1778,6 +1784,7 @@ impl Element for TextElement {
         };
 
         let hover_definition_hitbox = self.layout_hover_definition_hitbox(state, window, cx);
+        let link_hitbox = self.layout_link_hitbox(state, window, cx);
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
         let rulers_path = Self::layout_rulers(
@@ -1823,6 +1830,7 @@ impl Element for TextElement {
             bracket_match_paths,
             hover_highlight_path,
             hover_definition_hitbox,
+            link_hitbox,
             document_color_paths,
             indent_guides_path,
             rulers_path,
@@ -2271,6 +2279,10 @@ impl Element for TextElement {
 
         if let Some(hitbox) = prepaint.hover_definition_hitbox.as_ref() {
             window.set_cursor_style(gpui::CursorStyle::PointingHand, &hitbox);
+        }
+
+        if let Some(hitbox) = prepaint.link_hitbox.as_ref() {
+            window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
         }
 
         if let Some(hitbox) = prepaint.fold_gutter_hitbox.as_ref() {

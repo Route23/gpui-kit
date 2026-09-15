@@ -20,6 +20,7 @@ mod otp_input;
 pub(crate) mod popovers;
 mod rope_ext;
 mod rulers;
+mod links;
 mod search;
 mod state;
 mod tags;
