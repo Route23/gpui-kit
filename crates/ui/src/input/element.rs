@@ -1206,7 +1206,11 @@ impl TextElement {
             offset = range.end;
         }
 
-        let diagnostic_styles = diagnostics.styles_for_range(&visible_byte_range, cx);
+        let diagnostic_styles = diagnostics.styles_for_range(
+            &visible_byte_range,
+            self.state.read(cx).mode.diagnostic_tag_style(),
+            cx,
+        );
 
         // hover definition style
         if let Some(hover_style) = self.layout_hover_definition(cx) {

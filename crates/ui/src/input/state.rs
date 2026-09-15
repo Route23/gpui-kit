@@ -716,6 +716,59 @@ impl InputState {
         self
     }
 
+    /// Draw a box on control characters (#255).
+    pub fn render_control_characters(mut self, on: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            render_control_characters,
+            ..
+        } = &mut self.mode
+        {
+            *render_control_characters = on;
+        }
+        self
+    }
+
+    /// Draw a box on invisible or ASCII-lookalike characters (#255).
+    ///
+    /// `allowed` is the reader's "never mark these" list, as a plain string.
+    pub fn unicode_highlight(
+        mut self,
+        highlight: crate::input::UnicodeHighlight,
+        allowed: impl Into<std::rc::Rc<str>>,
+    ) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            unicode_highlight,
+            unicode_allowed,
+            ..
+        } = &mut self.mode
+        {
+            *unicode_highlight = highlight;
+            *unicode_allowed = allowed.into();
+        }
+        self
+    }
+
+    /// How a diagnostic's tags change the text it covers (#255).
+    ///
+    /// `fade` is `None` to leave "unnecessary" code at full strength.
+    pub fn diagnostic_tag_style(mut self, fade: Option<f32>, strike: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            show_unused,
+            unused_fade,
+            show_deprecated,
+            ..
+        } = &mut self.mode
+        {
+            *show_unused = fade.is_some();
+            *unused_fade = fade.unwrap_or(0.).clamp(0., 1.);
+            *show_deprecated = strike;
+        }
+        self
+    }
+
     /// Report where a definition landed instead of going there (#256).
     ///
     /// A host that owns more than one editor has to decide: the target may

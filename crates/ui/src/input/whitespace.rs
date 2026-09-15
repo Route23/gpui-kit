@@ -20,6 +20,98 @@ pub(super) enum WsKind {
     Space,
     /// A tab: drawn as an arrow spanning the tab's own advance.
     Tab,
+    /// A control character: drawn as a filled box, because the glyph itself
+    /// is usually blank and there is nothing else to see.
+    Control,
+    /// A character that is invisible or looks like ASCII without being it:
+    /// drawn as a box behind it, so the character stays readable.
+    Suspicious,
+}
+
+/// Is this an invisible or unusual space?
+///
+/// A plain space and a tab are **not** here -- those are
+/// [`super::mode::RenderWhitespace`]'s job, and marking them twice would put
+/// two boxes on one character.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        // No-break space, ogham space, the en/em quad family, narrow and
+        // medium spaces, the zero-width family, line/paragraph separators,
+        // word joiner, and the byte-order mark.
+        '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200f}'
+            | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}'
+            | '\u{2060}' | '\u{3000}' | '\u{feff}'
+    )
+}
+
+/// Does this look like an ASCII character without being one?
+///
+/// **Deliberately a short, hand-picked list.** VS Code ships a generated
+/// confusables table and the machinery to regenerate it; this is the set that
+/// actually bites in practice, and it can grow when something new does.
+fn is_ambiguous(c: char) -> bool {
+    matches!(
+        c,
+        // Full-width forms: `Ａ`..`ｚ`, `！`..`～`, and the ideographic space,
+        // which is the one that costs Japanese readers the most time.
+        '\u{3000}' | '\u{ff01}'..='\u{ff5e}'
+            // Cyrillic letters drawn like Latin ones.
+            | 'а' | 'в' | 'е' | 'к' | 'м' | 'н' | 'о' | 'р' | 'с' | 'т' | 'у' | 'х'
+            | 'А' | 'В' | 'Е' | 'К' | 'М' | 'Н' | 'О' | 'Р' | 'С' | 'Т' | 'У' | 'Х'
+            // Greek letters drawn like Latin ones.
+            | 'ο' | 'ν' | 'Ο' | 'Α' | 'Β' | 'Ε' | 'Ζ' | 'Η' | 'Ι' | 'Κ' | 'Μ'
+            | 'Ν' | 'Ρ' | 'Τ' | 'Υ' | 'Χ'
+            // Quotation marks and dashes that get pasted in from prose.
+            | '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}'
+            | '\u{2010}'..='\u{2015}' | '\u{2212}'
+    )
+}
+
+/// Which characters of `line` get a box that is not about whitespace.
+///
+/// Pure so it can be unit tested. `allowed` is the reader's "never mark
+/// these" list, taken as a plain string because that is how it is written in
+/// a settings file.
+pub(super) fn extra_marks_for_line(
+    line: &str,
+    control: bool,
+    unicode: super::mode::UnicodeHighlight,
+    allowed: &str,
+) -> Vec<Mark> {
+    if !control && !unicode.is_visible() {
+        return vec![];
+    }
+    let end = line.strip_suffix('\r').map(str::len).unwrap_or(line.len());
+    let mut marks = vec![];
+    for (offset, ch) in line[..end].char_indices() {
+        if allowed.contains(ch) {
+            continue;
+        }
+        // A control character is drawn even when it is also "invisible" --
+        // it is the more specific thing to say.
+        let kind = if control && is_control(ch) {
+            WsKind::Control
+        } else if unicode.wants_invisible() && is_invisible(ch) {
+            WsKind::Suspicious
+        } else if unicode.wants_ambiguous() && is_ambiguous(ch) {
+            WsKind::Suspicious
+        } else {
+            continue;
+        };
+        marks.push(Mark { offset, kind });
+    }
+    marks
+}
+
+/// Is this a control character worth showing?
+///
+/// **`\t` and `\r` are not.** The tab has its own mark and the carriage
+/// return belongs to the line ending -- boxing either would put a mark on
+/// every line of an ordinary file.
+fn is_control(c: char) -> bool {
+    (c.is_control() && c != '\t' && c != '\r' && c != '\n')
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// One mark to draw: the byte offset within the line, and what it is.
@@ -110,14 +202,17 @@ impl TextElement {
         last_layout: &LastLayout,
     ) -> Vec<PlacedMark> {
         let mode = state.mode.render_whitespace();
-        if !mode.is_visible() {
+        let control = state.mode.render_control_characters();
+        let unicode = state.mode.unicode_highlight();
+        let allowed = state.mode.unicode_allowed();
+        if !mode.is_visible() && !control && !unicode.is_visible() {
             return vec![];
         }
 
         let selection: Range<usize> = state.selected_range.into();
-        if mode.follows_selection() && selection.is_empty() {
-            return vec![];
-        }
+        // Only the whitespace marks follow the selection; a suspicious
+        // character is suspicious wherever it is.
+        let ws_off = mode.follows_selection() && selection.is_empty();
 
         let line_height = last_layout.line_height;
         let mut placed = vec![];
@@ -138,7 +233,13 @@ impl TextElement {
                     ..selection.end.saturating_sub(row_offset).min(line.len())
             });
 
-            for mark in marks_for_line(&line, mode, local_selection) {
+            let ws = if ws_off {
+                vec![]
+            } else {
+                marks_for_line(&line, mode, local_selection)
+            };
+            let extra = extra_marks_for_line(&line, control, unicode, &allowed);
+            for mark in ws.into_iter().chain(extra) {
                 let Some(pos) = line_layout.position_for_index(mark.offset, line_height) else {
                     continue;
                 };
@@ -192,6 +293,25 @@ impl TextElement {
                         color,
                     ));
                 }
+                WsKind::Control | WsKind::Suspicious => {
+                    // A box the width of the character. Control characters
+                    // usually shape to nothing, so the box is given a floor
+                    // wide enough to notice.
+                    let w = mark.width.max(px(3.));
+                    let h = line_height * 0.7;
+                    let fill = if mark.kind == WsKind::Control {
+                        cx.theme().danger.opacity(0.35)
+                    } else {
+                        cx.theme().warning.opacity(0.35)
+                    };
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(
+                            point(mark.origin.x, mark.origin.y + (line_height - h) / 2.),
+                            gpui::size(w, h),
+                        ),
+                        fill,
+                    ));
+                }
                 WsKind::Tab => {
                     // A horizontal bar with a short head, drawn as two quads so
                     // no glyph shaping is needed per tab.
@@ -222,8 +342,105 @@ impl TextElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mark, WsKind, marks_for_line};
-    use crate::input::mode::RenderWhitespace;
+    use super::{Mark, WsKind, extra_marks_for_line, marks_for_line};
+    use crate::input::mode::{RenderWhitespace, UnicodeHighlight};
+
+    #[track_caller]
+    fn extra(line: &str, control: bool, unicode: UnicodeHighlight) -> Vec<WsKind> {
+        extra_marks_for_line(line, control, unicode, "")
+            .into_iter()
+            .map(|m| m.kind)
+            .collect()
+    }
+
+    /// Off by default: an ordinary line of code gets nothing.
+    #[test]
+    fn nothing_is_marked_by_default() {
+        assert!(extra("let x = 1;", false, UnicodeHighlight::None).is_empty());
+        // Even with everything on, plain ASCII is plain ASCII.
+        assert!(extra("let x = 1;", true, UnicodeHighlight::All).is_empty());
+    }
+
+    /// The ideographic space is the one that costs the most time.
+    #[test]
+    fn an_ideographic_space_is_marked() {
+        let line = "let\u{3000}x = 1;";
+        assert_eq!(
+            extra(line, false, UnicodeHighlight::Ambiguous),
+            vec![WsKind::Suspicious]
+        );
+        // It is a space as well, so "invisible" catches it too -- a reader
+        // who picks either one expects to see it.
+        assert_eq!(
+            extra(line, false, UnicodeHighlight::Invisible),
+            vec![WsKind::Suspicious]
+        );
+    }
+
+    /// An ordinary space and tab belong to `render_whitespace`, not here --
+    /// marking them twice would put two boxes on one character.
+    #[test]
+    fn ordinary_whitespace_is_left_alone() {
+        assert!(extra("a \tb", true, UnicodeHighlight::All).is_empty());
+    }
+
+    #[test]
+    fn a_cyrillic_lookalike_is_ambiguous_not_invisible() {
+        let line = "let \u{0440}ath = 1;"; // Cyrillic `р`
+        assert_eq!(
+            extra(line, false, UnicodeHighlight::Ambiguous),
+            vec![WsKind::Suspicious]
+        );
+        assert!(extra(line, false, UnicodeHighlight::Invisible).is_empty());
+    }
+
+    #[test]
+    fn a_zero_width_space_is_invisible_not_ambiguous() {
+        let line = "a\u{200b}b";
+        assert_eq!(
+            extra(line, false, UnicodeHighlight::Invisible),
+            vec![WsKind::Suspicious]
+        );
+        assert!(extra(line, false, UnicodeHighlight::Ambiguous).is_empty());
+    }
+
+    /// Control characters are their own kind, and win over "invisible".
+    #[test]
+    fn a_control_character_is_its_own_mark() {
+        let line = "a\u{7}b";
+        assert_eq!(extra(line, true, UnicodeHighlight::None), vec![WsKind::Control]);
+        assert!(extra(line, false, UnicodeHighlight::All).is_empty(), "off means off");
+
+        // A bidi override is both a control character and a marking risk.
+        let bidi = "a\u{202e}b";
+        assert_eq!(extra(bidi, true, UnicodeHighlight::All), vec![WsKind::Control]);
+    }
+
+    /// `\r` belongs to the line ending; `\t` has its own mark.
+    #[test]
+    fn the_line_ending_is_not_a_control_character() {
+        assert!(extra("let x = 1;\r", true, UnicodeHighlight::None).is_empty());
+        assert!(extra("\tlet x = 1;", true, UnicodeHighlight::None).is_empty());
+    }
+
+    /// The reader's allow list wins over everything.
+    #[test]
+    fn an_allowed_character_is_never_marked() {
+        let line = "let\u{3000}x = \u{a0}1;";
+        assert_eq!(extra(line, true, UnicodeHighlight::All).len(), 2);
+        let marks = extra_marks_for_line(line, true, UnicodeHighlight::All, "\u{3000}");
+        assert_eq!(marks.len(), 1, "許した字は数えない");
+    }
+
+    /// Offsets are byte positions, so a multi-byte character before the mark
+    /// does not shift it.
+    #[test]
+    fn offsets_are_bytes() {
+        let line = "あい\u{3000}う";
+        let marks = extra_marks_for_line(line, false, UnicodeHighlight::Ambiguous, "");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].offset, 6, "あい で 6 バイト");
+    }
 
     #[track_caller]
     fn offsets(line: &str, mode: RenderWhitespace) -> Vec<usize> {

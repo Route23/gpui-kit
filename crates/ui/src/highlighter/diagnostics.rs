@@ -313,19 +313,42 @@ impl DiagnosticSet {
         self.range(offset..offset + 1).next()
     }
 
+    /// The styles the diagnostics in `range` put on the text.
+    ///
+    /// `tags` is `(fade, strike)`: how far a diagnostic tagged `Unnecessary`
+    /// fades the text it covers, and whether one tagged `Deprecated` strikes
+    /// it through. Both were being **stored and never read** -- the tags come
+    /// in on every `lsp_types::Diagnostic` and are the only way a server says
+    /// "this import is unused" as opposed to "this is a warning".
     pub(crate) fn styles_for_range(
         &self,
         range: &Range<usize>,
+        tags: (Option<f32>, bool),
         cx: &App,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
         if self.diagnostics.is_empty() {
             return vec![];
         }
 
+        let (fade, strike) = tags;
         let mut styles = vec![];
         for entry in self.range(range.clone()) {
             let range = entry.range.clone();
-            styles.push((range, entry.diagnostic.severity.highlight_style(cx)));
+            let mut style = entry.diagnostic.severity.highlight_style(cx);
+            if let Some(entry_tags) = entry.diagnostic.tags.as_ref() {
+                if let Some(fade) = fade {
+                    if entry_tags.contains(&lsp_types::DiagnosticTag::UNNECESSARY) {
+                        style.fade_out = Some(fade);
+                    }
+                }
+                if strike && entry_tags.contains(&lsp_types::DiagnosticTag::DEPRECATED) {
+                    style.strikethrough = Some(gpui::StrikethroughStyle {
+                        thickness: px(1.),
+                        ..Default::default()
+                    });
+                }
+            }
+            styles.push((range, style));
         }
 
         styles

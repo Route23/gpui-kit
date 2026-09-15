@@ -240,6 +240,41 @@ impl RenderWhitespace {
     }
 }
 
+/// Which suspicious characters get a mark.
+///
+/// Mirrors VS Code's `editor.unicodeHighlight.*`, collapsed to one choice
+/// because the three flags there are rarely wanted apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UnicodeHighlight {
+    /// Mark nothing.
+    #[default]
+    None,
+    /// Spaces and zero-width characters that are not a plain space or tab.
+    Invisible,
+    /// Characters that look like ASCII but are not.
+    Ambiguous,
+    /// Both.
+    All,
+}
+
+impl UnicodeHighlight {
+    /// Whether anything is marked at all.
+    #[inline]
+    pub fn is_visible(&self) -> bool {
+        !matches!(self, UnicodeHighlight::None)
+    }
+
+    #[inline]
+    pub(super) fn wants_invisible(&self) -> bool {
+        matches!(self, UnicodeHighlight::Invisible | UnicodeHighlight::All)
+    }
+
+    #[inline]
+    pub(super) fn wants_ambiguous(&self) -> bool {
+        matches!(self, UnicodeHighlight::Ambiguous | UnicodeHighlight::All)
+    }
+}
+
 /// When the fold chevrons in the gutter are visible.
 ///
 /// Mirrors VS Code's `editor.showFoldingControls`.
@@ -334,6 +369,18 @@ pub(crate) enum InputMode {
         search_behavior: super::search::SearchBehavior,
         /// Whether "go to definition" reports the target instead of acting.
         definitions_open_externally: bool,
+        /// Whether control characters get a visible box.
+        render_control_characters: bool,
+        /// Which suspicious characters get a visible box.
+        unicode_highlight: UnicodeHighlight,
+        /// Characters the reader said never to mark.
+        unicode_allowed: std::rc::Rc<str>,
+        /// Whether a diagnostic tagged `Unnecessary` fades its text.
+        show_unused: bool,
+        /// How far a `Unnecessary` diagnostic fades its text, 0.0 -- 1.0.
+        unused_fade: f32,
+        /// Whether a diagnostic tagged `Deprecated` strikes its text through.
+        show_deprecated: bool,
         /// Whether the hover popover is shown at all.
         hover: bool,
         /// How long the pointer rests before the hover popover appears, in ms.
@@ -468,6 +515,12 @@ impl InputMode {
             search_seed_from_selection: true,
             search_behavior: super::search::SearchBehavior::default(),
             definitions_open_externally: false,
+            render_control_characters: false,
+            unicode_highlight: UnicodeHighlight::default(),
+            unicode_allowed: "".into(),
+            show_unused: true,
+            unused_fade: 0.55,
+            show_deprecated: true,
             hover: true,
             hover_delay: 150,
             hover_hiding_delay: 0,
@@ -861,6 +914,60 @@ impl InputMode {
         match self {
             InputMode::CodeEditor { search_options, .. } => *search_options,
             _ => super::search::SearchOptions::default(),
+        }
+    }
+
+    /// Whether control characters get a visible box.
+    #[inline]
+    pub(super) fn render_control_characters(&self) -> bool {
+        match self {
+            InputMode::CodeEditor {
+                render_control_characters,
+                multi_line,
+                ..
+            } if *multi_line => *render_control_characters,
+            _ => false,
+        }
+    }
+
+    /// Which suspicious characters get a visible box.
+    #[inline]
+    pub(super) fn unicode_highlight(&self) -> UnicodeHighlight {
+        match self {
+            InputMode::CodeEditor {
+                unicode_highlight,
+                multi_line,
+                ..
+            } if *multi_line => *unicode_highlight,
+            _ => UnicodeHighlight::None,
+        }
+    }
+
+    /// Characters the reader said never to mark.
+    #[inline]
+    pub(super) fn unicode_allowed(&self) -> std::rc::Rc<str> {
+        match self {
+            InputMode::CodeEditor {
+                unicode_allowed, ..
+            } => unicode_allowed.clone(),
+            _ => "".into(),
+        }
+    }
+
+    /// How a diagnostic's tags change the look of the text it covers.
+    ///
+    /// Returns `(fade, strike)` -- the fade factor for `Unnecessary`, and
+    /// whether `Deprecated` strikes through.
+    #[inline]
+    pub(super) fn diagnostic_tag_style(&self) -> (Option<f32>, bool) {
+        match self {
+            InputMode::CodeEditor {
+                show_unused,
+                unused_fade,
+                show_deprecated,
+                ..
+            } => (show_unused.then_some(*unused_fade), *show_deprecated),
+            _ => (None, false),
         }
     }
 
@@ -1449,6 +1556,12 @@ search_options: crate::input::SearchOptions::default(),
             search_seed_from_selection: true,
             search_behavior: crate::input::SearchBehavior::default(),
             definitions_open_externally: false,
+            render_control_characters: false,
+            unicode_highlight: crate::input::UnicodeHighlight::default(),
+            unicode_allowed: "".into(),
+            show_unused: true,
+            unused_fade: 0.55,
+            show_deprecated: true,
                         hover_delay: 150,
             hover_hiding_delay: 0,
             hover_sticky: true,
