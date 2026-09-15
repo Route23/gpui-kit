@@ -107,6 +107,11 @@ impl InputState {
         let Some(next) = self.next_larger(&current) else {
             return;
         };
+        // Never record a step that goes nowhere — ⌃⇧⌘← would then need two
+        // presses to undo one visible ⌃⇧⌘→.
+        if next == current {
+            return;
+        }
         self.expand_stack.push(current);
         self.selected_range = next.into();
         self.selected_word_range = None;
@@ -151,11 +156,18 @@ impl InputState {
         }
 
         // 3. what the nearest pair encloses, then 4. the pair itself.
+        //
+        // **Trim before comparing, not after.** Trimming afterwards hands back
+        // a range the reader is already sitting on: the untrimmed inside of a
+        // braced block is longer than the trimmed one, so the size test passes
+        // and `maybe_trim` then shrinks it straight back to where it started.
+        // That made the second ⌃⇧⌘→ do nothing — and, because it still pushed
+        // onto the stack, it made ⌃⇧⌘← look broken too.
         if let Some((open, close)) = self.enclosing_pair(at) {
-            let inner = open.end..close.start;
+            let inner = self.maybe_trim(open.end..close.start, whitespace);
             let outer = open.start..close.end;
             if inner.len() > current.len() && inner != *current {
-                return Some(self.maybe_trim(inner, whitespace));
+                return Some(inner);
             }
             if outer.len() > current.len() && outer != *current {
                 return Some(outer);
@@ -170,8 +182,9 @@ impl InputState {
             } else {
                 self.text.len()
             };
+        let line = self.maybe_trim(line, whitespace);
         if line.len() > current.len() && line != *current {
-            return Some(self.maybe_trim(line, whitespace));
+            return Some(line);
         }
         let all = 0..self.text.len();
         (all != *current).then_some(all)
