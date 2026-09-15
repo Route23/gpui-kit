@@ -693,6 +693,18 @@ impl InputState {
         self
     }
 
+    /// How ⌘F behaves once something has been found (#241).
+    pub fn search_behavior(mut self, behavior: crate::input::SearchBehavior) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            search_behavior, ..
+        } = &mut self.mode
+        {
+            *search_behavior = behavior;
+        }
+        self
+    }
+
     /// Whether ⌘F starts with the selected text in the search field (#241).
     pub fn search_seed_from_selection(mut self, seed: bool) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
@@ -1880,14 +1892,38 @@ impl InputState {
             .last_layout
             .as_ref()
             .map_or(px(0.), |l| l.line_height);
-        let mut y = px(0.);
+        // Starts below the pad, like `scroll_to` and the element's own walk
+        // (#255 / ADR-0090). Seeding at zero lands the row `padding_top` low.
+        let mut y = self.mode.padding_top();
         for line in self.text_wrapper.lines.iter().take(row) {
             y += line.height(line_height);
         }
-        let mut offset = self.scroll_handle.offset();
+        // **Keep whatever horizontal reveal is already pending.** Called
+        // straight after `move_to`, reading `scroll_handle` instead would
+        // throw away the x that just brought the caret's column into view.
+        let mut offset = self
+            .deferred_scroll_offset
+            .unwrap_or_else(|| self.scroll_handle.offset());
         offset.y = -y;
         self.deferred_scroll_offset = Some(offset);
         cx.notify();
+    }
+
+    /// Scroll so `row` sits in the middle of the viewport.
+    ///
+    /// Goes through [`InputState::scroll_to_row`] rather than opening a
+    /// second scrolling path -- `scroll_to` is shared with caret movement,
+    /// clicks and session restore, and must keep meaning "just enough".
+    ///
+    /// `visible_range` counts **buffer rows**, the same unit as `row`, so a
+    /// softly wrapped file corrects itself: fewer rows fit, so half of them
+    /// is a smaller number.
+    pub fn scroll_row_to_center(&mut self, row: usize, cx: &mut Context<Self>) {
+        let half = self
+            .last_layout
+            .as_ref()
+            .map_or(0, |l| l.visible_range.len() / 2);
+        self.scroll_to_row(row.saturating_sub(half), cx);
     }
 
     /// Focus the input field.

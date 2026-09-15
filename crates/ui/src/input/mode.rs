@@ -330,6 +330,8 @@ pub(crate) enum InputMode {
         search_options: super::search::SearchOptions,
         /// Whether opening ⌘F puts the selected text in the search field.
         search_seed_from_selection: bool,
+        /// How ⌘F behaves once something has been found.
+        search_behavior: super::search::SearchBehavior,
         /// Whether the hover popover is shown at all.
         hover: bool,
         /// How long the pointer rests before the hover popover appears, in ms.
@@ -462,6 +464,7 @@ impl InputMode {
             unfold_on_click_after_end_of_line: false,
             search_options: super::search::SearchOptions::default(),
             search_seed_from_selection: true,
+            search_behavior: super::search::SearchBehavior::default(),
             hover: true,
             hover_delay: 150,
             hover_hiding_delay: 0,
@@ -855,6 +858,19 @@ impl InputMode {
         match self {
             InputMode::CodeEditor { search_options, .. } => *search_options,
             _ => super::search::SearchOptions::default(),
+        }
+    }
+
+    /// How ⌘F behaves once something has been found.
+    ///
+    /// Anything that is not a code editor behaves the plain way.
+    #[inline]
+    pub(super) fn search_behavior(&self) -> super::search::SearchBehavior {
+        match self {
+            InputMode::CodeEditor {
+                search_behavior, ..
+            } => *search_behavior,
+            _ => super::search::SearchBehavior::default(),
         }
     }
 
@@ -1416,6 +1432,7 @@ mod tests {
             hover: true,
 search_options: crate::input::SearchOptions::default(),
             search_seed_from_selection: true,
+            search_behavior: crate::input::SearchBehavior::default(),
                         hover_delay: 150,
             hover_hiding_delay: 0,
             hover_sticky: true,

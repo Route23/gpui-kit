@@ -1,12 +1,12 @@
 use aho_corasick::AhoCorasick;
 use regex::{Regex, RegexBuilder};
 use rust_i18n::t;
-use std::{ops::Range, rc::Rc};
+use std::{ops::Range, rc::Rc, time::Duration};
 
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled,
-    Subscription, Window, actions, canvas, div, prelude::FluentBuilder as _,
+    Subscription, Task, Window, actions, canvas, div, prelude::FluentBuilder as _,
 };
 use ropey::Rope;
 
@@ -77,6 +77,58 @@ impl SearchOptions {
     }
 }
 
+/// How the panel behaves once something has been found.
+///
+/// Kept apart from [`SearchOptions`] on purpose. That one says **how to
+/// look** -- every field of it feeds the pattern or filters a hit. These say
+/// what happens *after*, and six of the seven never reach the matcher at all.
+/// Folding them in would rebuild the Aho-Corasick automaton because somebody
+/// toggled "close the panel on a result".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchBehavior {
+    /// Look again on every keystroke. Off means the query only runs on Enter.
+    pub search_on_type: bool,
+    /// How long to wait after a keystroke before looking, in milliseconds.
+    /// Zero looks straight away, which is what it did before this existed.
+    pub search_debounce_ms: u16,
+    /// Move the caret to the current match while the reader is still typing.
+    pub cursor_move_on_type: bool,
+    /// Close the panel once a match has been stepped to.
+    pub close_on_result: bool,
+    /// Put the match in the middle of the viewport rather than merely
+    /// bringing it into view.
+    pub center_on_match: bool,
+    /// Go back to the first match after the last one, and the other way
+    /// round. Off stops at either end.
+    ///
+    /// Named `wrap_around` because `wrap_at` and `soft_wrap` already mean
+    /// something else a few fields away on [`super::InputMode`].
+    pub wrap_around: bool,
+    /// With nothing selected, seed the query with the word under the caret.
+    ///
+    /// Read together with `search_seed_from_selection`, which is the master
+    /// switch: no seeding at all means no seeding from a word either.
+    pub seed_from_word: bool,
+}
+
+impl Default for SearchBehavior {
+    fn default() -> Self {
+        Self {
+            search_on_type: true,
+            search_debounce_ms: 0,
+            // The one deliberate departure from what it did before: every
+            // other editor puts the caret on the match, and `hide()` hands
+            // focus back to the editor -- so without this, Escape throws the
+            // find away and drops the reader where they started.
+            cursor_move_on_type: true,
+            close_on_result: false,
+            center_on_match: false,
+            wrap_around: true,
+            seed_from_word: false,
+        }
+    }
+}
+
 /// A built query. Literal until the reader asks for a regular expression.
 #[derive(Debug, Clone)]
 enum Pattern {
@@ -92,6 +144,15 @@ pub struct SearchMatcher {
 
     pub(super) matched_ranges: Rc<Vec<Range<usize>>>,
     pub(super) current_match_ix: usize,
+    /// The query as last built, so an identical one can be waved through.
+    ///
+    /// Load-bearing: `update_matches` puts `current_match_ix` back to zero,
+    /// so re-running the same query on every Enter would land on match one
+    /// for ever and never advance.
+    query_text: String,
+    /// Go back to the first match after the last one. See
+    /// [`SearchBehavior::wrap_around`].
+    wrap: bool,
     /// Is in replacing mode, if true, the next update will not reset the current match index.
     replacing: bool,
     /// The reader typed a regular expression that does not parse.
@@ -125,6 +186,8 @@ impl SearchMatcher {
             options: SearchOptions::default(),
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
+            query_text: String::new(),
+            wrap: true,
             replacing: false,
             invalid: false,
         }
@@ -173,7 +236,17 @@ impl SearchMatcher {
     }
 
     /// Update the search query and reset the current match index.
+    ///
+    /// **An unchanged query is waved through.** Rebuilding it would put
+    /// `current_match_ix` back to zero, and `next`/`prev` re-run the query
+    /// before stepping (they have to, in case a debounce is still pending or
+    /// `search_on_type` is off) -- so without this guard, Enter would land on
+    /// match one for ever.
     pub fn update_query(&mut self, query: &str, options: SearchOptions) {
+        if self.query_text == query && self.options == options {
+            return;
+        }
+        self.query_text = query.to_string();
         self.options = options;
         self.invalid = false;
         let case_matters = options.case_matters(query);
@@ -215,6 +288,20 @@ impl SearchMatcher {
         self.matched_ranges.len()
     }
 
+    /// Go back to the first match after the last one, or stop there.
+    ///
+    /// **Does not look again.** This is a knob about how to *walk* the
+    /// matches, not how to find them -- throwing `matched_ranges` away here
+    /// would be a bug.
+    pub fn set_wrap(&mut self, wrap: bool) {
+        self.wrap = wrap;
+    }
+
+    /// The match the panel is on right now, without stepping.
+    fn current(&self) -> Option<Range<usize>> {
+        self.matched_ranges.get(self.current_match_ix).cloned()
+    }
+
     fn peek(&self) -> Option<Range<usize>> {
         self.matched_ranges.get(self.current_match_ix + 1).cloned()
     }
@@ -245,10 +332,15 @@ impl Iterator for SearchMatcher {
             return None;
         }
 
+        // **Look at the edge before moving.** Returning `None` has to leave
+        // the index where it was, or a refusal still walks the reader off the
+        // end of the list.
         if self.current_match_ix < self.matched_ranges.len().saturating_sub(1) {
             self.current_match_ix += 1;
-        } else {
+        } else if self.wrap {
             self.current_match_ix = 0;
+        } else {
+            return None;
         }
 
         self.matched_ranges.get(self.current_match_ix).cloned()
@@ -262,6 +354,9 @@ impl DoubleEndedIterator for SearchMatcher {
         }
 
         if self.current_match_ix == 0 {
+            if !self.wrap {
+                return None;
+            }
             self.current_match_ix = self.matched_ranges.len();
         }
 
@@ -283,6 +378,14 @@ pub(super) struct SearchPanel {
     replace_mode: bool,
     matcher: SearchMatcher,
     input_width: Pixels,
+    /// How the panel behaves once something has been found. Re-read from the
+    /// settings every time the panel opens, like `options` beside it.
+    behavior: SearchBehavior,
+    /// The pending debounced look-up.
+    ///
+    /// **Assigning over it is the cancellation** -- the old `Task` drops and
+    /// its future is never polled again (`lsp/hover.rs` does the same).
+    _query_task: Task<()>,
 
     open: bool,
     _subscriptions: Vec<Subscription>,
@@ -312,24 +415,37 @@ impl InputState {
         }
 
         let options = self.mode.search_options();
+        let behavior = self.mode.search_behavior();
         let seed = self.mode.search_seed_from_selection();
         let search_panel = match self.search_panel.as_ref() {
             Some(panel) => panel.clone(),
-            None => SearchPanel::new(cx.entity(), options, window, cx),
+            None => SearchPanel::new(cx.entity(), options, behavior, window, cx),
         };
 
         let text = self.text.clone();
         let editor = cx.entity();
-        let selected_text = Rope::from(self.selected_text());
+        // A selection wins; the word under the caret is the fallback. Note
+        // `word_at` gives back `""` when the caret is not on a word, which
+        // `show`'s own "is there anything to seed with" check already covers.
+        let selected = Rope::from(self.selected_text());
+        let seed_text = if selected.len() > 0 {
+            selected
+        } else if behavior.seed_from_word {
+            Rope::from(self.text.word_at(self.cursor()))
+        } else {
+            Rope::from("")
+        };
         search_panel.update(cx, |this, cx| {
             this.editor = editor;
             // **Settings decide how the panel opens, every time.** A panel
             // that stayed on the last session's toggles would quietly
             // disagree with what the settings window shows.
             this.options = options;
+            this.behavior = behavior;
+            this.matcher.set_wrap(behavior.wrap_around);
             this.case_decided = false;
             this.matcher.update(&text);
-            this.show(&selected_text, seed, window, cx);
+            this.show(&seed_text, seed, window, cx);
         });
         self.search_panel = Some(search_panel);
         cx.notify();
@@ -340,6 +456,7 @@ impl SearchPanel {
     pub fn new(
         editor: Entity<InputState>,
         options: SearchOptions,
+        behavior: SearchBehavior,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -352,8 +469,8 @@ impl SearchPanel {
                     cx.subscribe(&search_input, |this: &mut Self, _, ev: &InputEvent, cx| {
                         // Handle search input changes
                         match ev {
-                            InputEvent::Change => {
-                                this.update_search_query(cx);
+                            InputEvent::Change if this.behavior.search_on_type => {
+                                this.schedule_search_query(cx);
                             }
                             _ => {}
                         }
@@ -368,6 +485,8 @@ impl SearchPanel {
                 case_decided: false,
                 replace_mode: false,
                 matcher: SearchMatcher::new(),
+                behavior,
+                _query_task: Task::ready(()),
                 open: true,
                 input_width: Pixels::ZERO,
                 _subscriptions,
@@ -392,6 +511,69 @@ impl SearchPanel {
             }
             this.select_all(&super::SelectAll, window, cx);
         });
+        // **Run it here too.** The `Change` above is swallowed when
+        // `search_on_type` is off, and merely scheduled when a debounce is
+        // set -- neither of which should stop a freshly opened panel from
+        // showing what it was seeded with. Free when neither knob is set:
+        // `update_query` waves an unchanged query through.
+        self._query_task = Task::ready(());
+        self.update_search_query(cx);
+    }
+
+    /// Look again, now or after the debounce.
+    fn schedule_search_query(&mut self, cx: &mut Context<Self>) {
+        let wait = Duration::from_millis(u64::from(self.behavior.search_debounce_ms));
+        if wait.is_zero() {
+            // What it did before this existed: look on the keystroke.
+            self._query_task = Task::ready(());
+            self.update_search_query(cx);
+            return;
+        }
+        self._query_task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this: &mut Self, cx| this.update_search_query(cx));
+        });
+    }
+
+    /// Bring the match list up to date before stepping, and say whether that
+    /// built a **new** list.
+    ///
+    /// `next`/`prev` cannot assume the list matches what is in the query
+    /// field: `search_on_type` may be off, or a debounce may still be
+    /// pending. When the list is new the panel must land **on** the first
+    /// match rather than stepping past it.
+    fn run_query_if_stale(&mut self, cx: &mut Context<Self>) -> bool {
+        let query = self.search_input.read(cx).value();
+        if self.matcher.query_text == query.as_str() {
+            return false;
+        }
+        self._query_task = Task::ready(());
+        self.update_search_query(cx);
+        true
+    }
+
+    /// Put the caret on a match and bring it into view.
+    ///
+    /// **The one place a match becomes a selection.** `move_to` + `select_to`
+    /// is the same pair `go_to_definition` uses, and neither takes focus --
+    /// which matters, because the reader is typing in the search field.
+    fn reveal(
+        &mut self,
+        range: &Range<usize>,
+        direction: Option<MoveDirection>,
+        cx: &mut Context<Self>,
+    ) {
+        let center = self.behavior.center_on_match;
+        let start = range.start;
+        let end = range.end;
+        self.editor.update(cx, |state, cx| {
+            state.move_to(start, direction, cx);
+            state.select_to(end, cx);
+            if center {
+                let row = state.text().offset_to_point(start).row;
+                state.scroll_row_to_center(row, cx);
+            }
+        });
     }
 
     fn update_search_query(&mut self, cx: &mut Context<Self>) {
@@ -412,10 +594,18 @@ impl SearchPanel {
             self.matcher
                 .update_cursor_by_offset(visible_range_offset.start);
         }
+        if self.behavior.cursor_move_on_type {
+            if let Some(range) = self.matcher.current() {
+                self.reveal(&range, None, cx);
+            }
+        }
         cx.notify();
     }
 
     pub(super) fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A debounce still in flight must not look again after the panel is
+        // gone -- the highlights would have nowhere to go.
+        self._query_task = Task::ready(());
         self.open = false;
         self.editor.read(cx).focus_handle.focus(window);
         cx.notify();
@@ -437,19 +627,42 @@ impl SearchPanel {
         self.editor.focus_handle(cx).focus(window);
     }
 
-    fn prev(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(range) = self.matcher.next_back() {
-            self.editor.update(cx, |state, cx| {
-                state.scroll_to(range.start, Some(MoveDirection::Up), cx);
-            });
-        }
+    fn prev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fresh = self.run_query_if_stale(cx);
+        let range = if fresh {
+            self.matcher.current()
+        } else {
+            self.matcher.next_back()
+        };
+        self.step_to(range, MoveDirection::Up, window, cx);
     }
 
-    fn next(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(range) = self.matcher.next() {
-            self.editor.update(cx, |state, cx| {
-                state.scroll_to(range.end, Some(MoveDirection::Down), cx);
-            });
+    fn next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fresh = self.run_query_if_stale(cx);
+        let range = if fresh {
+            self.matcher.current()
+        } else {
+            self.matcher.next()
+        };
+        self.step_to(range, MoveDirection::Down, window, cx);
+    }
+
+    /// Land on a match, if there was one to land on.
+    fn step_to(
+        &mut self,
+        range: Option<Range<usize>>,
+        direction: MoveDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(range) = range else {
+            // Nothing to go to -- at either end with `wrap_around` off, or no
+            // matches at all. Leave the panel exactly as it was.
+            return;
+        };
+        self.reveal(&range, Some(direction), cx);
+        if self.behavior.close_on_result {
+            self.hide(window, cx);
         }
     }
 
@@ -776,6 +989,104 @@ mod tests {
         assert_eq!(matcher.len(), 0);
         assert_eq!(matcher.next(), None);
         assert_eq!(matcher.next_back(), None);
+    }
+
+    /// With `wrap_around` off, the ends are the ends -- and a refusal
+    /// **leaves the index where it was**.
+    #[test]
+    fn wrap_off_stops_at_the_ends() {
+        let mut m = SearchMatcher::new();
+        m.update(&Rope::from("is is is"));
+        m.update_query("is", insensitive());
+        m.set_wrap(false);
+        assert_eq!(m.len(), 3);
+
+        assert_eq!(m.next(), Some(3..5));
+        assert_eq!(m.next(), Some(6..8));
+        assert_eq!(m.current_match_ix, 2);
+        assert_eq!(m.next(), None, "末尾で止まる");
+        assert_eq!(m.current_match_ix, 2, "断っても添字は動かない");
+
+        assert_eq!(m.next_back(), Some(3..5));
+        assert_eq!(m.next_back(), Some(0..2));
+        assert_eq!(m.current_match_ix, 0);
+        assert_eq!(m.next_back(), None, "先頭で止まる");
+        assert_eq!(m.current_match_ix, 0, "断っても添字は動かない");
+    }
+
+    /// The default is what it did before the knob existed.
+    #[test]
+    fn wrap_on_is_what_it_did_before() {
+        let mut m = SearchMatcher::new();
+        m.update(&Rope::from("is is is"));
+        m.update_query("is", insensitive());
+
+        assert_eq!(m.next(), Some(3..5));
+        assert_eq!(m.next(), Some(6..8));
+        assert_eq!(m.next(), Some(0..2), "末尾の次は先頭");
+        assert_eq!(m.next_back(), Some(6..8), "先頭の前は末尾");
+    }
+
+    /// `set_wrap` is about **how to walk**, not how to look -- it must not
+    /// throw the match list away.
+    #[test]
+    fn set_wrap_does_not_look_again() {
+        let mut m = SearchMatcher::new();
+        m.update(&Rope::from("is is is"));
+        m.update_query("is", insensitive());
+        let before = Rc::as_ptr(&m.matched_ranges);
+        m.set_wrap(false);
+        assert!(std::ptr::eq(before, Rc::as_ptr(&m.matched_ranges)));
+    }
+
+    /// Re-running an unchanged query keeps the reader's place.
+    ///
+    /// `next`/`prev` re-run the query before stepping (the list may be stale
+    /// when `search_on_type` is off, or a debounce still pending). Without
+    /// the guard in `update_query`, that would reset `current_match_ix` and
+    /// Enter would land on match one for ever.
+    #[test]
+    fn re_running_the_same_query_keeps_the_place() {
+        let mut m = SearchMatcher::new();
+        m.update(&Rope::from("is is is"));
+        m.update_query("is", insensitive());
+        m.next();
+        m.next();
+        assert_eq!(m.current_match_ix, 2);
+
+        m.update_query("is", insensitive());
+        assert_eq!(m.current_match_ix, 2, "同じ問い合わせなら場所を保つ");
+
+        m.update_query("is", sensitive());
+        assert_eq!(m.current_match_ix, 0, "探しかたが変われば数え直す");
+    }
+
+    /// Everything stays as it was, except the one departure.
+    #[test]
+    fn the_default_behaviour_is_todays_behaviour() {
+        let b = SearchBehavior::default();
+        assert!(b.search_on_type);
+        assert_eq!(b.search_debounce_ms, 0);
+        assert!(!b.close_on_result);
+        assert!(!b.center_on_match);
+        assert!(b.wrap_around);
+        assert!(!b.seed_from_word);
+        // The one deliberate change: every other editor puts the caret on the
+        // match, and `hide()` hands focus back to the editor.
+        assert!(b.cursor_move_on_type);
+    }
+
+    /// What `seed_from_word` will actually pick up.
+    ///
+    /// This pins `RopeExt::word_at`, not the panel -- the panel has no seam
+    /// that can be reached without a `Window`.
+    #[test]
+    fn the_word_under_the_caret_seeds_the_query() {
+        let text = Rope::from("let value = 1;");
+        assert_eq!(text.word_at(5), "value", "語の途中");
+        assert_eq!(text.word_at(9), "value", "語の直後");
+        assert_eq!(text.word_at(10), "", "空白の上では何も拾わない");
+        assert_eq!(text.word_at(text.len()), "", "末尾でも落ちない");
     }
 
     #[test]

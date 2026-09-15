@@ -50,6 +50,6 @@ pub use otp_input::*;
 pub use state::*;
 
 pub use lsp_types::Position;
-pub use search::SearchOptions;
+pub use search::{SearchBehavior, SearchOptions};
 pub use rope_ext::*;
 pub use ropey::Rope;
