@@ -877,8 +877,14 @@ impl TextElement {
                 let color = match kind {
                     // A write stands out from a read -- that is the whole
                     // reason to ask a server rather than match strings.
-                    crate::input::HighlightKind::Write => base.saturation(0.35),
-                    _ => base.saturation(0.12),
+                    //
+                    // **Density, not saturation.** The selection colour is
+                    // nearly grey in a dark theme, so moving its saturation
+                    // moves nothing a reader can see; the two tints came out
+                    // the same shade on screen. Alpha is what "stronger"
+                    // means here.
+                    crate::input::HighlightKind::Write => base.alpha(0.60),
+                    _ => base.alpha(0.28),
                 };
                 Self::layout_match_range(range, last_layout, bounds).map(|p| (p, color))
             })
