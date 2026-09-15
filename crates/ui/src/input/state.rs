@@ -16,7 +16,6 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 use sum_tree::Bias;
-use unicode_segmentation::*;
 
 use super::{
     blink_cursor::BlinkCursor,
@@ -99,6 +98,8 @@ actions!(
         ToggleCodeActions,
         Search,
         GoToDefinition,
+        ExpandSelection,
+        ShrinkSelection,
         ToggleFold,
         FoldAll,
         UnfoldAll,
@@ -271,6 +272,8 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-/", ToggleBlockComment, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-alt-/", ToggleBlockComment, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-cmd-right", ExpandSelection, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-cmd-left", ShrinkSelection, Some(CONTEXT)),
         KeyBinding::new("cmd-.", ToggleCodeActions, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-.", ToggleCodeActions, Some(CONTEXT)),
@@ -427,6 +430,8 @@ pub struct InputState {
     pub(super) hover_hiding: bool,
     /// The LSP definitions locations for "Go to Definition" feature.
     pub(super) hover_definition: HoverDefinition,
+    /// Where the selection was before each `ExpandSelection` (#253).
+    pub(super) expand_stack: Vec<Range<usize>>,
     /// Ranges the host said may be clicked (#256). See `links.rs`.
     pub(super) link_ranges: Vec<Range<usize>>,
     /// The one the pointer is on **with the modifier held**, if any.
@@ -438,6 +443,11 @@ pub struct InputState {
     ///
     /// If true, will call some update (for example LSP, Syntax Highlight) before render.
     _pending_update: bool,
+    /// The caret moved, so the occurrence highlights are stale (#253).
+    ///
+    /// Asking needs a `&mut Window`, and `move_to` has none -- so the ask is
+    /// left for the next frame, which is also a free debounce for a drag.
+    pub(super) pending_highlight: bool,
     /// A flag to indicate if we should ignore the next completion event.
     pub(super) silent_replace_text: bool,
 
@@ -533,6 +543,7 @@ impl InputState {
             hover_popover_hovered: false,
             hover_hiding: false,
             hover_definition: HoverDefinition::default(),
+            expand_stack: Vec::new(),
             link_ranges: Vec::new(),
             link_hover: None,
             silent_replace_text: false,
@@ -540,6 +551,7 @@ impl InputState {
             _subscriptions,
             _context_menu_task: Task::ready(Ok(())),
             _pending_update: false,
+            pending_highlight: false,
             inline_completion: InlineCompletion::default(),
         }
     }
@@ -712,6 +724,40 @@ impl InputState {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { search_options, .. } = &mut self.mode {
             *search_options = options;
+        }
+        self
+    }
+
+    /// How the selection grows and what a double-click selects (#253).
+    pub fn selection_expansion(
+        mut self,
+        double_click_block: bool,
+        subwords: bool,
+        whitespace: bool,
+    ) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            double_click_selects_block,
+            smart_select_subwords,
+            smart_select_whitespace,
+            ..
+        } = &mut self.mode
+        {
+            *double_click_selects_block = double_click_block;
+            *smart_select_subwords = subwords;
+            *smart_select_whitespace = whitespace;
+        }
+        self
+    }
+
+    /// Which characters never join a word (#253, VS Code's `wordSeparators`).
+    pub fn word_separators(mut self, separators: impl Into<std::rc::Rc<str>>) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            word_separators, ..
+        } = &mut self.mode
+        {
+            *word_separators = separators.into();
         }
         self
     }
@@ -2118,28 +2164,61 @@ impl InputState {
     }
 
     /// Return the start offset of the previous word.
+    ///
+    /// **Uses the same idea of "word" as double-click** (`selection::
+    /// word_range`). These were two different answers before: this walk asked
+    /// `unicode-segmentation` while a double-click asked a table that counted
+    /// only ASCII, so ⌥← and a double-click disagreed about `café` and about
+    /// every Japanese word.
+    ///
+    /// It also **copied the whole left half of the document into a `String`
+    /// on every press** to do it. Now it steps by words through a window.
     pub(super) fn previous_start_of_word(&mut self) -> usize {
-        let offset = self.selected_range.start;
-        let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
-        // FIXME: Avoid to_string
-        let left_part = self.text.slice(0..offset).to_string();
-
-        UnicodeSegmentation::split_word_bound_indices(left_part.as_str())
-            .rfind(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        let mut offset = self.selected_range.start;
+        offset = self.offset_from_utf16(self.offset_to_utf16(offset));
+        // Step back over whatever sits immediately behind the caret, then
+        // keep stepping while it is blank -- ⌥← should land on a word, not
+        // in the gap before one.
+        loop {
+            if offset == 0 {
+                return 0;
+            }
+            let Some(prev) = self.text.chars_at(offset).reversed().next() else {
+                return 0;
+            };
+            let before = offset - prev.len_utf8();
+            let Some(range) = self.word_at_offset(before) else {
+                return before;
+            };
+            if !self.text.slice(range.clone()).to_string().trim().is_empty() {
+                return range.start;
+            }
+            offset = range.start;
+        }
     }
 
     /// Return the next end offset of the next word.
+    ///
+    /// The mirror of [`InputState::previous_start_of_word`]; same reasons.
     pub(super) fn next_end_of_word(&mut self) -> usize {
-        let offset = self.cursor();
-        let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
-        let right_part = self.text.slice(offset..self.text.len()).to_string();
-
-        UnicodeSegmentation::split_word_bound_indices(right_part.as_str())
-            .find(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, s)| offset + i + s.len())
-            .unwrap_or(self.text.len())
+        let len = self.text.len();
+        let mut offset = self.cursor();
+        offset = self.offset_from_utf16(self.offset_to_utf16(offset));
+        loop {
+            if offset >= len {
+                return len;
+            }
+            let Some(range) = self.word_at_offset(offset) else {
+                return len;
+            };
+            if !self.text.slice(range.clone()).to_string().trim().is_empty() {
+                return range.end;
+            }
+            if range.end <= offset {
+                return len;
+            }
+            offset = range.end;
+        }
     }
 
     /// Get start of line byte offset of cursor
@@ -2570,8 +2649,30 @@ impl InputState {
             }
         }
 
-        // Double click to select word
+        // Triple click to select the line.
+        //
+        // **This was simply missing** -- `click_count == 3` appeared nowhere,
+        // so a third click behaved like a first and put the caret down.
+        if event.button == MouseButton::Left && event.click_count >= 3 {
+            let row = self.text.offset_to_point(offset).row;
+            let start = self.text.line_start_offset(row);
+            let end = if row + 1 < self.text.lines_len() {
+                self.text.line_start_offset(row + 1)
+            } else {
+                self.text.len()
+            };
+            self.selected_range = (start..end).into();
+            self.selected_word_range = None;
+            cx.notify();
+            return;
+        }
+
+        // Double click to select word -- or, next to a bracket, the block it
+        // opens (`editor.doubleClickSelectsBlock`).
         if event.button == MouseButton::Left && event.click_count == 2 {
+            if self.select_enclosing_block(offset, cx) {
+                return;
+            }
             self.select_word(offset, window, cx);
             return;
         }
@@ -3696,6 +3797,14 @@ impl Render for InputState {
                 .update_highlighter(&(0..0), &self.text, "", false, cx);
             self.lsp.update(&self.text, window, cx);
             self._pending_update = false;
+        }
+
+        if self.pending_highlight {
+            self.pending_highlight = false;
+            let text = self.text.clone();
+            let offset = self.cursor();
+            self.lsp
+                .update_document_highlights(&text, offset, window, cx);
         }
 
         div()

@@ -591,6 +591,11 @@ impl TextElement {
         bounds: &Bounds<Pixels>,
         cx: &App,
     ) -> Vec<Path<Pixels>> {
+        // **The server's answer wins.** Showing both means showing two
+        // colours for the same word, one of them a guess.
+        if self.state.read(cx).lsp.has_document_highlights() {
+            return vec![];
+        }
         let state = self.state.read(cx);
         if !state.mode.selection_highlight() || state.masked {
             return vec![];
@@ -846,6 +851,38 @@ impl TextElement {
         }
 
         paths
+    }
+
+    /// Where else the symbol under the caret appears, as the server said.
+    ///
+    /// Drawn the same way as the document colours, because the painter takes
+    /// a range and nothing else.
+    fn layout_document_highlights(
+        &self,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        cx: &App,
+    ) -> Vec<(Path<Pixels>, Hsla)> {
+        let state = self.state.read(cx);
+        let found = state
+            .lsp
+            .document_highlights_for_range(&state.text, &last_layout.visible_range);
+        if found.is_empty() {
+            return vec![];
+        }
+        let base = cx.theme().selection;
+        found
+            .into_iter()
+            .filter_map(|(range, kind)| {
+                let color = match kind {
+                    // A write stands out from a read -- that is the whole
+                    // reason to ask a server rather than match strings.
+                    crate::input::HighlightKind::Write => base.saturation(0.35),
+                    _ => base.saturation(0.12),
+                };
+                Self::layout_match_range(range, last_layout, bounds).map(|p| (p, color))
+            })
+            .collect()
     }
 
     fn layout_selections(
@@ -1314,6 +1351,7 @@ pub(super) struct PrepaintState {
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     link_hitbox: Option<Hitbox>,
+    document_highlight_paths: Vec<(Path<Pixels>, Hsla)>,
     indent_guides_path: Option<Path<Pixels>>,
     rulers_path: Option<Path<Pixels>>,
     /// One vertical guide per bracket pair, grouped by colour
@@ -1713,6 +1751,8 @@ impl Element for TextElement {
         let bracket_match_paths = self.layout_bracket_match(&last_layout, &bounds, cx);
         let document_color_paths =
             self.layout_document_colors(&document_colors, &last_layout, &bounds);
+        let document_highlight_paths =
+            self.layout_document_highlights(&last_layout, &bounds, cx);
 
         let state = self.state.read(cx);
         let line_numbers_mode = state.mode.line_numbers();
@@ -1835,6 +1875,7 @@ impl Element for TextElement {
             hover_highlight_path,
             hover_definition_hitbox,
             link_hitbox,
+            document_highlight_paths,
             document_color_paths,
             indent_guides_path,
             rulers_path,
@@ -2036,6 +2077,11 @@ impl Element for TextElement {
             if let Some(path) = prepaint.hover_highlight_path.take() {
                 window.paint_path(path, secondary_selection);
             }
+        }
+
+        // Paint the server's occurrence highlights (#253).
+        for (path, color) in prepaint.document_highlight_paths.iter() {
+            window.paint_path(path.clone(), *color);
         }
 
         // Paint document colors

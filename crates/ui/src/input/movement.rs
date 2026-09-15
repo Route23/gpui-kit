@@ -67,6 +67,8 @@ impl InputState {
         self.update_preferred_column();
         self.hide_context_menu(cx);
         self.clear_inline_completion(cx);
+        // The symbol under the caret changed, so ask again next frame (#253).
+        self.pending_highlight = true;
         cx.notify()
     }
 

@@ -6,48 +6,64 @@ use sum_tree::Bias;
 
 use crate::{input::InputState, RopeExt as _};
 
+/// VS Code's `editor.wordSeparators`, verbatim.
+///
+/// Note `_` is **not** here: `foo_bar` is one word, `foo-bar` is two. UAX#29
+/// agrees on both counts, which is why the two can be layered.
+pub const DEFAULT_WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:\'\",.<>/?";
+
+/// How many characters either side of the caret are examined.
+///
+/// A double-click should not read a megabyte to answer "what word is this".
+const WORD_WINDOW: usize = 128;
+
+/// What kind of run a character belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CharType {
-    /// a-z, A-Z, 0-9, _
-    Word,
-    /// '\t', ' ', '\u{00A0}' etc.
+enum Kind {
+    /// A separator, or punctuation: stands alone.
+    Alone,
     Whitespace,
-    /// \n, \r
     Newline,
-    /// . , ; : ( ) [ ] { } ... or CJK characters: `汉`, `🎉` etc.
-    Other,
+    /// Han. Runs of these group together.
+    Han,
+    Hiragana,
+    Katakana,
+    /// Everything else -- Latin, Greek, Cyrillic, digits, `_`, and anything
+    /// the reader did not list as a separator.
+    Word,
 }
 
-impl From<char> for CharType {
-    fn from(c: char) -> Self {
-        match c {
-            '_' => CharType::Word,
-            c if c.is_ascii_alphanumeric() => CharType::Word,
-            c if c == '\n' || c == '\r' => CharType::Newline,
-            c if c.is_whitespace() => CharType::Whitespace,
-            _ => CharType::Other,
-        }
+fn kind_of(c: char, separators: &str) -> Kind {
+    if c == '\n' || c == '\r' {
+        return Kind::Newline;
     }
-}
-
-impl CharType {
-    /// Check if two CharTypes are connectable
-    fn is_connectable(self, c: char) -> bool {
-        let other = CharType::from(c);
-        match (self, other) {
-            (CharType::Word, CharType::Word) => true,
-            (CharType::Whitespace, CharType::Whitespace) => true,
-            _ => false,
-        }
+    if c.is_whitespace() {
+        return Kind::Whitespace;
+    }
+    // **The reader's list wins.** It is the whole point of the setting.
+    if separators.contains(c) {
+        return Kind::Alone;
+    }
+    match c {
+        '\u{3040}'..='\u{309f}' => Kind::Hiragana,
+        '\u{30a0}'..='\u{30ff}' | '\u{31f0}'..='\u{31ff}' => Kind::Katakana,
+        '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}' => Kind::Han,
+        // **Everything the reader did not call a separator is part of a
+        // word.** That is VS Code's rule, and it is what makes the setting
+        // mean something: take `.` out of the list and `foo.bar` becomes one
+        // word. It also means an emoji joins the word beside it, as there.
+        _ => Kind::Word,
     }
 }
 
 impl InputState {
+
     /// Select the word at the given offset on double-click.
     ///
     /// The offset is the UTF-8 offset.
     pub(super) fn select_word(&mut self, offset: usize, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(range) = TextSelector::word_range(&self.text, offset) else {
+        let separators = self.mode.word_separators();
+        let Some(range) = word_range(&self.text, offset, &separators) else {
             return;
         };
 
@@ -55,117 +71,175 @@ impl InputState {
         self.selected_word_range = Some(self.selected_range);
         cx.notify()
     }
-}
 
-struct TextSelector;
-impl TextSelector {
-    /// Select a word in the given text at the specified offset.
-    ///
-    /// The offset is the UTF-8 offset.
-    ///
-    /// Returns the start and end offsets of the selected word.
-    pub fn word_range(text: &Rope, offset: usize) -> Option<Range<usize>> {
-        let offset = text.clip_offset(offset, Bias::Left);
-        let Some(char) = text.char_at(offset) else {
-            return None;
-        };
-
-        let char_type = CharType::from(char);
-        let mut start = offset;
-        let mut end = offset + char.len_utf8();
-        let prev_chars = text.chars_at(start).reversed().take(128);
-        let next_chars = text.chars_at(end).take(128);
-
-        for ch in prev_chars {
-            if char_type.is_connectable(ch) {
-                start -= ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-
-        for ch in next_chars {
-            if char_type.is_connectable(ch) {
-                end += ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-
-        Some(start..end)
+    /// The word around `offset`, for the host and for the other word walks.
+    pub(super) fn word_at_offset(&self, offset: usize) -> Option<Range<usize>> {
+        word_range(&self.text, offset, &self.mode.word_separators())
     }
 }
+
+/// A slice of `text` around `offset`, and where it starts.
+///
+/// Both ends are moved to a character boundary, so the slice can be indexed.
+fn window_around(text: &Rope, offset: usize) -> (String, usize) {
+    let mut start = offset;
+    for _ in 0..WORD_WINDOW {
+        let Some(c) = text.chars_at(start).reversed().next() else {
+            break;
+        };
+        start -= c.len_utf8();
+    }
+    let mut end = offset;
+    for _ in 0..WORD_WINDOW {
+        let Some(c) = text.chars_at(end).next() else {
+            break;
+        };
+        end += c.len_utf8();
+    }
+    (text.slice(start..end).to_string(), start)
+}
+
+/// The word containing `offset` (a UTF-8 offset into `text`).
+///
+/// # What was wrong before
+///
+/// The old table counted only `is_ascii_alphanumeric` as a word character, so
+/// `café` cut after `caf`, and **every Japanese word selected one character**
+/// (everything non-ASCII fell into one "other" bucket that refused to join
+/// itself). The two were the same bug seen from two sides.
+///
+/// # Why not UAX#29
+///
+/// `unicode-segmentation` was the obvious answer and it is already in the
+/// tree, but it turned out to be both too little and too much:
+///
+/// - **Too little.** It splits Han and Hiragana one character at a time
+///   (`中文です` → `中`, `文`, `で`, `す`); only Katakana groups. For a
+///   double-click that is no better than what it replaced.
+/// - **Too much.** It joins `foo.bar` into one word (`.` is `MidNumLet`),
+///   which contradicts `word_separators` -- and the reader's list has to win,
+///   because that is the whole point of the setting.
+///
+/// So the rule is a run of one kind, where the kinds are: the separator list
+/// (always alone), whitespace, newline, each CJK script, and everything else
+/// (`is_alphanumeric() || '_'`). That last one is **the same set dopamine
+/// uses for hover, completion and whole-word search**.
+///
+/// It is not word segmentation: `食べた` stays whole rather than becoming
+/// `食べ` + `た`, because knowing that needs a dictionary. It is the useful
+/// approximation, and it is what an editor without one can honestly do.
+pub(super) fn word_range(text: &Rope, offset: usize, separators: &str) -> Option<Range<usize>> {
+    let offset = text.clip_offset(offset, Bias::Left);
+    let here = text.char_at(offset)?;
+    let kind = kind_of(here, separators);
+
+    // Punctuation, separators and newlines stand alone, as they always did.
+    if kind == Kind::Alone || kind == Kind::Newline {
+        return Some(offset..offset + here.len_utf8());
+    }
+
+    let (window, base) = window_around(text, offset);
+    let local = offset - base;
+
+    let mut start = local;
+    for c in window[..local].chars().rev() {
+        if kind_of(c, separators) != kind {
+            break;
+        }
+        start -= c.len_utf8();
+    }
+    let mut end = local;
+    for c in window[local..].chars() {
+        if kind_of(c, separators) != kind {
+            break;
+        }
+        end += c.len_utf8();
+    }
+    Some(base + start..base + end)
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ropey::Rope;
 
-    #[test]
-    fn test_char_type_from_char() {
-        assert_eq!(CharType::from('a'), CharType::Word);
-        assert_eq!(CharType::from('Z'), CharType::Word);
-        assert_eq!(CharType::from('0'), CharType::Word);
-        assert_eq!(CharType::from('_'), CharType::Word);
-        assert_eq!(CharType::from('.'), CharType::Other);
-        assert_eq!(CharType::from(','), CharType::Other);
-        assert_eq!(CharType::from(';'), CharType::Other);
-        assert_eq!(CharType::from('!'), CharType::Other);
-        assert_eq!(CharType::from('?'), CharType::Other);
-        assert_eq!(CharType::from('['), CharType::Other);
-        assert_eq!(CharType::from('{'), CharType::Other);
-        assert_eq!(CharType::from(' '), CharType::Whitespace);
-        assert_eq!(CharType::from('\t'), CharType::Whitespace);
-        assert_eq!(CharType::from('\u{00A0}'), CharType::Whitespace);
-        assert_eq!(CharType::from('\n'), CharType::Newline);
-        assert_eq!(CharType::from('\r'), CharType::Newline);
-        assert_eq!(CharType::from('汉'), CharType::Other);
-        assert_eq!(CharType::from('é'), CharType::Other);
+    #[track_caller]
+    fn word(text: &str, byte: usize) -> String {
+        let rope = Rope::from(text);
+        word_range(&rope, byte, DEFAULT_WORD_SEPARATORS)
+            .map(|r| rope.slice(r).to_string())
+            .unwrap_or_default()
     }
 
     #[test]
-    fn test_word_range() {
-        use indoc::indoc;
+    fn kinds_are_decided_by_script_not_by_ascii() {
+        let sep = DEFAULT_WORD_SEPARATORS;
+        assert_eq!(kind_of('a', sep), Kind::Word);
+        assert_eq!(kind_of('0', sep), Kind::Word);
+        assert_eq!(kind_of('_', sep), Kind::Word, "`_` は区切りではない");
+        assert_eq!(kind_of('é', sep), Kind::Word, "**ASCII だけではない**");
+        assert_eq!(kind_of('漢', sep), Kind::Han);
+        assert_eq!(kind_of('あ', sep), Kind::Hiragana);
+        assert_eq!(kind_of('ア', sep), Kind::Katakana);
+        assert_eq!(kind_of('.', sep), Kind::Alone);
+        assert_eq!(kind_of('-', sep), Kind::Alone);
+        assert_eq!(kind_of(' ', sep), Kind::Whitespace);
+        assert_eq!(kind_of('\n', sep), Kind::Newline);
+    }
 
-        let rope = Rope::from(indoc! {
-            r#"
-            test text:
-            abcde 中文🎉 test
-            hello[()]
-            test_connector ____
-            Rope
-            "#
-        });
+    /// **The bug this replaced**: `café` used to cut after `caf`.
+    #[test]
+    fn an_accented_word_is_one_word() {
+        assert_eq!(word("say café now", 4), "café");
+        assert_eq!(word("say café now", 7), "café", "é の上でも");
+        assert_eq!(word("naïve", 0), "naïve");
+    }
 
-        let tests = vec![
-            (0, 0, Some("test")),
-            (0, 4, Some(" ")),
-            (1, 0, Some("abcde")),
-            (1, 4, Some("abcde")),
-            (1, 5, Some(" ")),
-            (1, 6, Some("中")),
-            (1, 9, Some("文")),
-            (1, 13, Some("🎉")),
-            (1, 20, Some("test")),
-            (2, 5, Some("[")),
-            (2, 6, Some("(")),
-            (2, 7, Some(")")),
-            (2, 8, Some("]")),
-            (3, 5, Some("test_connector")),
-            (3, 14, Some(" ")),
-            (3, 16, Some("____")),
-            (4, 0, Some("Rope")),
-        ];
+    /// **The other half of the bug**: a Japanese word used to select one
+    /// character. Runs of one script group; the scripts do not mix.
+    #[test]
+    fn japanese_groups_by_script() {
+        // 中文です: Han run, then Hiragana run.
+        assert_eq!(word("中文です", 0), "中文");
+        assert_eq!(word("中文です", 3), "中文", "文 の上でも");
+        assert_eq!(word("中文です", 6), "です");
+        assert_eq!(word("カタカナ語", 0), "カタカナ");
+        assert_eq!(word("カタカナ語", 12), "語");
+    }
 
-        for (line, column, expected) in tests {
-            let line_start_offset = rope.line_start_offset(line);
-            let offset = line_start_offset + column;
-            let range = TextSelector::word_range(&rope, offset);
+    /// No dictionary: 食べた stays whole rather than 食べ + た.
+    #[test]
+    fn there_is_no_dictionary() {
+        assert_eq!(word("食べた", 0), "食");
+        assert_eq!(word("食べた", 3), "べた", "かなの連なり");
+    }
 
-            let actual = range.map(|r| rope.slice(r).to_string());
-            let expect = expected.map(|s| s.to_string());
-            assert_eq!(actual, expect, "line {}, column {}", line, column);
-        }
+    #[test]
+    fn identifiers_and_punctuation() {
+        assert_eq!(word("test_connector x", 0), "test_connector");
+        assert_eq!(word("fooBar_baz", 3), "fooBar_baz");
+        assert_eq!(word("a.b", 1), ".", "区切りは 1 文字で立つ");
+        assert_eq!(word("foo-bar", 3), "-");
+        assert_eq!(word("hello[()]", 5), "[");
+        assert_eq!(word("abc   def", 4), "   ", "空白は連なる");
+    }
+
+    /// The reader's list wins: drop `.` and `foo.bar` becomes one word.
+    #[test]
+    fn the_separator_list_decides() {
+        let rope = Rope::from("foo.bar baz");
+        let no_dot: String = DEFAULT_WORD_SEPARATORS.chars().filter(|c| *c != '.').collect();
+        let r = word_range(&rope, 0, &no_dot).unwrap();
+        assert_eq!(rope.slice(r).to_string(), "foo.bar");
+        // With the default list it still splits.
+        let r = word_range(&rope, 0, DEFAULT_WORD_SEPARATORS).unwrap();
+        assert_eq!(rope.slice(r).to_string(), "foo");
+    }
+
+    #[test]
+    fn a_newline_stands_alone() {
+        assert_eq!(word("ab\ncd", 2), "\n");
     }
 }
 
@@ -240,3 +314,4 @@ mod occurrence_tests {
         assert_eq!(occurrences("aa", "aaaa", 0, &(99..99)), vec![0..2, 2..4]);
     }
 }
+

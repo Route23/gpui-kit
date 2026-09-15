@@ -9,12 +9,14 @@ mod code_actions;
 mod completions;
 mod definitions;
 mod document_colors;
+mod document_highlights;
 mod hover;
 
 pub use code_actions::*;
 pub use completions::*;
 pub use definitions::*;
 pub use document_colors::*;
+pub use document_highlights::*;
 pub use hover::*;
 
 /// LSP ServerCapabilities
@@ -31,11 +33,15 @@ pub struct Lsp {
     pub definition_provider: Option<Rc<dyn DefinitionProvider>>,
     /// The document color provider.
     pub document_color_provider: Option<Rc<dyn DocumentColorProvider>>,
+    /// Where else the symbol under the caret appears.
+    pub document_highlight_provider: Option<Rc<dyn DocumentHighlightProvider>>,
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
+    document_highlights: Vec<(lsp_types::Range, HighlightKind)>,
     _hover_task: Task<Result<()>>,
     _hover_hide_task: Task<Result<()>>,
     _document_color_task: Task<Result<()>>,
+    _document_highlight_task: Task<Result<()>>,
 }
 
 impl Default for Lsp {
@@ -46,15 +52,23 @@ impl Default for Lsp {
             hover_provider: None,
             definition_provider: None,
             document_color_provider: None,
+            document_highlight_provider: None,
             document_colors: vec![],
+            document_highlights: vec![],
             _hover_task: Task::ready(Ok(())),
             _hover_hide_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(Ok(())),
+            _document_highlight_task: Task::ready(Ok(())),
         }
     }
 }
 
 impl Lsp {
+    /// Whether the server has answered with occurrences.
+    pub(crate) fn has_document_highlights(&self) -> bool {
+        !self.document_highlights.is_empty()
+    }
+
     /// Update the LSP when the text changes.
     pub(crate) fn update(
         &mut self,
@@ -63,6 +77,8 @@ impl Lsp {
         cx: &mut Context<InputState>,
     ) {
         self.update_document_colors(text, window, cx);
+        // The offsets the server gave are for the text before this edit.
+        self.clear_document_highlights();
     }
 
     /// Reset all LSP states.

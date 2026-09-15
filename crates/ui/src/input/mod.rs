@@ -6,6 +6,7 @@ mod comment;
 mod clear_button;
 mod cursor;
 mod element;
+mod expand;
 mod fold;
 mod indent;
 mod inlay;

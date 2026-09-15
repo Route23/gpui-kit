@@ -335,6 +335,12 @@ impl RenderOnce for Input {
                     .on_action(
                         window.listener_for(&self.state, InputState::on_action_go_to_definition),
                     )
+                    .on_action(
+                        window.listener_for(&self.state, InputState::on_action_expand_selection),
+                    )
+                    .on_action(
+                        window.listener_for(&self.state, InputState::on_action_shrink_selection),
+                    )
                     .on_action(window.listener_for(&self.state, InputState::on_action_toggle_fold))
                     .on_action(window.listener_for(&self.state, InputState::on_action_fold_all))
                     .on_action(window.listener_for(&self.state, InputState::on_action_unfold_all))

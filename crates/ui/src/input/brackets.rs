@@ -315,7 +315,7 @@ fn partner_of(
 }
 
 /// The innermost pair that encloses `offset`.
-fn enclosing(
+pub(super) fn enclosing(
     text: &Rope,
     offset: usize,
     pairs: &[Pair],

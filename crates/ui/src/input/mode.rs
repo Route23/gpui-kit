@@ -369,6 +369,14 @@ pub(crate) enum InputMode {
         search_behavior: super::search::SearchBehavior,
         /// Whether "go to definition" reports the target instead of acting.
         definitions_open_externally: bool,
+        /// Which characters never join a word (VS Code's `wordSeparators`).
+        word_separators: std::rc::Rc<str>,
+        /// Whether a double-click next to a bracket selects what it opens.
+        double_click_selects_block: bool,
+        /// Whether growing the selection stops at a piece of a word first.
+        smart_select_subwords: bool,
+        /// Whether growing the selection keeps the blank edges.
+        smart_select_whitespace: bool,
         /// Whether control characters get a visible box.
         render_control_characters: bool,
         /// Which suspicious characters get a visible box.
@@ -515,6 +523,10 @@ impl InputMode {
             search_seed_from_selection: true,
             search_behavior: super::search::SearchBehavior::default(),
             definitions_open_externally: false,
+            word_separators: super::selection::DEFAULT_WORD_SEPARATORS.into(),
+            double_click_selects_block: false,
+            smart_select_subwords: true,
+            smart_select_whitespace: false,
             render_control_characters: false,
             unicode_highlight: UnicodeHighlight::default(),
             unicode_allowed: "".into(),
@@ -915,6 +927,35 @@ impl InputMode {
             InputMode::CodeEditor { search_options, .. } => *search_options,
             _ => super::search::SearchOptions::default(),
         }
+    }
+
+    /// Which characters never join a word.
+    #[inline]
+    pub(super) fn word_separators(&self) -> std::rc::Rc<str> {
+        match self {
+            InputMode::CodeEditor {
+                word_separators, ..
+            } => word_separators.clone(),
+            _ => super::selection::DEFAULT_WORD_SEPARATORS.into(),
+        }
+    }
+
+    /// Whether a double-click next to a bracket selects what it opens.
+    #[inline]
+    pub(super) fn double_click_selects_block(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { double_click_selects_block: true, .. })
+    }
+
+    /// Whether growing the selection stops at a piece of a word first.
+    #[inline]
+    pub(super) fn smart_select_subwords(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { smart_select_subwords: true, .. })
+    }
+
+    /// Whether growing the selection keeps the blank edges.
+    #[inline]
+    pub(super) fn smart_select_whitespace(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { smart_select_whitespace: true, .. })
     }
 
     /// Whether control characters get a visible box.
@@ -1556,6 +1597,10 @@ search_options: crate::input::SearchOptions::default(),
             search_seed_from_selection: true,
             search_behavior: crate::input::SearchBehavior::default(),
             definitions_open_externally: false,
+            word_separators: crate::input::selection::DEFAULT_WORD_SEPARATORS.into(),
+            double_click_selects_block: false,
+            smart_select_subwords: true,
+            smart_select_whitespace: false,
             render_control_characters: false,
             unicode_highlight: crate::input::UnicodeHighlight::default(),
             unicode_allowed: "".into(),
