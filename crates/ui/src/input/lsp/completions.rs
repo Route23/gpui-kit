@@ -225,8 +225,9 @@ impl InputState {
                         return;
                     }
 
+                    let style = editor.mode.suggest_style();
                     _ = menu.update(cx, |menu, cx| {
-                        menu.show(new_offset, completions, window, cx);
+                        menu.show(new_offset, completions, style, window, cx);
                     });
 
                     cx.notify();

@@ -357,9 +357,14 @@ impl CompletionMenu {
         self.hide(cx);
     }
 
+    /// `accept` is `(Enter, commit character, Tab)`.
+    ///
+    /// **Handed in, not read.** This runs inside the editor's own update --
+    /// reading the editor here panics with "already being updated".
     pub(crate) fn handle_action(
         &mut self,
         action: Box<dyn Action>,
+        accept: (bool, bool, bool),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -367,7 +372,7 @@ impl CompletionMenu {
             return false;
         }
 
-        let (on_enter, _, on_tab) = self.editor.read(cx).mode.accept_suggestion_with();
+        let (on_enter, _, on_tab) = accept;
 
         cx.propagate();
         if action.partial_eq(&input::Enter { secondary: false }) {
@@ -436,17 +441,19 @@ impl CompletionMenu {
         self.query = query.into();
     }
 
+    /// **`style` is handed in, not read.** This runs inside the editor's own
+    /// update, and reading the editor there panics.
     pub(crate) fn show(
         &mut self,
         offset: usize,
         items: impl Into<Vec<CompletionItem>>,
+        style: crate::input::SuggestStyle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let items = items.into();
         self.offset = offset;
         self.open = true;
-        let style = self.editor.read(cx).mode.suggest_style();
         self.list.update(cx, |this, cx| {
             this.delegate_mut().set_style(style);
             let longest_ix = items

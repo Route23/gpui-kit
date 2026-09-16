@@ -126,11 +126,14 @@ impl InputState {
         };
 
         let mut handled = false;
+        // Read before handing the menu the update: this runs inside the
+        // editor's own, and the menu cannot read back into it (#246).
+        let accept = self.mode.accept_suggestion_with();
 
         match menu {
             ContextMenu::Completion(menu) => {
                 _ = menu.update(cx, |menu, cx| {
-                    handled = menu.handle_action(action, window, cx)
+                    handled = menu.handle_action(action, accept, window, cx)
                 });
             }
             ContextMenu::CodeAction(menu) => {
