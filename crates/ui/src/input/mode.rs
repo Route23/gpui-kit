@@ -299,6 +299,36 @@ impl WhitespaceMap {
     }
 }
 
+use super::scrollbar_marks::ScrollbarMarks;
+
+/// How far past the last line the view may scroll (#252).
+///
+/// Mirrors VS Code's `editor.scrollBeyondLastLine` and Zed's
+/// `scroll_beyond_last_line`, which takes a number as well.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ScrollBeyondLastLine {
+    /// The last line stops at the bottom edge.
+    Off,
+    /// Half the viewport, or three rows, whichever is more. **The old
+    /// behaviour** -- the fork had this hard-coded before it was a setting.
+    #[default]
+    Half,
+    /// A whole viewport.
+    Page,
+    /// This many rows.
+    Rows(u16),
+}
+
+/// Where a sticky-scroll header comes from (#252).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StickyModel {
+    /// Indentation, via the same walk that decides what folds.
+    Indentation,
+    /// The ranges a language server sent (`textDocument/foldingRange`).
+    #[default]
+    Folding,
+}
+
 /// Which suspicious characters get a mark.
 ///
 /// Mirrors VS Code's `editor.unicodeHighlight.*`, collapsed to one choice
@@ -496,6 +526,41 @@ pub(crate) enum InputMode {
         indent_list_on_tab: bool,
         /// The characters whitespace marks are drawn with.
         whitespace_map: WhitespaceMap,
+        /// How far past the last line the view may scroll.
+        scroll_beyond_last_line: ScrollBeyondLastLine,
+        /// How many columns past the longest line the view may scroll.
+        scroll_beyond_last_column: u16,
+        /// How many columns of context to keep left and right of the caret.
+        horizontal_scroll_margin: u16,
+        /// Whether a jump to a new place slides instead of cutting.
+        smooth_scrolling: bool,
+        /// Whether a diagonal wheel gesture moves on one axis only.
+        scroll_predominant_axis: bool,
+        /// Wheel multiplier, in percent.
+        scroll_sensitivity: u16,
+        /// Wheel multiplier while ⌥ is held, in percent.
+        fast_scroll_sensitivity: u16,
+        /// Whether ⌘ + wheel asks the host to change the font size.
+        mouse_wheel_zoom: bool,
+        /// When the bar shows; `None` takes the theme's setting.
+        scrollbar_show: Option<crate::scroll::ScrollbarShow>,
+        /// Whether each axis gets a bar.
+        scrollbar_vertical: bool,
+        scrollbar_horizontal: bool,
+        /// How thick the scrollbar is, in px. `0` takes the built-in width.
+        scrollbar_size: u16,
+        /// Whether the track gets a border down its side.
+        scrollbar_border: bool,
+        /// Whether clicking the track pages instead of jumping.
+        scrollbar_scroll_by_page: bool,
+        /// Which marks are painted in the scrollbar track.
+        scrollbar_marks: ScrollbarMarks,
+        /// Whether the sticky header is drawn, and how tall it may get.
+        sticky_scroll: bool,
+        sticky_scroll_max_lines: u16,
+        sticky_scroll_model: StickyModel,
+        /// Whether the sticky header slides with horizontal scrolling.
+        sticky_scroll_with_editor: bool,
         /// Whether every other run of the selected text is marked too.
         selection_highlight: bool,
         /// How long the selection may be and still do that, in characters.
@@ -661,6 +726,25 @@ impl InputMode {
             surrounding_lines_style: SurroundingLinesStyle::default(),
             autoscroll_on_clicks: false,
             caret_animation: CaretAnimation::default(),
+            scroll_beyond_last_line: ScrollBeyondLastLine::default(),
+            scroll_beyond_last_column: 0,
+            horizontal_scroll_margin: 0,
+            smooth_scrolling: false,
+            scroll_predominant_axis: false,
+            scroll_sensitivity: 100,
+            fast_scroll_sensitivity: 500,
+            mouse_wheel_zoom: false,
+            scrollbar_show: None,
+            scrollbar_vertical: true,
+            scrollbar_horizontal: true,
+            scrollbar_size: 0,
+            scrollbar_border: false,
+            scrollbar_scroll_by_page: false,
+            scrollbar_marks: ScrollbarMarks::default(),
+            sticky_scroll: false,
+            sticky_scroll_max_lines: 5,
+            sticky_scroll_model: StickyModel::default(),
+            sticky_scroll_with_editor: true,
             indent_guide_active: false,
             indent_guide_width: 1.,
             indent_guide_active_width: 1.,
@@ -1061,6 +1145,143 @@ impl InputMode {
     #[inline]
     pub(super) fn smart_select_whitespace(&self) -> bool {
         matches!(self, InputMode::CodeEditor { smart_select_whitespace: true, .. })
+    }
+
+    /// How far past the last line the view may scroll.
+    #[inline]
+    pub(super) fn scroll_beyond_last_line(&self) -> ScrollBeyondLastLine {
+        match self {
+            InputMode::CodeEditor { scroll_beyond_last_line, .. } => *scroll_beyond_last_line,
+            _ => ScrollBeyondLastLine::Off,
+        }
+    }
+
+    /// Columns past the longest line, and context kept beside the caret.
+    #[inline]
+    pub(super) fn scroll_margins(&self) -> (u16, u16) {
+        match self {
+            InputMode::CodeEditor {
+                scroll_beyond_last_column,
+                horizontal_scroll_margin,
+                ..
+            } => (*scroll_beyond_last_column, *horizontal_scroll_margin),
+            _ => (0, 0),
+        }
+    }
+
+    /// Whether a jump slides instead of cutting.
+    #[inline]
+    pub(super) fn smooth_scrolling(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { smooth_scrolling: true, .. })
+    }
+
+    /// Whether a diagonal gesture moves on one axis only.
+    #[inline]
+    pub(super) fn scroll_predominant_axis(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { scroll_predominant_axis: true, .. })
+    }
+
+    /// Wheel multipliers as fractions: (normal, while ⌥ is held).
+    #[inline]
+    pub(super) fn scroll_sensitivity(&self) -> (f32, f32) {
+        match self {
+            InputMode::CodeEditor {
+                scroll_sensitivity,
+                fast_scroll_sensitivity,
+                ..
+            } => (
+                f32::from(*scroll_sensitivity) / 100.,
+                f32::from(*fast_scroll_sensitivity) / 100.,
+            ),
+            _ => (1., 5.),
+        }
+    }
+
+    /// Whether ⌘ + wheel asks the host to change the font size.
+    #[inline]
+    pub(super) fn mouse_wheel_zoom(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { mouse_wheel_zoom: true, .. })
+    }
+
+    /// Which axes get a bar, or `None` to leave the default alone.
+    #[inline]
+    pub(super) fn scrollbar_axes(&self) -> Option<crate::scroll::ScrollbarAxis> {
+        let InputMode::CodeEditor {
+            scrollbar_vertical,
+            scrollbar_horizontal,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(match (*scrollbar_vertical, *scrollbar_horizontal) {
+            (true, true) => crate::scroll::ScrollbarAxis::Both,
+            (true, false) => crate::scroll::ScrollbarAxis::Vertical,
+            (false, true) => crate::scroll::ScrollbarAxis::Horizontal,
+            // Neither axis: `Hidden` below takes the bar away entirely.
+            (false, false) => crate::scroll::ScrollbarAxis::Vertical,
+        })
+    }
+
+    /// When the bar shows, or `None` to take the theme's setting.
+    #[inline]
+    pub(super) fn scrollbar_show(&self) -> Option<crate::scroll::ScrollbarShow> {
+        let InputMode::CodeEditor {
+            scrollbar_show,
+            scrollbar_vertical,
+            scrollbar_horizontal,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if !*scrollbar_vertical && !*scrollbar_horizontal {
+            return Some(crate::scroll::ScrollbarShow::Hidden);
+        }
+        *scrollbar_show
+    }
+
+    /// (thickness in px or 0, border, page on track click).
+    #[inline]
+    pub(super) fn scrollbar_style(&self) -> (u16, bool, bool) {
+        match self {
+            InputMode::CodeEditor {
+                scrollbar_size,
+                scrollbar_border,
+                scrollbar_scroll_by_page,
+                ..
+            } => (*scrollbar_size, *scrollbar_border, *scrollbar_scroll_by_page),
+            _ => (0, false, false),
+        }
+    }
+
+    /// Which marks are painted in the scrollbar track.
+    #[inline]
+    pub(super) fn scrollbar_marks(&self) -> ScrollbarMarks {
+        match self {
+            InputMode::CodeEditor { scrollbar_marks, .. } => *scrollbar_marks,
+            _ => ScrollbarMarks::default(),
+        }
+    }
+
+    /// (on, max rows, where headers come from, follows horizontal scrolling).
+    #[inline]
+    pub(super) fn sticky_scroll(&self) -> (bool, usize, StickyModel, bool) {
+        match self {
+            InputMode::CodeEditor {
+                sticky_scroll,
+                sticky_scroll_max_lines,
+                sticky_scroll_model,
+                sticky_scroll_with_editor,
+                ..
+            } => (
+                *sticky_scroll,
+                *sticky_scroll_max_lines as usize,
+                *sticky_scroll_model,
+                *sticky_scroll_with_editor,
+            ),
+            _ => (false, 0, StickyModel::Folding, true),
+        }
     }
 
     /// Whether the caret's indent level is drawn differently.
@@ -1698,7 +1919,8 @@ mod tests {
         highlighter::DiagnosticSet,
         input::{
             AutoClose, AutoIndent, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle,
-            GuideBackground, GuideColoring, MatchBrackets, WhitespaceMap,
+            GuideBackground, GuideColoring, MatchBrackets, ScrollBeyondLastLine, ScrollbarMarks,
+            StickyModel, WhitespaceMap,
             SurroundingLinesStyle, TabSize,
             mode::{
                 DEFAULT_INLINE_DIAGNOSTIC_PADDING, DEFAULT_MAX_FOLD_REGIONS,
@@ -1857,6 +2079,25 @@ search_options: crate::input::SearchOptions::default(),
             surrounding_lines_style: SurroundingLinesStyle::Always,
             autoscroll_on_clicks: true,
             caret_animation: CaretAnimation::On,
+            scroll_beyond_last_line: ScrollBeyondLastLine::Half,
+            scroll_beyond_last_column: 0,
+            horizontal_scroll_margin: 0,
+            smooth_scrolling: false,
+            scroll_predominant_axis: false,
+            scroll_sensitivity: 100,
+            fast_scroll_sensitivity: 500,
+            mouse_wheel_zoom: false,
+            scrollbar_show: None,
+            scrollbar_vertical: true,
+            scrollbar_horizontal: true,
+            scrollbar_size: 0,
+            scrollbar_border: false,
+            scrollbar_scroll_by_page: false,
+            scrollbar_marks: ScrollbarMarks::default(),
+            sticky_scroll: false,
+            sticky_scroll_max_lines: 5,
+            sticky_scroll_model: StickyModel::Folding,
+            sticky_scroll_with_editor: true,
             indent_guide_active: false,
             indent_guide_width: 1.,
             indent_guide_active_width: 1.,

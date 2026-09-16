@@ -22,6 +22,7 @@ mod otp_input;
 pub(crate) mod popovers;
 mod rope_ext;
 mod rulers;
+mod scrollbar_marks;
 mod links;
 mod list;
 mod search;
@@ -30,6 +31,7 @@ mod tags;
 mod text_wrapper;
 mod whitespace;
 mod selection;
+mod sticky;
 
 pub(crate) use clear_button::*;
 pub use caret::{
@@ -49,8 +51,9 @@ pub use inline_diag::InlineDiagnostic;
 pub use mode::{
     UnicodeHighlight,
     AutoIndent, FoldingControls, GuideBackground, GuideColoring, InlayModifier, LineHighlight,
-    LineNumbers, RenderWhitespace, WhitespaceMap, WrapAt,
+    LineNumbers, RenderWhitespace, ScrollBeyondLastLine, StickyModel, WhitespaceMap, WrapAt,
 };
+pub use scrollbar_marks::{MarkSeverity, ScrollbarMarks};
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};
 pub use otp_input::*;
 pub use state::*;

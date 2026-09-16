@@ -1211,7 +1211,7 @@ where
                 .top(self.options.size.table_row_height())
                 .right_0()
                 .bottom_0()
-                .w(Scrollbar::width())
+                .w(Scrollbar::default_width())
                 .child(Scrollbar::vertical(&self.vertical_scroll_handle).max_fps(60)),
         )
     }
@@ -1227,7 +1227,7 @@ where
             .left(self.fixed_head_cols_bounds.size.width)
             .right_0()
             .bottom_0()
-            .h(Scrollbar::width())
+            .h(Scrollbar::default_width())
             .child(Scrollbar::horizontal(&self.horizontal_scroll_handle))
     }
 }

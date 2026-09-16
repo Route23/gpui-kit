@@ -210,11 +210,27 @@ impl Input {
                         height: state.scroll_size.height,
                     };
 
-                    let scrollbar = if !state.soft_wrap {
+                    let mut scrollbar = if !state.soft_wrap {
                         Scrollbar::new(&state.scroll_handle)
                     } else {
                         Scrollbar::vertical(&state.scroll_handle)
                     };
+                    // Which axes get a bar, how thick, and what is painted in
+                    // the track (#252).
+                    if let Some(axis) = state.mode.scrollbar_axes() {
+                        scrollbar = scrollbar.axis(axis);
+                    }
+                    if let Some(show) = state.mode.scrollbar_show() {
+                        scrollbar = scrollbar.scrollbar_show(show);
+                    }
+                    let (size_px, border, by_page) = state.mode.scrollbar_style();
+                    if size_px > 0 {
+                        scrollbar = scrollbar.width(px(f32::from(size_px)));
+                    }
+                    scrollbar = scrollbar
+                        .border(border)
+                        .scroll_by_page(by_page)
+                        .marks(state.track_marks(_cx));
 
                     this.relative().child(
                         div()

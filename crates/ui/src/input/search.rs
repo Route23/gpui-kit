@@ -453,6 +453,11 @@ impl InputState {
 }
 
 impl SearchPanel {
+    /// What the panel has found, for the scrollbar marks (#252).
+    pub(super) fn matched_ranges(&self) -> Rc<Vec<Range<usize>>> {
+        self.matcher.matched_ranges.clone()
+    }
+
     pub fn new(
         editor: Entity<InputState>,
         options: SearchOptions,

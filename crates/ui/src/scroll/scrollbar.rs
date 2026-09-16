@@ -29,6 +29,9 @@ const THUMB_ACTIVE_WIDTH: Pixels = px(8.);
 const THUMB_ACTIVE_RADIUS: Pixels = px(8. / 2.);
 const THUMB_ACTIVE_INSET: Pixels = px(4.);
 
+/// How tall a mark in the track is (#252).
+const MARK_HEIGHT: Pixels = px(2.);
+
 const FADE_OUT_DURATION: f32 = 3.0;
 const FADE_OUT_DELAY: f32 = 2.0;
 
@@ -42,6 +45,8 @@ pub enum ScrollbarShow {
     Hover,
     /// Always show scrollbar.
     Always,
+    /// Never show it. The area still scrolls -- only the bar is gone.
+    Hidden,
 }
 
 impl ScrollbarShow {
@@ -51,6 +56,10 @@ impl ScrollbarShow {
 
     fn is_always(&self) -> bool {
         matches!(self, Self::Always)
+    }
+
+    fn is_hidden(&self) -> bool {
+        matches!(self, Self::Hidden)
     }
 }
 
@@ -306,6 +315,19 @@ impl ScrollbarAxis {
     }
 }
 
+/// A mark painted in the scrollbar track (#252).
+///
+/// **The scrollbar does not know what a mark means.** The caller decides
+/// what deserves one -- a match, a diagnostic, the caret -- and hands over
+/// a position and a colour. Mirrors VS Code's overview ruler and Zed's
+/// `scrollbar.*` flags, which is why those live where the text does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarMark {
+    /// Where in the content, 0.0 at the top and 1.0 at the bottom.
+    pub at: f32,
+    pub color: Hsla,
+}
+
 /// Scrollbar control for scroll-area or a uniform-list.
 pub struct Scrollbar {
     pub(crate) id: ElementId,
@@ -318,6 +340,14 @@ pub struct Scrollbar {
     /// This is used to limit the update rate of the scrollbar when it is
     /// being dragged for some complex interactions for reducing CPU usage.
     max_fps: usize,
+    /// How thick the bar is, in px. `None` takes the built-in width.
+    width: Option<Pixels>,
+    /// Whether a border is drawn down the side of the track.
+    border: bool,
+    /// Whether clicking the track pages instead of jumping to the spot.
+    scroll_by_page: bool,
+    /// Marks painted in the vertical track.
+    marks: Vec<ScrollbarMark>,
 }
 
 impl Scrollbar {
@@ -334,6 +364,10 @@ impl Scrollbar {
             scroll_handle: Rc::new(scroll_handle.clone()),
             max_fps: 120,
             scroll_size: None,
+            width: None,
+            border: false,
+            scroll_by_page: false,
+            marks: Vec::new(),
         }
     }
 
@@ -377,6 +411,32 @@ impl Scrollbar {
         self
     }
 
+    /// How thick the bar is, in px (#252). Default is the built-in width.
+    pub fn width(mut self, width: Pixels) -> Self {
+        self.width = Some(width);
+        self
+    }
+
+    /// Draw a border down the side of the track (#252,
+    /// VS Code's `editor.overviewRulerBorder`).
+    pub fn border(mut self, border: bool) -> Self {
+        self.border = border;
+        self
+    }
+
+    /// Clicking the track moves by one page instead of jumping to the spot
+    /// (#252, VS Code's `editor.scrollbar.scrollByPage`).
+    pub fn scroll_by_page(mut self, by_page: bool) -> Self {
+        self.scroll_by_page = by_page;
+        self
+    }
+
+    /// Marks painted in the vertical track (#252).
+    pub fn marks(mut self, marks: Vec<ScrollbarMark>) -> Self {
+        self.marks = marks;
+        self
+    }
+
     /// Set maximum frames per second for scrolling by drag. Default is 120 FPS.
     ///
     /// If you have very high CPU usage, consider reducing this value to improve performance.
@@ -387,9 +447,14 @@ impl Scrollbar {
         self
     }
 
-    // Get the width of the scrollbar.
-    pub(crate) const fn width() -> Pixels {
+    /// The built-in width of the scrollbar.
+    pub(crate) const fn default_width() -> Pixels {
         WIDTH
+    }
+
+    /// The width this bar actually uses.
+    fn bar_width(&self) -> Pixels {
+        self.width.unwrap_or(WIDTH)
     }
 
     fn style_for_active(cx: &App) -> (Hsla, Hsla, Hsla, Pixels, Pixels, Pixels) {
@@ -581,30 +646,24 @@ impl Element for Scrollbar {
                 * (container_size - margin_end - thumb_length));
             let thumb_end = (thumb_start + thumb_length).min(container_size - margin_end);
 
+            let w = self.bar_width();
             let bounds = Bounds {
                 origin: if is_vertical {
-                    point(hitbox.origin.x + hitbox.size.width - WIDTH, hitbox.origin.y)
+                    point(hitbox.origin.x + hitbox.size.width - w, hitbox.origin.y)
                 } else {
-                    point(
-                        hitbox.origin.x,
-                        hitbox.origin.y + hitbox.size.height - WIDTH,
-                    )
+                    point(hitbox.origin.x, hitbox.origin.y + hitbox.size.height - w)
                 },
                 size: gpui::Size {
-                    width: if is_vertical {
-                        WIDTH
-                    } else {
-                        hitbox.size.width
-                    },
-                    height: if is_vertical {
-                        hitbox.size.height
-                    } else {
-                        WIDTH
-                    },
+                    width: if is_vertical { w } else { hitbox.size.width },
+                    height: if is_vertical { hitbox.size.height } else { w },
                 },
             };
 
             let scrollbar_show = self.scrollbar_show.unwrap_or(cx.theme().scrollbar_show);
+            // `Hidden` keeps the area scrollable and takes the bar away (#252).
+            if scrollbar_show.is_hidden() {
+                continue;
+            }
             let is_always_to_show = scrollbar_show.is_always();
             let is_hover_to_show = scrollbar_show.is_hover();
             let is_hovered_on_bar = state.get().hovered_axis == Some(axis);
@@ -673,13 +732,13 @@ impl Element for Scrollbar {
                 Bounds::from_corner_and_size(
                     Corner::TopRight,
                     bounds.top_right() + point(-inset, inset + thumb_start),
-                    size(WIDTH, thumb_length),
+                    size(self.bar_width(), thumb_length),
                 )
             } else {
                 Bounds::from_corner_and_size(
                     Corner::BottomLeft,
                     bounds.bottom_left() + point(inset + thumb_start, -inset),
-                    size(thumb_length, WIDTH),
+                    size(thumb_length, self.bar_width()),
                 )
             };
 
@@ -771,6 +830,7 @@ impl Element for Scrollbar {
                     let thumb_size = state.thumb_size;
                     let margin_end = state.margin_end;
                     let is_vertical = axis.is_vertical();
+                    let scroll_by_page = self.scroll_by_page;
 
                     window.set_cursor_style(CursorStyle::default(), &state.bar_hitbox);
 
@@ -799,6 +859,41 @@ impl Element for Scrollbar {
                             border_color: state.border,
                             border_style: BorderStyle::default(),
                         });
+
+                        // Marks go under the thumb: the thumb is where you
+                        // are, the marks are where things are (#252).
+                        if is_vertical && !self.marks.is_empty() {
+                            let h = bounds.size.height;
+                            for mark in &self.marks {
+                                let y = bounds.origin.y + h * mark.at.clamp(0., 1.);
+                                cx.paint_quad(fill(
+                                    Bounds::new(
+                                        point(bounds.origin.x, y - MARK_HEIGHT / 2.),
+                                        size(bounds.size.width, MARK_HEIGHT),
+                                    ),
+                                    mark.color,
+                                ));
+                            }
+                        }
+
+                        // A line down the side of the track, so the marks read
+                        // as a ruler rather than as flecks on the text.
+                        if self.border {
+                            let x = if is_vertical {
+                                bounds.origin.x
+                            } else {
+                                bounds.origin.x
+                            };
+                            let line = if is_vertical {
+                                Bounds::new(point(x, bounds.origin.y), size(px(1.), bounds.size.height))
+                            } else {
+                                Bounds::new(
+                                    point(bounds.origin.x, bounds.origin.y),
+                                    size(bounds.size.width, px(1.)),
+                                )
+                            };
+                            cx.paint_quad(fill(line, state.border));
+                        }
 
                         cx.paint_quad(
                             fill(state.thumb_fill_bounds, state.thumb_bg).corner_radii(radius),
@@ -842,9 +937,35 @@ impl Element for Scrollbar {
 
                                         cx.notify(view_id);
                                     } else {
+                                        let offset = scroll_handle.offset();
+                                        // One page towards the click, instead
+                                        // of jumping to it (#252).
+                                        if scroll_by_page {
+                                            let page = container_size;
+                                            let before = if is_vertical {
+                                                event.position.y < thumb_bounds.origin.y
+                                            } else {
+                                                event.position.x < thumb_bounds.origin.x
+                                            };
+                                            let step = if before { page } else { -page };
+                                            let next = if is_vertical {
+                                                point(
+                                                    offset.x,
+                                                    (offset.y + step)
+                                                        .clamp(safe_range.start, safe_range.end),
+                                                )
+                                            } else {
+                                                point(
+                                                    (offset.x + step)
+                                                        .clamp(safe_range.start, safe_range.end),
+                                                    offset.y,
+                                                )
+                                            };
+                                            scroll_handle.set_offset(next);
+                                            return;
+                                        }
                                         // click on the scrollbar, jump to the position
                                         // Set the thumb bar center to the click position
-                                        let offset = scroll_handle.offset();
                                         let percentage = if is_vertical {
                                             (event.position.y - thumb_size / 2. - bounds.origin.y)
                                                 / (bounds.size.height - thumb_size)

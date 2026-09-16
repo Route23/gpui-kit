@@ -38,7 +38,7 @@ const BOTTOM_MARGIN_ROWS: usize = 3;
 /// extend a glyph's width to the right of it.
 pub(super) const RIGHT_MARGIN: Pixels = px(WIDTH_OF_SCROLLBAR + 8.);
 
-/// `crate::scroll::Scrollbar::width()`, which is not reachable from a `const`
+/// `crate::scroll::Scrollbar::default_width()`, which is not reachable from a `const`
 /// initialiser. Kept next to the margin so the two cannot drift apart.
 const WIDTH_OF_SCROLLBAR: f32 = 4. * 2. + 8.;
 /// Trace `points` as a closed polygon with its corners rounded by `radius`.
@@ -1358,6 +1358,7 @@ pub(super) struct PrepaintState {
     hover_definition_hitbox: Option<Hitbox>,
     link_hitbox: Option<Hitbox>,
     document_highlight_paths: Vec<(Path<Pixels>, Hsla)>,
+    sticky_lines: Vec<super::sticky::StickyLine>,
     indent_guide_paths: Vec<(Path<Pixels>, Hsla)>,
     indent_guide_bands: Vec<(Bounds<Pixels>, Hsla)>,
     rulers_path: Option<Path<Pixels>>,
@@ -1689,22 +1690,39 @@ impl Element for TextElement {
         let ghost_lines_height = ghost_line_count as f32 * line_height;
 
         let total_wrapped_lines = state.text_wrapper.len();
+        // How far past the last line the view may scroll (#252). `Half` is
+        // what this was before it became a setting.
         let empty_bottom_height = if state.mode.is_code_editor() {
-            bounds
-                .size
-                .height
-                .half()
-                .max(BOTTOM_MARGIN_ROWS * line_height)
+            match state.mode.scroll_beyond_last_line() {
+                super::mode::ScrollBeyondLastLine::Off => px(0.),
+                super::mode::ScrollBeyondLastLine::Half => bounds
+                    .size
+                    .height
+                    .half()
+                    .max(BOTTOM_MARGIN_ROWS * line_height),
+                super::mode::ScrollBeyondLastLine::Page => bounds.size.height,
+                super::mode::ScrollBeyondLastLine::Rows(n) => f32::from(n) * line_height,
+            }
         } else {
             px(0.)
         };
 
-        let scroll_size = size(
-            if longest_line_width + line_number_width + RIGHT_MARGIN > bounds.size.width {
-                longest_line_width + line_number_width + RIGHT_MARGIN
+        // Columns past the longest line (#252, `scrollBeyondLastColumn`).
+        let beyond_column = {
+            let n = state.mode.scroll_margins().0;
+            if n == 0 {
+                px(0.)
             } else {
-                longest_line_width
-            },
+                self.measure_indent_width(&text_style, usize::from(n), window)
+            }
+        };
+        let scroll_size = size(
+            beyond_column
+                + if longest_line_width + line_number_width + RIGHT_MARGIN > bounds.size.width {
+                    longest_line_width + line_number_width + RIGHT_MARGIN
+                } else {
+                    longest_line_width
+                },
             (total_wrapped_lines as f32 * line_height
                 + empty_bottom_height
                 + ghost_lines_height
@@ -1836,6 +1854,7 @@ impl Element for TextElement {
 
         let hover_definition_hitbox = self.layout_hover_definition_hitbox(state, window, cx);
         let link_hitbox = self.layout_link_hitbox(state, window, cx);
+        let sticky_lines = self.layout_sticky(state, &last_layout, &text_style, window);
         let (indent_guide_paths, indent_guide_bands) =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window, cx);
         let rulers_path = Self::layout_rulers(
@@ -1884,6 +1903,7 @@ impl Element for TextElement {
             link_hitbox,
             document_highlight_paths,
             document_color_paths,
+            sticky_lines,
             indent_guide_paths,
             indent_guide_bands,
             rulers_path,
@@ -2224,6 +2244,27 @@ impl Element for TextElement {
             }
         }
 
+        // Pinned headers go over the text and under the caret (#252).
+        if !prepaint.sticky_lines.is_empty() {
+            let state = self.state.read(cx);
+            let follow = state.mode.sticky_scroll().3;
+            let scroll_x = state.scroll_handle.offset().x;
+            let line_number_width = prepaint.last_layout.line_number_width;
+            Self::paint_sticky(
+                &prepaint.sticky_lines,
+                super::sticky::StickyGeometry {
+                    origin: bounds.origin,
+                    width: bounds.size.width,
+                    line_number_width,
+                    line_height,
+                    scroll_x,
+                    follow_scroll: follow,
+                },
+                window,
+                cx,
+            );
+        }
+
         // Paint whitespace marks on top of the glyphs they belong to.
         Self::paint_whitespaces(
             &prepaint.whitespaces,
@@ -2495,10 +2536,10 @@ mod tests {
     fn the_right_margin_clears_the_scrollbar() {
         assert_eq!(
             gpui::px(super::WIDTH_OF_SCROLLBAR),
-            crate::scroll::Scrollbar::width()
+            crate::scroll::Scrollbar::default_width()
         );
         assert!(
-            super::RIGHT_MARGIN > crate::scroll::Scrollbar::width(),
+            super::RIGHT_MARGIN > crate::scroll::Scrollbar::default_width(),
             "the caret would sit under the scrollbar"
         );
     }

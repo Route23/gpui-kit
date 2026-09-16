@@ -107,7 +107,7 @@ impl InputMode {
 
 impl TextElement {
     /// Measure the indent width in pixels for given column count.
-    fn measure_indent_width(&self, style: &TextStyle, column: usize, window: &Window) -> Pixels {
+    pub(super) fn measure_indent_width(&self, style: &TextStyle, column: usize, window: &Window) -> Pixels {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let layout = window.text_system().shape_line(
             SharedString::from(" ".repeat(column)),

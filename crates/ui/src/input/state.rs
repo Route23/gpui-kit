@@ -114,6 +114,12 @@ pub enum InputEvent {
     PressEnter { secondary: bool },
     Focus,
     Blur,
+    /// ⌘ + wheel asked for a bigger or smaller font (#252).
+    ///
+    /// Positive steps mean bigger. **`InputState` does not own the font
+    /// size** -- the host does, and in a multi-pane editor it is the one that
+    /// knows whether "bigger" means this pane or all of them.
+    ZoomDelta { steps: i32 },
     /// Text was pasted from the clipboard, covering `range` (byte offsets).
     ///
     /// [`InputEvent::Change`] alone cannot tell a paste from typing, and a
@@ -298,6 +304,9 @@ pub(super) struct CaretSlide {
     start: Instant,
 }
 
+/// How long a smooth jump takes (#252).
+const SCROLL_SLIDE: std::time::Duration = std::time::Duration::from_millis(120);
+
 #[derive(Clone)]
 pub(super) struct LastLayout {
     /// The visible range (no wrap) of lines in the viewport, the value is row (0-based) index.
@@ -448,6 +457,10 @@ pub struct InputState {
     /// Asking needs a `&mut Window`, and `move_to` has none -- so the ask is
     /// left for the next frame, which is also a free debounce for a drag.
     pub(super) pending_highlight: bool,
+    /// A scroll slide in flight: (from, to, when it started) (#252).
+    pub(super) scroll_slide: Option<(Point<Pixels>, Point<Pixels>, std::time::Instant)>,
+    /// Dropping this stops the slide.
+    pub(super) scroll_slide_task: Option<gpui::Task<()>>,
     /// Indent the editor itself put on a line, still untouched (#248).
     ///
     /// Set when Enter writes an indent and nothing else; taken back when the
@@ -557,6 +570,8 @@ impl InputState {
             _context_menu_task: Task::ready(Ok(())),
             _pending_update: false,
             pending_highlight: false,
+            scroll_slide: None,
+            scroll_slide_task: None,
             auto_ws: None,
             inline_completion: InlineCompletion::default(),
         }
@@ -752,6 +767,124 @@ impl InputState {
             *double_click_selects_block = double_click_block;
             *smart_select_subwords = subwords;
             *smart_select_whitespace = whitespace;
+        }
+        self
+    }
+
+    /// How far past the text the view may scroll, and how much context is
+    /// kept beside the caret (#252).
+    pub fn scroll_bounds(
+        mut self,
+        beyond_last_line: super::mode::ScrollBeyondLastLine,
+        beyond_last_column: u16,
+        horizontal_margin: u16,
+    ) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            scroll_beyond_last_line,
+            scroll_beyond_last_column,
+            horizontal_scroll_margin,
+            ..
+        } = &mut self.mode
+        {
+            *scroll_beyond_last_line = beyond_last_line;
+            *scroll_beyond_last_column = beyond_last_column;
+            *horizontal_scroll_margin = horizontal_margin;
+        }
+        self
+    }
+
+    /// How the wheel and a jump behave (#252).
+    ///
+    /// Sensitivities are percentages; 100 leaves the wheel alone.
+    pub fn scroll_motion(
+        mut self,
+        smooth: bool,
+        predominant_axis: bool,
+        sensitivity: u16,
+        fast_sensitivity: u16,
+        wheel_zoom: bool,
+    ) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            smooth_scrolling,
+            scroll_predominant_axis,
+            scroll_sensitivity,
+            fast_scroll_sensitivity,
+            mouse_wheel_zoom,
+            ..
+        } = &mut self.mode
+        {
+            *smooth_scrolling = smooth;
+            *scroll_predominant_axis = predominant_axis;
+            *scroll_sensitivity = sensitivity;
+            *fast_scroll_sensitivity = fast_sensitivity;
+            *mouse_wheel_zoom = wheel_zoom;
+        }
+        self
+    }
+
+    /// How the scrollbar looks (#252). `size_px` of 0 keeps the built-in width.
+    pub fn scrollbar_style(
+        mut self,
+        show: Option<crate::scroll::ScrollbarShow>,
+        vertical: bool,
+        horizontal: bool,
+        size_px: u16,
+        border: bool,
+        by_page: bool,
+    ) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            scrollbar_show,
+            scrollbar_vertical,
+            scrollbar_horizontal,
+            scrollbar_size,
+            scrollbar_border,
+            scrollbar_scroll_by_page,
+            ..
+        } = &mut self.mode
+        {
+            *scrollbar_show = show;
+            *scrollbar_vertical = vertical;
+            *scrollbar_horizontal = horizontal;
+            *scrollbar_size = size_px;
+            *scrollbar_border = border;
+            *scrollbar_scroll_by_page = by_page;
+        }
+        self
+    }
+
+    /// Which marks the scrollbar track carries (#252).
+    pub fn scrollbar_marks(mut self, marks: super::ScrollbarMarks) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { scrollbar_marks, .. } = &mut self.mode {
+            *scrollbar_marks = marks;
+        }
+        self
+    }
+
+    /// The headers pinned above the text (#252).
+    pub fn sticky_scroll(
+        mut self,
+        on: bool,
+        max_lines: u16,
+        model: super::mode::StickyModel,
+        with_editor: bool,
+    ) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            sticky_scroll,
+            sticky_scroll_max_lines,
+            sticky_scroll_model,
+            sticky_scroll_with_editor,
+            ..
+        } = &mut self.mode
+        {
+            *sticky_scroll = on;
+            *sticky_scroll_max_lines = max_lines;
+            *sticky_scroll_model = model;
+            *sticky_scroll_with_editor = with_editor;
         }
         self
     }
@@ -2916,7 +3049,37 @@ impl InputState {
             .as_ref()
             .map(|layout| layout.line_height)
             .unwrap_or(window.line_height());
-        let delta = event.delta.pixel_delta(line_height);
+        let mut delta = event.delta.pixel_delta(line_height);
+
+        // ⌘ + wheel is not scrolling: the host decides what "bigger" means
+        // (#252). `InputState` does not own the font size.
+        if self.mode.mouse_wheel_zoom() && event.modifiers.platform {
+            let steps = (delta.y / line_height).round() as i32;
+            if steps != 0 {
+                cx.emit(InputEvent::ZoomDelta { steps });
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        // Wheel multipliers (#252). ⌥ is the "go faster" modifier both
+        // VS Code and Zed use.
+        let (normal, fast) = self.mode.scroll_sensitivity();
+        let factor = if event.modifiers.alt { fast } else { normal };
+        if (factor - 1.).abs() > f32::EPSILON {
+            delta.x *= factor;
+            delta.y *= factor;
+        }
+
+        // A diagonal gesture moves on one axis only (#252). Trackpads make
+        // perfectly straight gestures hard; this decides for the reader.
+        if self.mode.scroll_predominant_axis() {
+            if delta.y.abs() >= delta.x.abs() {
+                delta.x = px(0.);
+            } else {
+                delta.y = px(0.);
+            }
+        }
 
         let old_offset = self.scroll_handle.offset();
         self.update_scroll_offset(Some(old_offset + delta), cx);
@@ -2995,11 +3158,15 @@ impl InputState {
                 let bounds_width = bounds.size.width - last_layout.line_number_width;
                 let col_offset_x = pos.x;
                 row_offset_y += pos.y;
-                if col_offset_x - RIGHT_MARGIN < -scroll_offset.x {
+                // Columns of context kept beside the caret (#252, Zed's
+                // `horizontal_scroll_margin`). Zero is the old behaviour.
+                let margin = RIGHT_MARGIN
+                    + f32::from(self.mode.scroll_margins().1) * line_height * 0.5;
+                if col_offset_x - margin < -scroll_offset.x {
                     // If the position is out of the visible area, scroll to make it visible
-                    scroll_offset.x = -col_offset_x + RIGHT_MARGIN;
-                } else if col_offset_x + RIGHT_MARGIN > -scroll_offset.x + bounds_width {
-                    scroll_offset.x = -(col_offset_x - bounds_width + RIGHT_MARGIN);
+                    scroll_offset.x = -col_offset_x + margin;
+                } else if col_offset_x + margin > -scroll_offset.x + bounds_width {
+                    scroll_offset.x = -(col_offset_x - bounds_width + margin);
                 }
             }
         }
@@ -3038,8 +3205,58 @@ impl InputState {
 
         scroll_offset.x = scroll_offset.x.min(px(0.));
         scroll_offset.y = scroll_offset.y.min(px(0.));
+        // A jump slides instead of cutting (#252). **Only a jump** -- the
+        // wheel already carries the trackpad's own inertia, and interpolating
+        // that on top makes it feel like mud.
+        if self.mode.smooth_scrolling() && scroll_offset != was_offset {
+            self.start_scroll_slide(was_offset, scroll_offset, cx);
+            return;
+        }
         self.deferred_scroll_offset = Some(scroll_offset);
         cx.notify();
+    }
+
+    /// Slide from `from` to `to` over [`SCROLL_SLIDE`] (#252).
+    ///
+    /// Driven by **this input's** `notify`, not the window's -- the editor is
+    /// the only thing that has to be redrawn (ADR-0040 §5).
+    fn start_scroll_slide(
+        &mut self,
+        from: Point<Pixels>,
+        to: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_slide = Some((from, to, std::time::Instant::now()));
+        self.deferred_scroll_offset = Some(from);
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                gpui::Timer::after(std::time::Duration::from_millis(8)).await;
+                let done = this
+                    .update(cx, |this, cx| {
+                        let Some((from, to, started)) = this.scroll_slide else {
+                            return true;
+                        };
+                        let t = (started.elapsed().as_secs_f32()
+                            / SCROLL_SLIDE.as_secs_f32())
+                        .clamp(0., 1.);
+                        // Ease out: fast at the start, settling at the end.
+                        let e = 1. - (1. - t) * (1. - t);
+                        let at = from + (to - from) * e;
+                        this.deferred_scroll_offset = Some(at);
+                        if t >= 1. {
+                            this.scroll_slide = None;
+                        }
+                        cx.notify();
+                        t >= 1.
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        });
+        self.scroll_slide_task = Some(task);
     }
 
     pub(super) fn show_character_palette(
