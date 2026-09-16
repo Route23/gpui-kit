@@ -2244,27 +2244,6 @@ impl Element for TextElement {
             }
         }
 
-        // Pinned headers go over the text and under the caret (#252).
-        if !prepaint.sticky_lines.is_empty() {
-            let state = self.state.read(cx);
-            let follow = state.mode.sticky_scroll().3;
-            let scroll_x = state.scroll_handle.offset().x;
-            let line_number_width = prepaint.last_layout.line_number_width;
-            Self::paint_sticky(
-                &prepaint.sticky_lines,
-                super::sticky::StickyGeometry {
-                    origin: bounds.origin,
-                    width: bounds.size.width,
-                    line_number_width,
-                    line_height,
-                    scroll_x,
-                    follow_scroll: follow,
-                },
-                window,
-                cx,
-            );
-        }
-
         // Paint whitespace marks on top of the glyphs they belong to.
         Self::paint_whitespaces(
             &prepaint.whitespaces,
@@ -2373,6 +2352,32 @@ impl Element for TextElement {
                 }
             }
         }
+
+        // Pinned headers go **last** (#252). Line numbers are painted after
+        // the text, so a header drawn before them has the covered rows'
+        // numbers showing through it -- which is exactly the wrong number.
+        if !prepaint.sticky_lines.is_empty() {
+            let state = self.state.read(cx);
+            let follow = state.mode.sticky_scroll().3;
+            let scroll_offset = state.scroll_handle.offset();
+            let scroll_x = scroll_offset.x;
+            let line_number_width = prepaint.last_layout.line_number_width;
+            Self::paint_sticky(
+                &prepaint.sticky_lines,
+                super::sticky::StickyGeometry {
+                    // Undo the scroll: the headers belong to the viewport.
+                    origin: bounds.origin - scroll_offset,
+                    width: bounds.size.width,
+                    line_number_width,
+                    line_height,
+                    scroll_x,
+                    follow_scroll: follow,
+                },
+                window,
+                cx,
+            );
+        }
+
 
         self.state.update(cx, |state, cx| {
             state.last_layout = Some(prepaint.last_layout.clone());

@@ -152,6 +152,9 @@ use crate::{ActiveTheme as _, RopeExt as _};
 /// Where the pinned headers go.
 #[derive(Clone, Copy)]
 pub(super) struct StickyGeometry {
+    /// **The viewport's top-left, not the element's.** `bounds.origin` in
+    /// `paint` has already been moved by the scroll offset -- anchoring to it
+    /// puts the headers as far above the screen as the reader has scrolled.
     pub origin: Point<Pixels>,
     pub width: Pixels,
     pub line_number_width: Pixels,
@@ -162,6 +165,8 @@ pub(super) struct StickyGeometry {
 
 /// A header shaped and ready to paint.
 pub(super) struct StickyLine {
+    /// The row this header is, so its own number goes in the gutter.
+    pub row: usize,
     pub line: ShapedLine,
 }
 
@@ -235,7 +240,7 @@ impl super::element::TextElement {
                 let line = window
                     .text_system()
                     .shape_line(text, font_size, &[run], None);
-                StickyLine { line }
+                StickyLine { row, line }
             })
             .collect()
     }
@@ -258,11 +263,37 @@ impl super::element::TextElement {
         if lines.is_empty() {
             return;
         }
+        // **Two fills.** The editor's own background first, because the band
+        // colour is translucent and the rows underneath -- line numbers
+        // included -- would otherwise read straight through the header.
+        let under: Hsla = cx.theme().background;
         let bg: Hsla = cx.theme().secondary;
+        let number_color = cx.theme().muted_foreground;
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let font = window.text_style().font();
         let mut y = origin.y;
         for sticky in lines {
             let band = Bounds::new(point(origin.x, y), size(width, line_height));
+            window.paint_quad(fill(band, under));
             window.paint_quad(fill(band, bg));
+            // The header's **own** number, not the one it is covering.
+            if line_number_width > px(0.) {
+                let text: gpui::SharedString = (sticky.row + 1).to_string().into();
+                let run = TextRun {
+                    len: text.len(),
+                    font: font.clone(),
+                    color: number_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window
+                    .text_system()
+                    .shape_line(text, font_size, &[run], None);
+                // Right-aligned in the gutter, the way the real numbers are.
+                let nx = origin.x + line_number_width - shaped.width - px(8.);
+                let _ = shaped.paint(point(nx.max(origin.x), y), line_height, window, cx);
+            }
             let x = origin.x + line_number_width + if follow_scroll { scroll_x } else { px(0.) };
             let _ = sticky.line.paint(point(x, y), line_height, window, cx);
             y += line_height;
