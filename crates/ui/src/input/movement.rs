@@ -49,6 +49,8 @@ impl InputState {
         // Indent this inserted and nobody typed on goes away when the caret
         // leaves the line (`editor.trimAutoWhitespace`, #248).
         let offset = self.trim_auto_whitespace_on_leave(offset);
+        // Parameter hints go away when the caret leaves the call (#246).
+        self.hide_signature_help_if_outside(offset, cx);
         // The caret must never come to rest inside a folded region. This is the
         // choke point for movement, mouse and `set_cursor_position`; vertical
         // movement is already safe because a display point never lands on a

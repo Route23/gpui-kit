@@ -101,9 +101,25 @@ impl InputState {
         });
     }
 
-    /// Take the hints away (`)` or Escape).
+    /// Take the hints away (Escape).
     pub(crate) fn hide_signature_help(&mut self, cx: &mut Context<Self>) {
         if self.signature_popover.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Take them away once the caret is no longer inside a call (#246).
+    ///
+    /// **Not the `)` key.** Auto-closing overtypes a closing bracket and
+    /// returns before any text is written, so watching what was typed leaves
+    /// the hints up over a call that is already finished. Watching **where
+    /// the caret is** catches that, the arrow keys and a click alike.
+    pub(crate) fn hide_signature_help_if_outside(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if self.signature_popover.is_none() {
+            return;
+        }
+        if call_anchor(&self.text, offset, SIGNATURE_SCAN_BACK).is_none() {
+            self.signature_popover = None;
             cx.notify();
         }
     }
