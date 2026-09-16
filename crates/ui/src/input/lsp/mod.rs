@@ -11,6 +11,7 @@ mod definitions;
 mod document_colors;
 mod document_highlights;
 mod hover;
+mod signature;
 
 pub use code_actions::*;
 pub use completions::*;
@@ -18,6 +19,7 @@ pub use definitions::*;
 pub use document_colors::*;
 pub use document_highlights::*;
 pub use hover::*;
+pub use signature::*;
 
 /// LSP ServerCapabilities
 ///
@@ -35,6 +37,8 @@ pub struct Lsp {
     pub document_color_provider: Option<Rc<dyn DocumentColorProvider>>,
     /// Where else the symbol under the caret appears.
     pub document_highlight_provider: Option<Rc<dyn DocumentHighlightProvider>>,
+    /// What the call under the caret takes (#246).
+    pub signature_provider: Option<Rc<dyn SignatureProvider>>,
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
     document_highlights: Vec<(lsp_types::Range, HighlightKind)>,
@@ -42,6 +46,7 @@ pub struct Lsp {
     _hover_hide_task: Task<Result<()>>,
     _document_color_task: Task<Result<()>>,
     _document_highlight_task: Task<Result<()>>,
+    _signature_task: Task<Result<()>>,
 }
 
 impl Default for Lsp {
@@ -53,12 +58,14 @@ impl Default for Lsp {
             definition_provider: None,
             document_color_provider: None,
             document_highlight_provider: None,
+            signature_provider: None,
             document_colors: vec![],
             document_highlights: vec![],
             _hover_task: Task::ready(Ok(())),
             _hover_hide_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(Ok(())),
             _document_highlight_task: Task::ready(Ok(())),
+            _signature_task: Task::ready(Ok(())),
         }
     }
 }

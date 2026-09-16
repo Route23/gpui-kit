@@ -240,6 +240,108 @@ impl RenderWhitespace {
     }
 }
 
+/// How the completion menu looks, gathered so the render site takes one
+/// argument rather than eight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuggestStyle {
+    pub font_size: u16,
+    pub line_height: u16,
+    pub kind: KindDisplay,
+    pub inline_details: bool,
+    pub alignment: DetailAlignment,
+    pub status_bar: bool,
+    pub preview: bool,
+    pub scrollbar: bool,
+}
+
+impl Default for SuggestStyle {
+    fn default() -> Self {
+        Self {
+            font_size: 0,
+            line_height: 0,
+            kind: KindDisplay::None,
+            // **On, because that is what the menu already did.**
+            inline_details: true,
+            alignment: DetailAlignment::Left,
+            status_bar: false,
+            preview: false,
+            scrollbar: true,
+        }
+    }
+}
+
+/// How the completion menu is asked for and taken, gathered so the builder
+/// takes one argument rather than seven.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SuggestBehaviour {
+    pub quick: QuickSuggestions,
+    pub delay: u16,
+    pub on_enter: bool,
+    pub on_commit_character: bool,
+    pub tab: bool,
+    pub insert_mode: InsertMode,
+    pub selection: SuggestSelection,
+}
+
+/// When the completion menu opens by itself (#246).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum QuickSuggestions {
+    /// Only when asked for.
+    Off,
+    /// Not inside a comment or a string -- **what you type there is prose,
+    /// and a menu over it is in the way.**
+    Code,
+    /// Anywhere. **The old behaviour.**
+    #[default]
+    All,
+}
+
+/// What a completion replaces when it is accepted (VS Code's
+/// `editor.suggest.insertMode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InsertMode {
+    /// Only up to the caret; whatever follows stays.
+    Insert,
+    /// The whole word the caret is in. **The old behaviour.**
+    #[default]
+    Replace,
+}
+
+/// Which item is selected when the menu opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SuggestSelection {
+    /// The first one. **The old behaviour.**
+    #[default]
+    First,
+    /// What was picked for this prefix last time, when there is one.
+    RecentlyUsed,
+}
+
+/// How a completion's kind is shown.
+///
+/// **VS Code's `showIcons` and Zed's `completion_menu_item_kind` are the same
+/// face**, so they are one setting here rather than two fighting over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum KindDisplay {
+    /// Nothing. **The old behaviour.**
+    #[default]
+    None,
+    /// A small glyph.
+    Icon,
+    /// The kind's name, e.g. `method`.
+    Label,
+}
+
+/// Where a completion's detail sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DetailAlignment {
+    /// Right after the label. **The old behaviour.**
+    #[default]
+    Left,
+    /// Pushed to the far edge of the menu.
+    Right,
+}
+
 /// How indent guides are coloured (Zed's `indent_guides.coloring`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GuideColoring {
@@ -526,6 +628,42 @@ pub(crate) enum InputMode {
         indent_list_on_tab: bool,
         /// The characters whitespace marks are drawn with.
         whitespace_map: WhitespaceMap,
+        /// When the completion menu opens by itself.
+        quick_suggestions: QuickSuggestions,
+        /// How long after a keystroke the menu opens, in ms.
+        quick_suggestions_delay: u16,
+        /// Whether Enter accepts the selected completion.
+        accept_suggestion_on_enter: bool,
+        /// Whether a commit character (`;`, `(`, …) accepts it.
+        accept_suggestion_on_commit_character: bool,
+        /// Whether Tab accepts it.
+        tab_completion: bool,
+        /// What an accepted completion replaces.
+        suggest_insert_mode: InsertMode,
+        /// Which item is selected when the menu opens.
+        suggest_selection: SuggestSelection,
+        /// The menu's font size in px; `0` follows the editor.
+        suggest_font_size: u16,
+        /// The menu's line height in px; `0` follows the editor.
+        suggest_line_height: u16,
+        /// How a completion's kind is shown.
+        suggest_kind_display: KindDisplay,
+        /// Whether the detail is drawn beside the label.
+        suggest_show_inline_details: bool,
+        /// Where the detail sits.
+        suggest_detail_alignment: DetailAlignment,
+        /// Whether a footer with the count is drawn.
+        suggest_show_status_bar: bool,
+        /// Whether the selected completion is previewed in the text.
+        suggest_preview: bool,
+        /// Whether the menu carries a scrollbar.
+        suggest_scrollbar: bool,
+        /// Whether parameter hints are asked for and shown.
+        parameter_hints: bool,
+        /// Whether cycling past the last overload wraps.
+        parameter_hints_cycle: bool,
+        /// Whether an edit re-asks for parameter hints.
+        signature_help_after_edits: bool,
         /// How far past the last line the view may scroll.
         scroll_beyond_last_line: ScrollBeyondLastLine,
         /// How many columns past the longest line the view may scroll.
@@ -726,6 +864,24 @@ impl InputMode {
             surrounding_lines_style: SurroundingLinesStyle::default(),
             autoscroll_on_clicks: false,
             caret_animation: CaretAnimation::default(),
+            quick_suggestions: QuickSuggestions::default(),
+            quick_suggestions_delay: 0,
+            accept_suggestion_on_enter: true,
+            accept_suggestion_on_commit_character: false,
+            tab_completion: false,
+            suggest_insert_mode: InsertMode::default(),
+            suggest_selection: SuggestSelection::default(),
+            suggest_font_size: 0,
+            suggest_line_height: 0,
+            suggest_kind_display: KindDisplay::default(),
+            suggest_show_inline_details: true,
+            suggest_detail_alignment: DetailAlignment::default(),
+            suggest_show_status_bar: false,
+            suggest_preview: false,
+            suggest_scrollbar: true,
+            parameter_hints: true,
+            parameter_hints_cycle: false,
+            signature_help_after_edits: false,
             scroll_beyond_last_line: ScrollBeyondLastLine::default(),
             scroll_beyond_last_column: 0,
             horizontal_scroll_margin: 0,
@@ -1145,6 +1301,102 @@ impl InputMode {
     #[inline]
     pub(super) fn smart_select_whitespace(&self) -> bool {
         matches!(self, InputMode::CodeEditor { smart_select_whitespace: true, .. })
+    }
+
+    /// When the completion menu opens by itself.
+    #[inline]
+    pub(super) fn quick_suggestions(&self) -> (QuickSuggestions, u16) {
+        match self {
+            InputMode::CodeEditor {
+                quick_suggestions,
+                quick_suggestions_delay,
+                ..
+            } => (*quick_suggestions, *quick_suggestions_delay),
+            _ => (QuickSuggestions::All, 0),
+        }
+    }
+
+    /// (Enter, commit character, Tab) accept the selected completion.
+    #[inline]
+    pub(super) fn accept_suggestion_with(&self) -> (bool, bool, bool) {
+        match self {
+            InputMode::CodeEditor {
+                accept_suggestion_on_enter,
+                accept_suggestion_on_commit_character,
+                tab_completion,
+                ..
+            } => (
+                *accept_suggestion_on_enter,
+                *accept_suggestion_on_commit_character,
+                *tab_completion,
+            ),
+            _ => (true, false, false),
+        }
+    }
+
+    /// What an accepted completion replaces.
+    #[inline]
+    pub(super) fn suggest_insert_mode(&self) -> InsertMode {
+        match self {
+            InputMode::CodeEditor { suggest_insert_mode, .. } => *suggest_insert_mode,
+            _ => InsertMode::Replace,
+        }
+    }
+
+    /// Which item is selected when the menu opens.
+    #[inline]
+    pub(super) fn suggest_selection(&self) -> SuggestSelection {
+        match self {
+            InputMode::CodeEditor { suggest_selection, .. } => *suggest_selection,
+            _ => SuggestSelection::First,
+        }
+    }
+
+    /// How the completion menu looks.
+    #[inline]
+    pub(super) fn suggest_style(&self) -> SuggestStyle {
+        match self {
+            InputMode::CodeEditor {
+                suggest_font_size,
+                suggest_line_height,
+                suggest_kind_display,
+                suggest_show_inline_details,
+                suggest_detail_alignment,
+                suggest_show_status_bar,
+                suggest_preview,
+                suggest_scrollbar,
+                ..
+            } => SuggestStyle {
+                font_size: *suggest_font_size,
+                line_height: *suggest_line_height,
+                kind: *suggest_kind_display,
+                inline_details: *suggest_show_inline_details,
+                alignment: *suggest_detail_alignment,
+                status_bar: *suggest_show_status_bar,
+                preview: *suggest_preview,
+                scrollbar: *suggest_scrollbar,
+            },
+            _ => SuggestStyle::default(),
+        }
+    }
+
+    /// Whether parameter hints are asked for and shown.
+    #[inline]
+    pub(super) fn parameter_hints(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { parameter_hints: true, .. })
+    }
+
+    /// (wrap when cycling, re-ask after an edit).
+    #[inline]
+    pub(super) fn parameter_hints_behaviour(&self) -> (bool, bool) {
+        match self {
+            InputMode::CodeEditor {
+                parameter_hints_cycle,
+                signature_help_after_edits,
+                ..
+            } => (*parameter_hints_cycle, *signature_help_after_edits),
+            _ => (false, false),
+        }
     }
 
     /// How far past the last line the view may scroll.
@@ -1919,8 +2171,9 @@ mod tests {
         highlighter::DiagnosticSet,
         input::{
             AutoClose, AutoIndent, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle,
-            GuideBackground, GuideColoring, MatchBrackets, ScrollBeyondLastLine, ScrollbarMarks,
-            StickyModel, WhitespaceMap,
+            DetailAlignment, GuideBackground, GuideColoring, InsertMode, KindDisplay,
+            MatchBrackets, QuickSuggestions, ScrollBeyondLastLine, ScrollbarMarks, StickyModel,
+            SuggestSelection, WhitespaceMap,
             SurroundingLinesStyle, TabSize,
             mode::{
                 DEFAULT_INLINE_DIAGNOSTIC_PADDING, DEFAULT_MAX_FOLD_REGIONS,
@@ -2079,6 +2332,24 @@ search_options: crate::input::SearchOptions::default(),
             surrounding_lines_style: SurroundingLinesStyle::Always,
             autoscroll_on_clicks: true,
             caret_animation: CaretAnimation::On,
+            quick_suggestions: QuickSuggestions::All,
+            quick_suggestions_delay: 0,
+            accept_suggestion_on_enter: true,
+            accept_suggestion_on_commit_character: false,
+            tab_completion: false,
+            suggest_insert_mode: InsertMode::Replace,
+            suggest_selection: SuggestSelection::First,
+            suggest_font_size: 0,
+            suggest_line_height: 0,
+            suggest_kind_display: KindDisplay::None,
+            suggest_show_inline_details: true,
+            suggest_detail_alignment: DetailAlignment::Left,
+            suggest_show_status_bar: false,
+            suggest_preview: false,
+            suggest_scrollbar: true,
+            parameter_hints: true,
+            parameter_hints_cycle: false,
+            signature_help_after_edits: false,
             scroll_beyond_last_line: ScrollBeyondLastLine::Half,
             scroll_beyond_last_column: 0,
             horizontal_scroll_margin: 0,

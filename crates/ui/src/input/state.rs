@@ -429,6 +429,10 @@ pub struct InputState {
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
     pub(super) hover_popover: Option<Entity<HoverPopover>>,
+    /// The parameter hints for the call the caret is in (#246).
+    pub(super) signature_popover: Option<Entity<crate::input::popovers::SignaturePopover>>,
+    /// Waiting out `quickSuggestionsDelay` before opening the menu (#246).
+    pub(super) _suggest_delay_task: Task<Result<()>>,
     /// Whether the pointer is over the hover popover.
     ///
     /// The popover occludes, so the editor's own `mouse_move` stops firing the
@@ -558,6 +562,8 @@ impl InputState {
             mouse_context_menu,
             completion_inserting: false,
             hover_popover: None,
+            signature_popover: None,
+            _suggest_delay_task: Task::ready(Ok(())),
             hover_popover_hovered: false,
             hover_hiding: false,
             hover_definition: HoverDefinition::default(),
@@ -790,6 +796,75 @@ impl InputState {
             *scroll_beyond_last_line = beyond_last_line;
             *scroll_beyond_last_column = beyond_last_column;
             *horizontal_scroll_margin = horizontal_margin;
+        }
+        self
+    }
+
+    /// When the completion menu opens by itself, and how it is taken (#246).
+    pub fn suggest_behaviour(mut self, b: super::mode::SuggestBehaviour) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            quick_suggestions,
+            quick_suggestions_delay,
+            accept_suggestion_on_enter,
+            accept_suggestion_on_commit_character,
+            tab_completion,
+            suggest_insert_mode,
+            suggest_selection,
+            ..
+        } = &mut self.mode
+        {
+            *quick_suggestions = b.quick;
+            *quick_suggestions_delay = b.delay;
+            *accept_suggestion_on_enter = b.on_enter;
+            *accept_suggestion_on_commit_character = b.on_commit_character;
+            *tab_completion = b.tab;
+            *suggest_insert_mode = b.insert_mode;
+            *suggest_selection = b.selection;
+        }
+        self
+    }
+
+    /// How the completion menu looks (#246).
+    pub fn suggest_style(mut self, style: super::mode::SuggestStyle) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            suggest_font_size,
+            suggest_line_height,
+            suggest_kind_display,
+            suggest_show_inline_details,
+            suggest_detail_alignment,
+            suggest_show_status_bar,
+            suggest_preview,
+            suggest_scrollbar,
+            ..
+        } = &mut self.mode
+        {
+            *suggest_font_size = style.font_size;
+            *suggest_line_height = style.line_height;
+            *suggest_kind_display = style.kind;
+            *suggest_show_inline_details = style.inline_details;
+            *suggest_detail_alignment = style.alignment;
+            *suggest_show_status_bar = style.status_bar;
+            *suggest_preview = style.preview;
+            *suggest_scrollbar = style.scrollbar;
+        }
+        self
+    }
+
+    /// The parameter hints shown inside a call (#246).
+    pub fn parameter_hints(mut self, on: bool, cycle: bool, after_edits: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            parameter_hints,
+            parameter_hints_cycle,
+            signature_help_after_edits,
+            ..
+        } = &mut self.mode
+        {
+            *parameter_hints = on;
+            *parameter_hints_cycle = cycle;
+            *signature_help_after_edits = after_edits;
         }
         self
     }
@@ -4018,6 +4093,16 @@ impl EntityInputHandler for InputState {
         self.mode.update_auto_grow(&self.text_wrapper);
         if !self.silent_replace_text {
             self.handle_completion_trigger(&range, &new_text, window, cx);
+            // Parameter hints follow the brackets (#246). `)` closes them;
+            // `signature_help_after_edits` re-asks on anything else.
+            match new_text.chars().next_back() {
+                Some('(') | Some(',') => self.request_signature_help(None, window, cx),
+                Some(')') => self.hide_signature_help(cx),
+                _ if self.mode.parameter_hints_behaviour().1 => {
+                    self.request_signature_help(None, window, cx);
+                }
+                _ => {}
+            }
         }
         cx.emit(InputEvent::Change);
         cx.notify();
@@ -4208,5 +4293,6 @@ impl Render for InputState {
             .children(self.diagnostic_popover.clone())
             .children(self.context_menu.as_ref().map(|menu| menu.render()))
             .children(self.hover_popover.clone())
+            .children(self.signature_popover.clone())
     }
 }

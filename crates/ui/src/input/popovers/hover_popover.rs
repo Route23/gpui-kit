@@ -120,7 +120,7 @@ impl Popover {
     }
 
     /// Try the space above the line first (the default), or below.
-    fn prefer_above(mut self, above: bool) -> Self {
+    pub(crate) fn prefer_above(mut self, above: bool) -> Self {
         self.prefer_above = above;
         self
     }

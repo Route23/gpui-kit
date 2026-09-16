@@ -124,11 +124,42 @@ impl InputState {
         self.schedule_inline_completion(window, cx);
 
         let start = range.end;
-        let new_offset = self.cursor();
 
         if !provider.is_completion_trigger(start, new_text, cx) {
             return;
         }
+
+        // `editor.quickSuggestionsDelay` (#246). **The menu path had none** --
+        // it asked the provider on every keystroke. Zero keeps that.
+        let delay = self.mode.quick_suggestions().1;
+        if delay > 0 {
+            let range = range.clone();
+            self._suggest_delay_task = cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(u64::from(delay)))
+                    .await;
+                let _ = this.update_in(cx, |state, window, cx| {
+                    state.open_completion_menu(&range, window, cx);
+                });
+                Ok(())
+            });
+            return;
+        }
+        self.open_completion_menu(range, window, cx);
+    }
+
+    /// Build or reuse the menu and ask the provider (#246).
+    fn open_completion_menu(
+        &mut self,
+        range: &Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self.lsp.completion_provider.clone() else {
+            return;
+        };
+        let start = range.end;
+        let new_offset = self.cursor();
 
         let menu = match self.context_menu.as_ref() {
             Some(ContextMenu::Completion(menu)) => Some(menu),

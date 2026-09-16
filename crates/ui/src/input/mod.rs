@@ -51,7 +51,8 @@ pub use inline_diag::InlineDiagnostic;
 pub use mode::{
     UnicodeHighlight,
     AutoIndent, FoldingControls, GuideBackground, GuideColoring, InlayModifier, LineHighlight,
-    LineNumbers, RenderWhitespace, ScrollBeyondLastLine, StickyModel, WhitespaceMap, WrapAt,
+    DetailAlignment, InsertMode, KindDisplay, LineNumbers, QuickSuggestions, RenderWhitespace,
+    ScrollBeyondLastLine, StickyModel, SuggestBehaviour, SuggestSelection, SuggestStyle, WhitespaceMap, WrapAt,
 };
 pub use scrollbar_marks::{MarkSeverity, ScrollbarMarks};
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};

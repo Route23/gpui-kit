@@ -27,9 +27,16 @@ struct ContextMenuDelegate {
     menu: Entity<CompletionMenu>,
     items: Vec<Rc<CompletionItem>>,
     selected_ix: usize,
+    /// How rows look; copied in when the menu is shown so `render_item` does
+    /// not have to reach back through the editor on every row.
+    style: crate::input::SuggestStyle,
 }
 
 impl ContextMenuDelegate {
+    fn set_style(&mut self, style: crate::input::SuggestStyle) {
+        self.style = style;
+    }
+
     fn set_items(&mut self, items: Vec<CompletionItem>) {
         self.items = items.into_iter().map(Rc::new).collect();
         self.selected_ix = 0;
@@ -47,6 +54,40 @@ struct CompletionMenuItem {
     children: Vec<AnyElement>,
     selected: bool,
     highlight_prefix: SharedString,
+    style: crate::input::SuggestStyle,
+}
+
+/// The mark drawn for a completion's kind (#246).
+///
+/// **VS Code's icons and Zed's kind badge are the same face**, so one setting
+/// picks between a glyph and the kind's name.
+fn kind_mark(
+    kind: Option<lsp_types::CompletionItemKind>,
+    how: crate::input::KindDisplay,
+) -> SharedString {
+    use lsp_types::CompletionItemKind as K;
+    let Some(kind) = kind else {
+        return "".into();
+    };
+    if how == crate::input::KindDisplay::Label {
+        return format!("{kind:?}").to_lowercase().into();
+    }
+    // One glyph per kind. **Text, not an icon font** -- the icon set does not
+    // ship the twenty-odd symbols LSP names, and a wrong icon reads worse
+    // than a letter.
+    match kind {
+        K::METHOD | K::FUNCTION | K::CONSTRUCTOR => "\u{0192}",
+        K::FIELD | K::PROPERTY => "\u{25cf}",
+        K::VARIABLE | K::VALUE => "\u{25a0}",
+        K::CLASS | K::STRUCT | K::INTERFACE => "\u{25c6}",
+        K::MODULE | K::FILE | K::FOLDER => "\u{25b0}",
+        K::ENUM | K::ENUM_MEMBER => "\u{25b2}",
+        K::KEYWORD | K::OPERATOR => "\u{2318}",
+        K::SNIPPET => "\u{2702}",
+        K::CONSTANT => "\u{03c0}",
+        _ => "\u{00b7}",
+    }
+    .into()
 }
 
 impl CompletionMenuItem {
@@ -57,6 +98,7 @@ impl CompletionMenuItem {
             children: vec![],
             selected: false,
             highlight_prefix: "".into(),
+            style: crate::input::SuggestStyle::default(),
         }
     }
 
@@ -84,6 +126,7 @@ impl ParentElement for CompletionMenuItem {
 impl RenderOnce for CompletionMenuItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let item = self.item;
+        let style = self.style;
 
         let deprecated = item.deprecated.unwrap_or(false);
         let matched_len = item
@@ -113,9 +156,21 @@ impl RenderOnce for CompletionMenuItem {
                 this.bg(cx.theme().accent)
                     .text_color(cx.theme().accent_foreground)
             })
-            .child(div().child(StyledText::new(item.label.clone()).with_highlights(highlights)))
-            .when(item.detail.is_some(), |this| {
+            .when(style.kind != crate::input::KindDisplay::None, |this| {
                 this.child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(kind_mark(item.kind, style.kind)),
+                )
+            })
+            .child(div().child(StyledText::new(item.label.clone()).with_highlights(highlights)))
+            .when(style.inline_details && item.detail.is_some(), |this| {
+                this.when(style.alignment == crate::input::DetailAlignment::Right, |this| {
+                    // A spacer that eats the slack, so the detail lands on the
+                    // far edge instead of next to the label.
+                    this.child(div().flex_1())
+                })
+                .child(
                     Label::new(item.detail.as_deref().unwrap_or("").to_string())
                         .text_color(cx.theme().muted_foreground)
                         .when(deprecated, |this| this.line_through())
@@ -142,7 +197,10 @@ impl ListDelegate for ContextMenuDelegate {
         _: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
         let item = self.items.get(ix.row)?;
-        Some(CompletionMenuItem::new(ix.row, item.clone()).highlight_prefix(self.query.clone()))
+        let mut row = CompletionMenuItem::new(ix.row, item.clone())
+            .highlight_prefix(self.query.clone());
+        row.style = self.style;
+        Some(row)
     }
 
     fn set_selected_index(
@@ -192,6 +250,7 @@ impl CompletionMenu {
         cx.new(|cx| {
             let view = cx.entity();
             let menu = ContextMenuDelegate {
+                style: crate::input::SuggestStyle::default(),
                 query: SharedString::default(),
                 menu: view,
                 items: vec![],
@@ -247,8 +306,16 @@ impl CompletionMenu {
                         }
                         CompletionTextEdit::InsertAndReplace(edit) => {
                             new_text = edit.new_text.clone();
-                            range.start = editor.text.position_to_offset(&edit.replace.start);
-                            range.end = editor.text.position_to_offset(&edit.replace.end);
+                            // `editor.suggest.insertMode`. **`replace` is what
+                            // this always did** -- `insert` keeps whatever
+                            // follows the caret, which is what you want when
+                            // you are adding to a name rather than swapping it.
+                            let which = match editor.mode.suggest_insert_mode() {
+                                crate::input::InsertMode::Insert => &edit.insert,
+                                crate::input::InsertMode::Replace => &edit.replace,
+                            };
+                            range.start = editor.text.position_to_offset(&which.start);
+                            range.end = editor.text.position_to_offset(&which.end);
                         }
                     }
                 } else if let Some(insert_text) = item.insert_text.clone() {
@@ -300,8 +367,19 @@ impl CompletionMenu {
             return false;
         }
 
+        let (on_enter, _, on_tab) = self.editor.read(cx).mode.accept_suggestion_with();
+
         cx.propagate();
         if action.partial_eq(&input::Enter { secondary: false }) {
+            // `acceptSuggestionOnEnter`: off leaves Enter as a line break,
+            // which is what people who accept with Tab want.
+            if !on_enter {
+                return false;
+            }
+            self.on_action_enter(window, cx);
+        } else if on_tab && action.partial_eq(&input::IndentInline) {
+            // `editor.tabCompletion`. **Only while the menu is open** --
+            // Tab is still an indent everywhere else.
             self.on_action_enter(window, cx);
         } else if action.partial_eq(&input::Escape) {
             self.on_action_escape(window, cx);
@@ -368,7 +446,9 @@ impl CompletionMenu {
         let items = items.into();
         self.offset = offset;
         self.open = true;
+        let style = self.editor.read(cx).mode.suggest_style();
         self.list.update(cx, |this, cx| {
+            this.delegate_mut().set_style(style);
             let longest_ix = items
                 .iter()
                 .enumerate()
@@ -429,6 +509,8 @@ impl Render for CompletionMenu {
             .selected_item()
             .and_then(|item| item.documentation.clone());
 
+        let style = self.editor.read(cx).mode.suggest_style();
+        let count = self.list.read(cx).delegate().items.len();
         let max_width = MAX_MENU_WIDTH.min(window.bounds().size.width - pos.x);
         let abs_pos = self.editor.read(cx).input_bounds.origin + pos;
         let vertical_layout =
@@ -449,7 +531,31 @@ impl Render for CompletionMenu {
                     editor_popover("completion-menu", cx)
                         .max_w(max_width)
                         .min_w(px(120.))
-                        .child(List::new(&self.list).max_h(MAX_MENU_HEIGHT))
+                        .when(style.font_size > 0, |this| {
+                            this.text_size(px(f32::from(style.font_size)))
+                        })
+                        .when(style.line_height > 0, |this| {
+                            this.line_height(px(f32::from(style.line_height)))
+                        })
+                        .child(
+                            List::new(&self.list)
+                                .max_h(MAX_MENU_HEIGHT)
+                                .scrollbar_visible(style.scrollbar),
+                        )
+                        // `editor.suggest.showStatusBar`: how many there are,
+                        // and how to take one.
+                        .when(style.status_bar, |this| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .child(format!("{count} · ⏎ / Esc")),
+                            )
+                        })
                         .child(
                             canvas(
                                 move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds),
