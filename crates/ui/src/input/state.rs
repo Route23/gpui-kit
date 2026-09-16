@@ -448,6 +448,11 @@ pub struct InputState {
     /// Asking needs a `&mut Window`, and `move_to` has none -- so the ask is
     /// left for the next frame, which is also a free debounce for a drag.
     pub(super) pending_highlight: bool,
+    /// Indent the editor itself put on a line, still untouched (#248).
+    ///
+    /// Set when Enter writes an indent and nothing else; taken back when the
+    /// caret leaves that line, if `trim_auto_whitespace` is on.
+    pub(super) auto_ws: Option<Range<usize>>,
     /// A flag to indicate if we should ignore the next completion event.
     pub(super) silent_replace_text: bool,
 
@@ -552,6 +557,7 @@ impl InputState {
             _context_menu_task: Task::ready(Ok(())),
             _pending_update: false,
             pending_highlight: false,
+            auto_ws: None,
             inline_completion: InlineCompletion::default(),
         }
     }
@@ -746,6 +752,107 @@ impl InputState {
             *double_click_selects_block = double_click_block;
             *smart_select_subwords = subwords;
             *smart_select_whitespace = whitespace;
+        }
+        self
+    }
+
+    /// How indent guides look (#248).
+    ///
+    /// `width` and `active_width` are in px; the caller is expected to clamp
+    /// them to something sane (1--10 here).
+    pub fn indent_guide_style(
+        mut self,
+        active: bool,
+        width: f32,
+        active_width: f32,
+        coloring: super::mode::GuideColoring,
+        background: super::mode::GuideBackground,
+    ) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            indent_guide_active,
+            indent_guide_width,
+            indent_guide_active_width,
+            indent_guide_coloring,
+            indent_guide_background,
+            ..
+        } = &mut self.mode
+        {
+            *indent_guide_active = active;
+            *indent_guide_width = width;
+            *indent_guide_active_width = active_width;
+            *indent_guide_coloring = coloring;
+            *indent_guide_background = background;
+        }
+        self
+    }
+
+    /// What a new line inherits, and what a paste is re-indented to (#248).
+    pub fn auto_indent(
+        mut self,
+        mode: super::mode::AutoIndent,
+        on_paste: bool,
+        on_paste_in_string: bool,
+        trim_auto: bool,
+        trim_on_delete: bool,
+    ) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            auto_indent,
+            auto_indent_on_paste,
+            auto_indent_on_paste_in_string,
+            trim_auto_whitespace,
+            trim_whitespace_on_delete,
+            ..
+        } = &mut self.mode
+        {
+            *auto_indent = mode;
+            *auto_indent_on_paste = on_paste;
+            *auto_indent_on_paste_in_string = on_paste_in_string;
+            *trim_auto_whitespace = trim_auto;
+            *trim_whitespace_on_delete = trim_on_delete;
+        }
+        self
+    }
+
+    /// How the caret and backspace treat runs of leading spaces (#248).
+    pub fn tab_stops(mut self, use_tab_stops: bool, sticky: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            use_tab_stops: u,
+            sticky_tab_stops: s,
+            ..
+        } = &mut self.mode
+        {
+            *u = use_tab_stops;
+            *s = sticky;
+        }
+        self
+    }
+
+    /// Whether a Markdown list carries onto the next line, and whether Tab
+    /// indents the item (#248).
+    pub fn lists(mut self, on_newline: bool, indent_on_tab: bool) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor {
+            list_on_newline,
+            indent_list_on_tab,
+            ..
+        } = &mut self.mode
+        {
+            *list_on_newline = on_newline;
+            *indent_list_on_tab = indent_on_tab;
+        }
+        self
+    }
+
+    /// The characters whitespace marks are drawn with (#248).
+    ///
+    /// `None` on either keeps the built-in quad for that kind.
+    pub fn whitespace_map(mut self, space: Option<char>, tab: Option<char>) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { whitespace_map, .. } = &mut self.mode {
+            *whitespace_map = super::mode::WhitespaceMap { space, tab };
         }
         self
     }
@@ -2275,6 +2382,10 @@ impl InputState {
         if self.mode.is_single_line() {
             return "".into();
         }
+        // `AutoIndent::None` starts every line at column zero (#248).
+        if self.mode.auto_indent() == super::mode::AutoIndent::None {
+            return "".into();
+        }
 
         let mut current_indent = String::new();
         let mut next_indent = String::new();
@@ -2300,11 +2411,25 @@ impl InputState {
             next_indent.push(c);
         }
 
-        if next_indent.len() > current_indent.len() {
-            return next_indent;
+        let base = if next_indent.len() > current_indent.len() {
+            next_indent
         } else {
-            return current_indent;
+            current_indent
+        };
+
+        // `Brackets`: a line that leaves a bracket open puts the next one a
+        // level deeper. **The syntax tree is not consulted** -- see
+        // `auto_indent.rs` for why.
+        if self.mode.auto_indent() != super::mode::AutoIndent::Brackets {
+            return base;
         }
+        let line_start = self.start_of_line();
+        let before = self.text.slice(line_start..self.cursor()).to_string();
+        let pairs = super::brackets::pairs_for(self.mode.language_name());
+        if super::auto_indent::opens_block(&before, &pairs) {
+            return base + &self.mode.tab_size().to_string();
+        }
+        base
     }
 
     /// What auto-closing wants to do for this insertion, if anything.
@@ -2417,6 +2542,10 @@ impl InputState {
             {
                 self.selected_range =
                     (self.previous_boundary(offset)..self.next_boundary(offset)).into();
+            } else if let Some(stop) = self.tab_stop_before_caret() {
+                self.select_to(stop, cx)
+            } else if let Some(join) = self.join_without_indent() {
+                self.select_to(join, cx)
             } else {
                 self.select_to(self.previous_boundary(self.cursor()), cx)
             }
@@ -2548,7 +2677,7 @@ impl InputState {
             // Carry a line comment onto the next line, and let a line that is
             // nothing but the marker be the way out of the block.
             let carry = self.comment_to_carry(window, cx);
-            let prefix = match carry {
+            let mut prefix = match carry {
                 Some(EnterComment::Continue { prefix }) => prefix,
                 Some(EnterComment::Clear { range }) => {
                     self.replace_text_in_range_silent(
@@ -2562,9 +2691,38 @@ impl InputState {
                 None => String::new(),
             };
 
+            // A Markdown list marker carries the same way (#248). **A comment
+            // wins** -- a `// - foo` line is a comment that happens to hold a
+            // dash, and continuing both would put the marker twice.
+            let mut indent = indent;
+            if prefix.is_empty() {
+                match self.list_to_carry(window, cx) {
+                    Some(super::list::EnterList::Continue { prefix: p }) => {
+                        // The marker already carries the line's own indent.
+                        indent = String::new();
+                        prefix = p;
+                    }
+                    Some(super::list::EnterList::Clear { range }) => {
+                        self.replace_text_in_range_silent(
+                            Some(self.range_to_utf16(&range)),
+                            "",
+                            window,
+                            cx,
+                        );
+                        indent = String::new();
+                    }
+                    None => {}
+                }
+            }
+
             // Add newline and indent
             let new_line_text = format!("\n{indent}{prefix}");
             self.replace_text_in_range_silent(None, &new_line_text, window, cx);
+            // Remember indent nobody asked for, so it can be taken back.
+            self.auto_ws = (!indent.is_empty() && prefix.is_empty()).then(|| {
+                let end = self.cursor();
+                end - indent.len()..end
+            });
             self.pause_blink_cursor(cx);
         } else {
             // Single line input, just emit the event (e.g.: In a dialog to confirm).
@@ -2953,6 +3111,12 @@ impl InputState {
             let mut new_text = clipboard.text().unwrap_or_default();
             if !self.mode.is_multi_line() {
                 new_text = new_text.replace('\n', "");
+            }
+
+            // Re-indent the block to where it landed (#248). **Before the
+            // edit** -- moving text after it is in would be a second undo step.
+            if let Some(fixed) = self.reindent_paste(&new_text) {
+                new_text = fixed;
             }
 
             self.replace_text_in_range_silent(None, &new_text, window, cx);
@@ -3544,6 +3708,16 @@ impl EntityInputHandler for InputState {
         // purpose. `CaretAnimation::Explicit` does not slide for this.
         self.caret_moved_explicitly = false;
         self.pause_blink_cursor(cx);
+
+        // ── a closing bracket pulls its own line back ──────────────────────
+        // `AutoIndent::Brackets`. Done first and as its own edit, so the
+        // bracket itself still goes through auto-closing below.
+        if range_utf16.is_none() && self.selected_range.is_empty() {
+            if let Some(drop) = self.outdent_for_closer(new_text) {
+                self.text.replace(drop.clone(), "");
+                self.selected_range = (drop.start..drop.start).into();
+            }
+        }
 
         // ── auto-closing brackets ──────────────────────────────────────────
         // Decided before anything is written, because the whole point is to

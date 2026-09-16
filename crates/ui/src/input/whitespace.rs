@@ -270,6 +270,8 @@ impl TextElement {
     pub(super) fn paint_whitespaces(
         marks: &[PlacedMark],
         line_height: Pixels,
+        map: &super::mode::WhitespaceMap,
+        text_style: &gpui::TextStyle,
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
@@ -281,6 +283,32 @@ impl TextElement {
         let middle = line_height / 2.;
 
         for mark in marks {
+            // A character the reader chose is shaped and drawn in place of the
+            // built-in quad (Zed's `whitespace_map`). **Only when they chose
+            // one** -- shaping costs a `shape_line` per mark, and the default
+            // dot and arrow look the same for free.
+            let glyph = match mark.kind {
+                WsKind::Space => map.space,
+                WsKind::Tab => map.tab,
+                _ => None,
+            };
+            if let Some(ch) = glyph {
+                let mut buf = [0u8; 4];
+                let text: gpui::SharedString = ch.encode_utf8(&mut buf).to_string().into();
+                let run = gpui::TextRun {
+                    len: text.len(),
+                    font: text_style.font(),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let size = text_style.font_size.to_pixels(window.rem_size());
+                let line = window.text_system().shape_line(text, size, &[run], None);
+                let x = mark.origin.x + (mark.width - line.width).max(px(0.)) / 2.;
+                let _ = line.paint(point(x, mark.origin.y), line_height, window, cx);
+                continue;
+            }
             match mark.kind {
                 WsKind::Space => {
                     let size = px(2.);

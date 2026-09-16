@@ -46,6 +46,9 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let offset = offset.clamp(0, self.text.len());
+        // Indent this inserted and nobody typed on goes away when the caret
+        // leaves the line (`editor.trimAutoWhitespace`, #248).
+        let offset = self.trim_auto_whitespace_on_leave(offset);
         // The caret must never come to rest inside a folded region. This is the
         // choke point for movement, mouse and `set_cursor_position`; vertical
         // movement is already safe because a display point never lands on a
@@ -136,7 +139,12 @@ impl InputState {
     pub(super) fn left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
         if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(self.cursor()), None, cx);
+            // `editor.stickyTabStops`: leading spaces are crossed a tab stop
+            // at a time, so an indent written with spaces feels like a tab.
+            let to = self
+                .sticky_stop_left()
+                .unwrap_or_else(|| self.previous_boundary(self.cursor()));
+            self.move_to(to, None, cx);
         } else {
             self.move_to(self.selected_range.start, None, cx)
         }
@@ -145,7 +153,10 @@ impl InputState {
     pub(super) fn right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
         if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(self.selected_range.end), None, cx);
+            let to = self
+                .sticky_stop_right()
+                .unwrap_or_else(|| self.next_boundary(self.selected_range.end));
+            self.move_to(to, None, cx);
         } else {
             self.move_to(self.selected_range.end, None, cx)
         }

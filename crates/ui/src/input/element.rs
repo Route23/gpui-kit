@@ -1358,7 +1358,8 @@ pub(super) struct PrepaintState {
     hover_definition_hitbox: Option<Hitbox>,
     link_hitbox: Option<Hitbox>,
     document_highlight_paths: Vec<(Path<Pixels>, Hsla)>,
-    indent_guides_path: Option<Path<Pixels>>,
+    indent_guide_paths: Vec<(Path<Pixels>, Hsla)>,
+    indent_guide_bands: Vec<(Bounds<Pixels>, Hsla)>,
     rulers_path: Option<Path<Pixels>>,
     /// One vertical guide per bracket pair, grouped by colour
     bracket_guide_paths: Vec<(Path<Pixels>, Hsla)>,
@@ -1835,8 +1836,8 @@ impl Element for TextElement {
 
         let hover_definition_hitbox = self.layout_hover_definition_hitbox(state, window, cx);
         let link_hitbox = self.layout_link_hitbox(state, window, cx);
-        let indent_guides_path =
-            self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
+        let (indent_guide_paths, indent_guide_bands) =
+            self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window, cx);
         let rulers_path = Self::layout_rulers(
             state,
             &unscrolled_bounds,
@@ -1883,7 +1884,8 @@ impl Element for TextElement {
             link_hitbox,
             document_highlight_paths,
             document_color_paths,
-            indent_guides_path,
+            indent_guide_paths,
+            indent_guide_bands,
             rulers_path,
             bracket_guide_paths,
             whitespaces,
@@ -2043,9 +2045,13 @@ impl Element for TextElement {
             window.paint_path(path, cx.theme().border.opacity(0.6));
         }
 
-        // Paint indent guides
-        if let Some(path) = prepaint.indent_guides_path.take() {
-            window.paint_path(path, cx.theme().border.opacity(0.85));
+        // Paint indent guides. The bands go first -- they sit behind the
+        // guides and behind the text.
+        for (bounds, color) in prepaint.indent_guide_bands.iter() {
+            window.paint_quad(gpui::fill(*bounds, *color));
+        }
+        for (path, color) in prepaint.indent_guide_paths.iter() {
+            window.paint_path(path.clone(), *color);
         }
 
         // Paint bracket pair guides, in the colour of the pair they belong to
@@ -2219,7 +2225,14 @@ impl Element for TextElement {
         }
 
         // Paint whitespace marks on top of the glyphs they belong to.
-        Self::paint_whitespaces(&prepaint.whitespaces, line_height, window, cx);
+        Self::paint_whitespaces(
+            &prepaint.whitespaces,
+            line_height,
+            &self.state.read(cx).mode.whitespace_map(),
+            &window.text_style(),
+            window,
+            cx,
+        );
 
         // Paint blinking cursor
         //

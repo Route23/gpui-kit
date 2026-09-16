@@ -1,3 +1,4 @@
+mod auto_indent;
 mod blink_cursor;
 mod brackets;
 mod caret;
@@ -22,6 +23,7 @@ pub(crate) mod popovers;
 mod rope_ext;
 mod rulers;
 mod links;
+mod list;
 mod search;
 mod state;
 mod tags;
@@ -46,7 +48,8 @@ pub use inlay::InlayRow;
 pub use inline_diag::InlineDiagnostic;
 pub use mode::{
     UnicodeHighlight,
-    FoldingControls, InlayModifier, LineHighlight, LineNumbers, RenderWhitespace, WrapAt,
+    AutoIndent, FoldingControls, GuideBackground, GuideColoring, InlayModifier, LineHighlight,
+    LineNumbers, RenderWhitespace, WhitespaceMap, WrapAt,
 };
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};
 pub use otp_input::*;

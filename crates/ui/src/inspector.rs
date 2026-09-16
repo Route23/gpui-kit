@@ -97,6 +97,7 @@ impl DivInspector {
                 .tab_size(TabSize {
                     tab_size: 4,
                     hard_tabs: false,
+                    indent_size: 0,
                 });
 
             editor.lsp.completion_provider = Some(lsp_provider.clone());

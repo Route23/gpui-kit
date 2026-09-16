@@ -826,6 +826,7 @@ mod tests {
         TabSize {
             tab_size: 4,
             hard_tabs: false,
+    indent_size: 0,
         }
     }
 

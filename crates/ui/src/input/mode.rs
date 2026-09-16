@@ -240,6 +240,65 @@ impl RenderWhitespace {
     }
 }
 
+/// How indent guides are coloured (Zed's `indent_guides.coloring`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GuideColoring {
+    /// One colour for every level -- the theme's border.
+    #[default]
+    Disabled,
+    /// One colour for every level, but the accent instead of the border.
+    Fixed,
+    /// A different colour per depth, cycling through a small palette.
+    IndentAware,
+}
+
+/// Whether each indent level gets a tinted band behind the text
+/// (Zed's `indent_guides.background_coloring`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GuideBackground {
+    #[default]
+    Disabled,
+    /// A very faint band per depth, in the same cycle as `IndentAware`.
+    IndentAware,
+}
+
+/// What a new line inherits from the line above it.
+///
+/// Mirrors VS Code's `editor.autoIndent` and Zed's `auto_indent`. **The
+/// syntax tree is not consulted** -- VS Code's `full` and Zed's
+/// `syntax_aware` need per-language indent queries, and this fork ships
+/// highlight queries only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AutoIndent {
+    /// A new line starts at column zero.
+    None,
+    /// A new line copies the indent of the line above. **The old behaviour.**
+    #[default]
+    Keep,
+    /// `Keep`, plus one level after an opening bracket, and one level back
+    /// when a closing bracket is typed as the first thing on a line.
+    Brackets,
+}
+
+/// The characters whitespace marks are drawn with (Zed's `whitespace_map`).
+///
+/// **Empty means the built-in quads** -- a centred dot and an arrow drawn
+/// without shaping any glyph. Setting a character switches that mark to a
+/// shaped glyph, which costs one `shape_line` per distinct character.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WhitespaceMap {
+    pub space: Option<char>,
+    pub tab: Option<char>,
+}
+
+impl WhitespaceMap {
+    /// Whether anything here needs glyph shaping.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.space.is_none() && self.tab.is_none()
+    }
+}
+
 /// Which suspicious characters get a mark.
 ///
 /// Mirrors VS Code's `editor.unicodeHighlight.*`, collapsed to one choice
@@ -406,6 +465,37 @@ pub(crate) enum InputMode {
         inlay_hint_font_size: f32,
         /// Whether a chip is drawn behind an inlay hint.
         inlay_hint_background: bool,
+        /// Whether the indent level the caret sits in is drawn differently.
+        indent_guide_active: bool,
+        /// How thick an indent guide is, in px (1--10).
+        indent_guide_width: f32,
+        /// How thick the active indent guide is, in px (1--10).
+        indent_guide_active_width: f32,
+        /// How indent guides are coloured.
+        indent_guide_coloring: GuideColoring,
+        /// Whether each indent level gets a tinted band behind the text.
+        indent_guide_background: GuideBackground,
+        /// What a new line inherits from the line above it.
+        auto_indent: AutoIndent,
+        /// Whether pasted lines are re-indented to where they landed.
+        auto_indent_on_paste: bool,
+        /// Whether that also happens inside a string or a comment.
+        auto_indent_on_paste_in_string: bool,
+        /// Whether indent this inserted is taken back when the caret leaves
+        /// the line without anything being typed on it.
+        trim_auto_whitespace: bool,
+        /// Whether joining two lines also drops the second one\'s indent.
+        trim_whitespace_on_delete: bool,
+        /// Whether backspace in leading whitespace goes back a whole tab stop.
+        use_tab_stops: bool,
+        /// Whether the arrow keys step over leading spaces a tab stop at a time.
+        sticky_tab_stops: bool,
+        /// Whether a new line continues a Markdown list marker.
+        list_on_newline: bool,
+        /// Whether Tab at the start of a list item indents the item.
+        indent_list_on_tab: bool,
+        /// The characters whitespace marks are drawn with.
+        whitespace_map: WhitespaceMap,
         /// Whether every other run of the selected text is marked too.
         selection_highlight: bool,
         /// How long the selection may be and still do that, in characters.
@@ -571,6 +661,21 @@ impl InputMode {
             surrounding_lines_style: SurroundingLinesStyle::default(),
             autoscroll_on_clicks: false,
             caret_animation: CaretAnimation::default(),
+            indent_guide_active: false,
+            indent_guide_width: 1.,
+            indent_guide_active_width: 1.,
+            indent_guide_coloring: GuideColoring::default(),
+            indent_guide_background: GuideBackground::default(),
+            auto_indent: AutoIndent::default(),
+            auto_indent_on_paste: false,
+            auto_indent_on_paste_in_string: false,
+            trim_auto_whitespace: false,
+            trim_whitespace_on_delete: false,
+            use_tab_stops: false,
+            sticky_tab_stops: false,
+            list_on_newline: true,
+            indent_list_on_tab: false,
+            whitespace_map: WhitespaceMap::default(),
             diagnostics: DiagnosticSet::new(&Rope::new()),
         }
     }
@@ -956,6 +1061,113 @@ impl InputMode {
     #[inline]
     pub(super) fn smart_select_whitespace(&self) -> bool {
         matches!(self, InputMode::CodeEditor { smart_select_whitespace: true, .. })
+    }
+
+    /// Whether the caret's indent level is drawn differently.
+    #[inline]
+    pub(super) fn indent_guide_active(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { indent_guide_active: true, .. })
+    }
+
+    /// How thick indent guides are: (normal, active), in px.
+    #[inline]
+    pub(super) fn indent_guide_widths(&self) -> (f32, f32) {
+        match self {
+            InputMode::CodeEditor {
+                indent_guide_width,
+                indent_guide_active_width,
+                ..
+            } => (*indent_guide_width, *indent_guide_active_width),
+            _ => (1., 1.),
+        }
+    }
+
+    /// How indent guides are coloured.
+    #[inline]
+    pub(super) fn indent_guide_coloring(&self) -> GuideColoring {
+        match self {
+            InputMode::CodeEditor { indent_guide_coloring, .. } => *indent_guide_coloring,
+            _ => GuideColoring::Disabled,
+        }
+    }
+
+    /// Whether each indent level gets a tinted band.
+    #[inline]
+    pub(super) fn indent_guide_background(&self) -> GuideBackground {
+        match self {
+            InputMode::CodeEditor { indent_guide_background, .. } => *indent_guide_background,
+            _ => GuideBackground::Disabled,
+        }
+    }
+
+    /// What a new line inherits from the line above it.
+    #[inline]
+    pub(super) fn auto_indent(&self) -> AutoIndent {
+        match self {
+            InputMode::CodeEditor { auto_indent, .. } => *auto_indent,
+            // Plain multi-line text keeps the old copy-the-indent behaviour
+            // only in the code editor; elsewhere a new line starts at zero.
+            _ => AutoIndent::None,
+        }
+    }
+
+    /// Whether pasted lines are re-indented, and whether that reaches inside
+    /// a string or a comment.
+    #[inline]
+    pub(super) fn auto_indent_on_paste(&self) -> (bool, bool) {
+        match self {
+            InputMode::CodeEditor {
+                auto_indent_on_paste,
+                auto_indent_on_paste_in_string,
+                ..
+            } => (*auto_indent_on_paste, *auto_indent_on_paste_in_string),
+            _ => (false, false),
+        }
+    }
+
+    /// Whether indent nobody typed on is taken back.
+    #[inline]
+    pub(super) fn trim_auto_whitespace(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { trim_auto_whitespace: true, .. })
+    }
+
+    /// Whether joining two lines drops the second one's indent.
+    #[inline]
+    pub(super) fn trim_whitespace_on_delete(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { trim_whitespace_on_delete: true, .. })
+    }
+
+    /// Whether backspace in leading whitespace goes back a whole tab stop.
+    #[inline]
+    pub(super) fn use_tab_stops(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { use_tab_stops: true, .. })
+    }
+
+    /// Whether the arrow keys step over leading spaces a tab stop at a time.
+    #[inline]
+    pub(super) fn sticky_tab_stops(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { sticky_tab_stops: true, .. })
+    }
+
+    /// Whether a new line continues a Markdown list marker.
+    #[inline]
+    pub(super) fn list_on_newline(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { list_on_newline: true, .. })
+    }
+
+    /// Whether Tab at the start of a list item indents the item.
+    #[inline]
+    pub(super) fn indent_list_on_tab(&self) -> bool {
+        matches!(self, InputMode::CodeEditor { indent_list_on_tab: true, .. })
+    }
+
+    /// The characters whitespace marks are drawn with.
+    #[inline]
+    pub(super) fn whitespace_map(&self) -> WhitespaceMap {
+        match self {
+            InputMode::CodeEditor { whitespace_map, .. } => whitespace_map.clone(),
+            _ => WhitespaceMap::default(),
+        }
     }
 
     /// Whether control characters get a visible box.
@@ -1485,7 +1697,8 @@ mod tests {
     use crate::{
         highlighter::DiagnosticSet,
         input::{
-            AutoClose, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle, MatchBrackets,
+            AutoClose, AutoIndent, BracketGuides, CaretAnimation, CursorBlinking, CursorStyle,
+            GuideBackground, GuideColoring, MatchBrackets, WhitespaceMap,
             SurroundingLinesStyle, TabSize,
             mode::{
                 DEFAULT_INLINE_DIAGNOSTIC_PADDING, DEFAULT_MAX_FOLD_REGIONS,
@@ -1644,6 +1857,21 @@ search_options: crate::input::SearchOptions::default(),
             surrounding_lines_style: SurroundingLinesStyle::Always,
             autoscroll_on_clicks: true,
             caret_animation: CaretAnimation::On,
+            indent_guide_active: false,
+            indent_guide_width: 1.,
+            indent_guide_active_width: 1.,
+            indent_guide_coloring: GuideColoring::Disabled,
+            indent_guide_background: GuideBackground::Disabled,
+            auto_indent: AutoIndent::Keep,
+            auto_indent_on_paste: false,
+            auto_indent_on_paste_in_string: false,
+            trim_auto_whitespace: false,
+            trim_whitespace_on_delete: false,
+            use_tab_stops: false,
+            sticky_tab_stops: false,
+            list_on_newline: true,
+            indent_list_on_tab: false,
+            whitespace_map: WhitespaceMap::default(),
             rows: 0,
             tab: Default::default(),
             language: "rust".into(),

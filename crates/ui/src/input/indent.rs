@@ -1,14 +1,14 @@
 use gpui::{
-    Bounds, Context, EntityInputHandler as _, Hsla, Path, PathBuilder, Pixels, SharedString,
+    Bounds, Context, EntityInputHandler as _, Hsla, Path, PathBuilder, Pixels, Point, SharedString,
     TextRun, TextStyle, Window, point, px,
 };
 use ropey::RopeSlice;
 
 use crate::{
-    RopeExt,
+    ActiveTheme as _, RopeExt,
     input::{
         Indent, IndentInline, InputState, LastLayout, Outdent, OutdentInline, element::TextElement,
-        mode::InputMode,
+        mode::{GuideBackground, GuideColoring, InputMode},
     },
 };
 
@@ -18,6 +18,14 @@ pub struct TabSize {
     pub tab_size: usize,
     /// Set true to use `\t` as tab indent, default is false
     pub hard_tabs: bool,
+    /// How wide one level of indent is, when that differs from how wide a tab
+    /// character is drawn (VS Code's `editor.indentSize`).
+    ///
+    /// `0` means "the same as `tab_size`", which is the usual case. Only the
+    /// indent the editor *inserts* changes; a `\t` already in the file is
+    /// still counted as `tab_size` columns, because that is what it looks
+    /// like on screen.
+    pub indent_size: usize,
 }
 
 impl Default for TabSize {
@@ -25,16 +33,27 @@ impl Default for TabSize {
         Self {
             tab_size: 2,
             hard_tabs: false,
+            indent_size: 0,
         }
     }
 }
 
 impl TabSize {
+    /// How many columns one level of indent is worth.
+    #[inline]
+    pub fn indent_unit(&self) -> usize {
+        if self.indent_size == 0 {
+            self.tab_size
+        } else {
+            self.indent_size
+        }
+    }
+
     pub(super) fn to_string(&self) -> SharedString {
         if self.hard_tabs {
             "\t".into()
         } else {
-            " ".repeat(self.tab_size).into()
+            " ".repeat(self.indent_unit()).into()
         }
     }
 
@@ -107,6 +126,36 @@ impl TextElement {
         layout.width
     }
 
+    /// The colour cycle for `IndentAware`, by depth.
+    ///
+    /// Six steps, then it repeats -- past that the nesting is the problem,
+    /// not the colour. The same cycle is used for the background band at a
+    /// much lower alpha, so a level's guide and its band match.
+    fn guide_color(depth: usize, coloring: GuideColoring, cx: &gpui::App) -> Hsla {
+        match coloring {
+            GuideColoring::Disabled => cx.theme().border.opacity(0.85),
+            GuideColoring::Fixed => cx.theme().accent_foreground.opacity(0.5),
+            GuideColoring::IndentAware => {
+                // Hue wheel in sixths, starting at the theme's accent so the
+                // first level still looks like it belongs to the theme.
+                let base = cx.theme().accent_foreground;
+                let step = (depth % 6) as f32 / 6.;
+                Hsla {
+                    h: (base.h + step) % 1.,
+                    s: 0.45,
+                    l: base.l,
+                    a: 0.55,
+                }
+            }
+        }
+    }
+
+    /// Indent guides, grouped by (thickness, colour) so each group is one
+    /// stroked path, plus the bands drawn behind the text.
+    ///
+    /// **A `PathBuilder` carries one stroke width**, so the active guide has
+    /// to be its own path whether or not its colour differs -- which is why
+    /// this returns a list instead of the single path it used to.
     pub(super) fn layout_indent_guides(
         &self,
         state: &InputState,
@@ -114,9 +163,11 @@ impl TextElement {
         last_layout: &LastLayout,
         text_style: &TextStyle,
         window: &mut Window,
-    ) -> Option<Path<Pixels>> {
+        cx: &gpui::App,
+    ) -> (Vec<(Path<Pixels>, Hsla)>, Vec<(Bounds<Pixels>, Hsla)>) {
+        let empty = (vec![], vec![]);
         if !state.mode.has_indent_guides() {
-            return None;
+            return empty;
         }
 
         let indent_width =
@@ -125,9 +176,23 @@ impl TextElement {
         let tab_size = state.mode.tab_size();
         let line_height = last_layout.line_height;
         let visible_range = last_layout.visible_range.clone();
-        let mut builder = PathBuilder::stroke(px(1.));
+        let coloring = state.mode.indent_guide_coloring();
+        let background = state.mode.indent_guide_background();
+        let (width, active_width) = state.mode.indent_guide_widths();
+        let highlight_active = state.mode.indent_guide_active();
+
+        // Which depth the caret sits in, counted the same way the guides are.
+        let active_depth = highlight_active.then(|| {
+            let row = state.text.offset_to_point(state.cursor()).row;
+            let line = state.text.slice_line(row);
+            tab_size.indent_count(&line) / tab_size.tab_size.max(1)
+        });
+
+        // depth -> the segments drawn at that depth.
+        let mut segments: Vec<(usize, Point<Pixels>)> = vec![];
+        let mut bands: Vec<(Bounds<Pixels>, Hsla)> = vec![];
         let mut offset_y = last_layout.visible_top;
-        let mut last_indents = vec![];
+        let mut last_indents: Vec<(usize, Pixels)> = vec![];
         for ix in visible_range {
             let line = state.text.slice_line(ix);
             let Some(line_layout) = last_layout.line(ix) else {
@@ -142,36 +207,70 @@ impl TextElement {
             let mut current_indents = vec![];
             if line.len() > 0 {
                 let indent_count = tab_size.indent_count(&line);
-                for offset in (0..indent_count).step_by(tab_size.tab_size) {
+                for (depth, offset) in (0..indent_count).step_by(tab_size.tab_size).enumerate() {
                     let x = if indent_count > 0 {
                         indent_width * offset as f32 / tab_size.tab_size as f32
                     } else {
                         px(0.)
                     };
-
-                    let pos = point(x + last_layout.line_number_width, offset_y);
-
-                    builder.move_to(pos);
-                    builder.line_to(point(pos.x, pos.y + line_height));
-                    current_indents.push(pos.x);
+                    current_indents.push((depth, x + last_layout.line_number_width));
                 }
-            } else if last_indents.len() > 0 {
-                for x in &last_indents {
-                    let pos = point(*x, offset_y);
-                    builder.move_to(pos);
-                    builder.line_to(point(pos.x, pos.y + line_height));
-                }
+            } else {
                 current_indents = last_indents.clone();
             }
 
-            offset_y += line_layout.wrapped_lines.len() * line_height;
+            let height = line_layout.wrapped_lines.len() * line_height;
+            for (depth, x) in &current_indents {
+                segments.push((*depth, point(*x, offset_y)));
+                if background == GuideBackground::IndentAware {
+                    let color = Self::guide_color(*depth, GuideColoring::IndentAware, cx);
+                    bands.push((
+                        Bounds::new(
+                            point(*x + bounds.origin.x, offset_y + bounds.origin.y),
+                            gpui::size(indent_width, height),
+                        ),
+                        color.opacity(0.06),
+                    ));
+                }
+            }
+
+            offset_y += height;
             last_indents = current_indents;
         }
 
-        builder.translate(bounds.origin);
-        let path = builder.build().unwrap();
-        Some(path)
+        // Group by (thickness, colour). The key is cheap to compare and there
+        // are at most a handful of groups on a screen.
+        let mut groups: Vec<(f32, Hsla, PathBuilder)> = vec![];
+        for (depth, pos) in segments {
+            let is_active = active_depth == Some(depth);
+            let w = if is_active { active_width } else { width };
+            let color = if is_active && highlight_active {
+                Self::guide_color(depth, coloring, cx).opacity(1.0)
+            } else {
+                Self::guide_color(depth, coloring, cx)
+            };
+            let slot = groups
+                .iter_mut()
+                .position(|(gw, gc, _)| *gw == w && *gc == color)
+                .unwrap_or_else(|| {
+                    groups.push((w, color, PathBuilder::stroke(px(w))));
+                    groups.len() - 1
+                });
+            let b = &mut groups[slot].2;
+            b.move_to(pos);
+            b.line_to(point(pos.x, pos.y + line_height));
+        }
+
+        let mut paths = vec![];
+        for (_, color, mut builder) in groups {
+            builder.translate(bounds.origin);
+            if let Ok(path) = builder.build() {
+                paths.push((path, color));
+            }
+        }
+        (paths, bands)
     }
+
 }
 
 impl InputState {
@@ -247,6 +346,12 @@ impl InputState {
     ) {
         // First, try to accept inline completion if present
         if self.accept_inline_completion(window, cx) {
+            return;
+        }
+        // Tab inside a list marker indents the whole item, the way Markdown
+        // editors do (#248, Zed's `indent_list_on_tab`).
+        if self.tab_indents_list() {
+            self.indent(true, window, cx);
             return;
         }
         self.indent(false, window, cx);
@@ -418,22 +523,26 @@ mod tests {
         let tab = TabSize {
             tab_size: 2,
             hard_tabs: false,
+    indent_size: 0,
         };
         assert_eq!(tab.to_string(), "  ");
         let tab = TabSize {
             tab_size: 4,
             hard_tabs: false,
+    indent_size: 0,
         };
         assert_eq!(tab.to_string(), "    ");
 
         let tab = TabSize {
             tab_size: 2,
             hard_tabs: true,
+    indent_size: 0,
         };
         assert_eq!(tab.to_string(), "\t");
         let tab = TabSize {
             tab_size: 4,
             hard_tabs: true,
+    indent_size: 0,
         };
         assert_eq!(tab.to_string(), "\t");
     }
@@ -443,6 +552,7 @@ mod tests {
         let tab = TabSize {
             tab_size: 4,
             hard_tabs: false,
+    indent_size: 0,
         };
         assert_eq!(tab.indent_count(&RopeSlice::from("abc")), 0);
         assert_eq!(tab.indent_count(&RopeSlice::from("  abc")), 2);
