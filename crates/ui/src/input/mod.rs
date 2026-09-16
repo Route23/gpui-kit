@@ -54,6 +54,7 @@ pub use mode::{
     DetailAlignment, InsertMode, KindDisplay, LineNumbers, QuickSuggestions, RenderWhitespace,
     ScrollBeyondLastLine, StickyModel, SuggestBehaviour, SuggestSelection, SuggestStyle, WhitespaceMap, WrapAt,
 };
+pub use popovers::SignatureHint;
 pub use scrollbar_marks::{MarkSeverity, ScrollbarMarks};
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};
 pub use otp_input::*;
