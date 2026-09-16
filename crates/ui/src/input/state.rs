@@ -4093,15 +4093,18 @@ impl EntityInputHandler for InputState {
         self.mode.update_auto_grow(&self.text_wrapper);
         if !self.silent_replace_text {
             self.handle_completion_trigger(&range, &new_text, window, cx);
-            // Parameter hints follow the brackets (#246). `)` closes them;
-            // `signature_help_after_edits` re-asks on anything else.
-            match new_text.chars().next_back() {
-                Some('(') | Some(',') => self.request_signature_help(None, window, cx),
-                Some(')') => self.hide_signature_help(cx),
-                _ if self.mode.parameter_hints_behaviour().1 => {
-                    self.request_signature_help(None, window, cx);
-                }
-                _ => {}
+            // Parameter hints follow the brackets (#246).
+            //
+            // **Look at what the text holds, not at its last character.**
+            // Auto-closing turns a typed `(` into `()`, so the last character
+            // is a `)` and the hints were taken away the instant they were
+            // asked for.
+            if new_text.contains('(') || new_text.contains(',') {
+                self.request_signature_help(None, window, cx);
+            } else if new_text.chars().next_back() == Some(')') {
+                self.hide_signature_help(cx);
+            } else if self.mode.parameter_hints_behaviour().1 {
+                self.request_signature_help(None, window, cx);
             }
         }
         cx.emit(InputEvent::Change);
