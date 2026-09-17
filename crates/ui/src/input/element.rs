@@ -1184,6 +1184,7 @@ impl TextElement {
                         visible_range_offset.start + offset,
                         &line_runs,
                         bg_segments,
+                        state.mode.minimum_contrast(),
                     )
                 };
 
@@ -2468,10 +2469,19 @@ pub(super) fn runs_for_range(
     result
 }
 
+/// Re-colour the text that sits on a highlight background.
+///
+/// `min_lc` is the APCA contrast floor (dopamine #276 / ADR-0109):
+///
+/// - **`0` keeps the old behaviour** -- the run is slammed to black or white,
+///   which reads fine but **throws the syntax colour away**.
+/// - Anything above keeps the colour and **only moves its lightness** until it
+///   clears the floor (Zed's `minimum_contrast_for_highlights`).
 fn split_runs_by_bg_segments(
     start_offset: usize,
     runs: &[TextRun],
     bg_segments: &[(Range<usize>, Hsla)],
+    min_lc: f32,
 ) -> Vec<TextRun> {
     let mut result = vec![];
 
@@ -2497,7 +2507,9 @@ fn split_runs_by_bg_segments(
             // Add the overlapping part with background color
             let overlap_start = run_start.max(bg_range.start);
             let overlap_end = run_end.min(bg_range.end);
-            let text_color = if bg_color.l >= 0.5 {
+            let text_color = if min_lc > 0. {
+                super::contrast::ensure(run.color, *bg_color, min_lc)
+            } else if bg_color.l >= 0.5 {
                 gpui::black()
             } else {
                 gpui::white()
@@ -2636,7 +2648,7 @@ mod tests {
         ];
 
         let bg_segments = vec![(8..12, gpui::red()), (12..18, gpui::blue())];
-        let result = split_runs_by_bg_segments(5, &runs, &bg_segments);
+        let result = split_runs_by_bg_segments(5, &runs, &bg_segments, 0.);
         assert_eq!(
             result.iter().map(|run| run.len).collect::<Vec<_>>(),
             vec![3, 2, 2, 5, 1, 23]

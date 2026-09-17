@@ -4,6 +4,7 @@ mod brackets;
 mod caret;
 mod change;
 mod comment;
+mod contrast;
 mod clear_button;
 mod cursor;
 mod element;

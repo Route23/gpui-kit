@@ -658,6 +658,10 @@ pub(crate) enum InputMode {
         suggest_preview: bool,
         /// Whether the menu carries a scrollbar.
         suggest_scrollbar: bool,
+        /// The APCA contrast floor for text drawn on a highlight background
+        /// (dopamine #276 / ADR-0109). **`0` keeps the old behaviour** -- the
+        /// text is slammed to black or white and the syntax colour is lost.
+        minimum_contrast: f32,
         /// Whether parameter hints are asked for and shown.
         parameter_hints: bool,
         /// Whether cycling past the last overload wraps.
@@ -879,6 +883,7 @@ impl InputMode {
             suggest_show_status_bar: false,
             suggest_preview: false,
             suggest_scrollbar: true,
+            minimum_contrast: 0.,
             parameter_hints: true,
             parameter_hints_cycle: false,
             signature_help_after_edits: false,
@@ -1382,6 +1387,14 @@ impl InputMode {
 
     /// Whether parameter hints are asked for and shown.
     #[inline]
+    /// The APCA floor for text on a highlight (dopamine #276 / ADR-0109).
+    pub(super) fn minimum_contrast(&self) -> f32 {
+        match self {
+            InputMode::CodeEditor { minimum_contrast, .. } => *minimum_contrast,
+            _ => 0.,
+        }
+    }
+
     pub(super) fn parameter_hints(&self) -> bool {
         matches!(self, InputMode::CodeEditor { parameter_hints: true, .. })
     }
@@ -2347,6 +2360,7 @@ search_options: crate::input::SearchOptions::default(),
             suggest_show_status_bar: false,
             suggest_preview: false,
             suggest_scrollbar: true,
+            minimum_contrast: 0.,
             parameter_hints: true,
             parameter_hints_cycle: false,
             signature_help_after_edits: false,

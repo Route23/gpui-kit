@@ -852,6 +852,21 @@ impl InputState {
         self
     }
 
+    /// The APCA contrast floor for text on a highlight background
+    /// (dopamine #276 / ADR-0109).
+    ///
+    /// **`0` keeps the old behaviour** -- text on a highlight is slammed to
+    /// black or white, which reads fine but loses the syntax colour. Anything
+    /// above keeps the colour and only moves its lightness far enough to clear
+    /// the floor (Zed's `minimum_contrast_for_highlights`, whose default is 45).
+    pub fn minimum_contrast(mut self, lc: f32) -> Self {
+        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
+        if let InputMode::CodeEditor { minimum_contrast, .. } = &mut self.mode {
+            *minimum_contrast = lc.max(0.);
+        }
+        self
+    }
+
     /// The parameter hints shown inside a call (#246).
     pub fn parameter_hints(mut self, on: bool, cycle: bool, after_edits: bool) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
