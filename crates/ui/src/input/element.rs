@@ -551,6 +551,39 @@ impl TextElement {
         builder.build().ok()
     }
 
+    /// The highlight backgrounds text is drawn on (dopamine #276 / ADR-0109).
+    ///
+    /// The selection and the search matches paint **behind** the text, so the
+    /// syntax colour can end up unreadable on them. These ranges let
+    /// [`split_runs_by_bg_segments`] lift it just far enough.
+    ///
+    /// **Empty unless a floor is set** -- with `minimum_contrast == 0` nothing
+    /// is collected and the text is left exactly as it was.
+    ///
+    /// The colours have to match what `paint` fills these paths with, or the
+    /// contrast is measured against the wrong background.
+    fn contrast_segments(&self, state: &InputState, cx: &App) -> Vec<(Range<usize>, Hsla)> {
+        if state.mode.minimum_contrast() <= 0. {
+            return vec![];
+        }
+        let strong = cx.theme().selection;
+        let faint = strong.saturation(0.1);
+        let mut out = Vec::new();
+        if let Some(panel) = state.search_panel.clone() {
+            if let Some(matcher) = panel.read(cx).matcher() {
+                for (i, range) in matcher.matched_ranges.as_ref().iter().enumerate() {
+                    let colour = if matcher.current_match_ix == i { strong } else { faint };
+                    out.push((range.clone(), colour));
+                }
+            }
+        }
+        let selected = state.selected_range;
+        if selected.start < selected.end {
+            out.push((selected.start..selected.end, strong));
+        }
+        out
+    }
+
     fn layout_search_matches(
         &self,
         last_layout: &LastLayout,
@@ -1645,13 +1678,19 @@ impl Element for TextElement {
         let document_colors = state
             .lsp
             .document_colors_for_range(&text, &last_layout.visible_range);
+        // The highlight backgrounds the text has to stay readable on
+        // (dopamine #276 / ADR-0109). **Only collected when the floor is set**
+        // -- at `0` the text keeps its syntax colour the way it always has.
+        let contrast_segments = self.contrast_segments(&state, cx);
+        let mut segments = document_colors.clone();
+        segments.extend(contrast_segments);
         let lines = Self::layout_lines(
             &state,
             &display_text,
             &last_layout,
             text_size,
             &runs,
-            &document_colors,
+            &segments,
             window,
         );
 
