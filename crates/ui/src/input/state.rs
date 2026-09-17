@@ -467,6 +467,11 @@ pub struct InputState {
     pub(super) expand_stack: Vec<Range<usize>>,
     /// Ranges the host said may be clicked (#256). See `links.rs`.
     pub(super) link_ranges: Vec<Range<usize>>,
+    /// What a language server said each span of text is (#388).
+    ///
+    /// Sorted by `range.start` and non-overlapping; `semantic_spans_in` leans
+    /// on that to find the visible slice by binary search.
+    pub(super) semantic_spans: Vec<super::SemanticSpan>,
     /// The one the pointer is on **with the modifier held**, if any.
     pub(super) link_hover: Option<Range<usize>>,
 
@@ -589,6 +594,7 @@ impl InputState {
             hover_definition: HoverDefinition::default(),
             expand_stack: Vec::new(),
             link_ranges: Vec::new(),
+            semantic_spans: Vec::new(),
             link_hover: None,
             silent_replace_text: false,
             size: Size::default(),

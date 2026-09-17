@@ -27,6 +27,7 @@ mod scrollbar_marks;
 mod links;
 mod list;
 mod search;
+mod semantic;
 mod state;
 mod tags;
 mod text_wrapper;
@@ -49,6 +50,7 @@ pub use comment::CommentTokens;
 pub use fold::{FoldKind, FoldRange};
 pub use inlay::InlayRow;
 pub use inline_diag::InlineDiagnostic;
+pub use semantic::SemanticSpan;
 pub use mode::{
     UnicodeHighlight,
     AutoIndent, FoldingControls, GuideBackground, GuideColoring, InlayModifier, LineHighlight,

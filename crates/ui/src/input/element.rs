@@ -1307,6 +1307,31 @@ impl TextElement {
         // Combine marker styles
         styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
 
+        // What the language server said each word is (#388).
+        //
+        // **Over the tree, under the brackets.** Same `overwrite_colors` path
+        // as below, and for the same reason: `combine_highlights` would pick a
+        // winner at random between two passes that both set `.color`. The
+        // brackets stay on top because their colour is about nesting depth,
+        // not about what the word means.
+        let semantic = state.semantic_spans_in(&visible_byte_range);
+        if !semantic.is_empty() {
+            let colors: Vec<(Range<usize>, Hsla)> = semantic
+                .iter()
+                .filter_map(|span| {
+                    // A name the theme does not know leaves the span alone --
+                    // the tree's colour is better than no colour.
+                    let color = cx
+                        .theme()
+                        .highlight_theme
+                        .style(span.capture.as_ref())
+                        .and_then(|s| s.color)?;
+                    Some((span.range.clone(), color))
+                })
+                .collect();
+            styles = overwrite_colors(styles, &colors);
+        }
+
         // Colour bracket pairs by nesting depth (VS Code's
         // `bracketPairColorization`).
         //
