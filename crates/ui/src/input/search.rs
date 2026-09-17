@@ -790,11 +790,16 @@ impl Render for SearchPanel {
             .on_action(cx.listener(Self::on_action_tab))
             .font_family(cx.theme().font_family.clone())
             .items_center()
-            .py_2()
-            .px_3()
+            // **Tight.** The bar sits on top of the text the reader is looking
+            // for; every row it takes is a row of that text they cannot see.
+            .py_0p5()
+            .px_1p5()
             .w_full()
             .gap_1()
-            .bg(cx.theme().popover)
+            // **The same surface as the field inside it.** A popover colour
+            // here draws a second box around the search field, and the reader
+            // reads the pair as two nested things rather than one bar.
+            .bg(cx.theme().background)
             .border_b_1()
             .rounded(cx.theme().radius.half())
             .border_color(cx.theme().border)
