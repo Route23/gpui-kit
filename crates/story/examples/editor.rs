@@ -681,6 +681,8 @@ impl Example {
                 .tab_size(TabSize {
                     tab_size: 4,
                     hard_tabs: false,
+                    // 0 = the same as `tab_size` (dopamine's fork, ADR-0097).
+                    indent_size: 0,
                 })
                 .soft_wrap(false)
                 .default_value(include_str!("./fixtures/test.rs"))

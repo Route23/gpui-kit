@@ -259,7 +259,8 @@ impl TextElement {
                 });
             }
 
-            offset_y += line_layout.wrapped_lines.len() as f32 * line_height;
+            offset_y += line_layout.wrapped_lines.len() as f32 * line_height
+                + last_layout.extra_height(row);
             row_offset += line.len() + 1;
         }
 

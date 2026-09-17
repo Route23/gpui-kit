@@ -325,6 +325,12 @@ pub(super) struct LastLayout {
     pub(super) line_number_width: Pixels,
     /// The cursor position (top, left) in pixels.
     pub(super) cursor_bounds: Option<Bounds<Pixels>>,
+    /// Rows inserted below each visible row, in the same order as `lines`.
+    ///
+    /// The painting walks step through `lines` (shaped, wrapped) and never see
+    /// a `LineItem`, so this is where they ask. Empty while nothing is
+    /// inserted, which is the normal case.
+    pub(super) extra_rows: Rc<Vec<usize>>,
 }
 
 impl LastLayout {
@@ -339,6 +345,20 @@ impl LastLayout {
         }
 
         self.lines.get(row.saturating_sub(self.visible_range.start))
+    }
+
+    /// The height of what is inserted **below** `row`, 0 for a row with nothing
+    /// under it (and for a row outside the viewport).
+    pub(crate) fn extra_height(&self, row: usize) -> Pixels {
+        if row < self.visible_range.start {
+            return px(0.);
+        }
+        let rows = self
+            .extra_rows
+            .get(row - self.visible_range.start)
+            .copied()
+            .unwrap_or(0);
+        rows as f32 * self.line_height
     }
 }
 

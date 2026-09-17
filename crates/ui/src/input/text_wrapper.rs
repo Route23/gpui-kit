@@ -20,6 +20,13 @@ pub(super) struct LineItem {
     /// The wrap info is kept, so unfolding needs no re-wrap (which would need
     /// the text system, and therefore a `Window`).
     pub(super) hidden: bool,
+    /// Rows inserted **below** this one that are not text: the ghost lines of a
+    /// multi-line inline completion today, code lenses later.
+    ///
+    /// Kept on the row rather than added by whoever paints them, so that every
+    /// y-walk which already asks a row for its height follows along -- the hit
+    /// tests included. Painting them is still the caller's business.
+    pub(super) extra_rows: usize,
 }
 
 impl LineItem {
@@ -41,9 +48,25 @@ impl LineItem {
         self.wrapped_lines.len()
     }
 
+    /// Rows inserted below this one, as seen on screen.
+    ///
+    /// A folded row shows nothing, so what was inserted under it takes no room
+    /// either -- same rule as [`LineItem::lines_len`].
+    #[inline]
+    pub(super) fn extra_rows(&self) -> usize {
+        if self.hidden {
+            return 0;
+        }
+        self.extra_rows
+    }
+
     /// Get the height of this line item with given line height.
+    ///
+    /// **Text rows plus anything inserted under them.** Every y-walk that goes
+    /// through here -- the visible range, the caret hit test, the fold gutter
+    /// hit test -- keeps up with an insertion for free.
     pub(super) fn height(&self, line_height: Pixels) -> Pixels {
-        self.lines_len() as f32 * line_height
+        (self.lines_len() + self.extra_rows()) as f32 * line_height
     }
 }
 
@@ -77,6 +100,12 @@ pub(super) struct TextWrapper {
     /// and `set_font` both go through the latter, and would otherwise drop
     /// every flag mid-frame.
     hidden_rows: Vec<usize>,
+    /// Rows inserted below a row, as `(row, rows)`.
+    ///
+    /// Kept here for the same reason as `hidden_rows`: `_update` splices
+    /// `lines` and `update_all` rebuilds it outright, so flags living only on
+    /// the lines would be dropped mid-frame.
+    extra_rows: Vec<(usize, usize)>,
 
     _initialized: bool,
 }
@@ -93,6 +122,7 @@ impl TextWrapper {
             longest_row: LongestRow::default(),
             lines: Vec::new(),
             hidden_rows: Vec::new(),
+            extra_rows: Vec::new(),
             _initialized: false,
         }
     }
@@ -122,6 +152,40 @@ impl TextWrapper {
     pub(super) fn set_hidden_rows(&mut self, rows: Vec<usize>) {
         self.hidden_rows = rows;
         self.apply_hidden_rows();
+    }
+
+    /// Replace the set of rows inserted below a row, as `(row, rows)`.
+    ///
+    /// Clear-then-set like [`TextWrapper::set_hidden_rows`], and for the same
+    /// reason. Passing an empty list is how an insertion goes away.
+    pub(super) fn set_extra_rows(&mut self, rows: Vec<(usize, usize)>) {
+        if self.extra_rows == rows {
+            return;
+        }
+        self.extra_rows = rows;
+        self.apply_extra_rows();
+    }
+
+    fn apply_extra_rows(&mut self) {
+        for line in self.lines.iter_mut() {
+            line.extra_rows = 0;
+        }
+        for &(row, rows) in &self.extra_rows {
+            if let Some(line) = self.lines.get_mut(row) {
+                line.extra_rows = rows;
+            }
+        }
+    }
+
+    /// The height of every row, insertions included.
+    ///
+    /// **The one truth for the scroll size** -- whoever paints an insertion
+    /// must not add its height a second time.
+    pub(super) fn total_height(&self, line_height: Pixels) -> Pixels {
+        self.lines
+            .iter()
+            .map(|line| line.height(line_height))
+            .fold(px(0.), |acc, h| acc + h)
     }
 
     fn apply_hidden_rows(&mut self) {
@@ -261,6 +325,7 @@ impl TextWrapper {
                 line: Rope::from(line),
                 wrapped_lines,
                 hidden: false,
+                extra_rows: 0,
             });
         }
 
@@ -272,6 +337,7 @@ impl TextWrapper {
 
         self.text = changed_text.clone();
         self.apply_hidden_rows();
+        self.apply_extra_rows();
         self.longest_row = LongestRow {
             row: longest_row_ix,
             len: longest_row_len,
@@ -558,6 +624,87 @@ impl LineLayout {
 mod tests {
     use super::*;
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+
+    fn test_font() -> gpui::Font {
+        gpui::Font {
+            family: "Arial".into(),
+            weight: FontWeight::default(),
+            style: FontStyle::Normal,
+            features: FontFeatures::default(),
+            fallbacks: None,
+        }
+    }
+
+    fn no_wrap(_line: &str, _wrap_width: Pixels) -> Vec<Boundary> {
+        vec![]
+    }
+
+    /// Four one-line rows, no soft wrap.
+    fn four_rows() -> (Rope, TextWrapper) {
+        let text = Rope::from("one\ntwo\nthree\nfour");
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+        wrapper._update(&text, &(0..text.len()), &text, &mut no_wrap);
+        (text, wrapper)
+    }
+
+    /// A row carries what was inserted under it, and the total follows.
+    #[test]
+    fn inserted_rows_add_to_the_height() {
+        let (_text, mut wrapper) = four_rows();
+        let h = px(20.);
+        assert_eq!(wrapper.total_height(h), px(80.));
+
+        wrapper.set_extra_rows(vec![(1, 2)]);
+        assert_eq!(wrapper.lines[1].height(h), px(60.));
+        // Only that row: the others are untouched.
+        assert_eq!(wrapper.lines[0].height(h), px(20.));
+        assert_eq!(wrapper.total_height(h), px(120.));
+
+        // An empty list is how an insertion goes away.
+        wrapper.set_extra_rows(vec![]);
+        assert_eq!(wrapper.total_height(h), px(80.));
+    }
+
+    /// Nothing shows under a folded row, so nothing takes room there either.
+    #[test]
+    fn a_folded_row_hides_what_was_inserted_under_it() {
+        let (_text, mut wrapper) = four_rows();
+        let h = px(20.);
+        wrapper.set_extra_rows(vec![(1, 2)]);
+        wrapper.set_hidden_rows(vec![1]);
+
+        assert_eq!(wrapper.lines[1].extra_rows(), 0);
+        assert_eq!(wrapper.lines[1].height(h), px(0.));
+        assert_eq!(wrapper.total_height(h), px(60.));
+
+        // Unfolding brings both the row and its insertion back.
+        wrapper.set_hidden_rows(vec![]);
+        assert_eq!(wrapper.lines[1].height(h), px(60.));
+    }
+
+    /// `_update` splices `lines`; the flags have to be put back afterwards.
+    #[test]
+    fn inserted_rows_survive_a_rewrap() {
+        let (mut text, mut wrapper) = four_rows();
+        let h = px(20.);
+        wrapper.set_extra_rows(vec![(1, 3)]);
+
+        let range = text.len()..text.len();
+        text.replace(range.clone(), "\nfive");
+        wrapper._update(&text, &range, &Rope::from("\nfive"), &mut no_wrap);
+
+        assert_eq!(wrapper.lines.len(), 5);
+        assert_eq!(wrapper.lines[1].extra_rows(), 3);
+        assert_eq!(wrapper.total_height(h), px(160.));
+    }
+
+    /// A row the text no longer has is dropped, not carried on the next one.
+    #[test]
+    fn an_insertion_past_the_end_is_dropped() {
+        let (_text, mut wrapper) = four_rows();
+        wrapper.set_extra_rows(vec![(9, 2)]);
+        assert_eq!(wrapper.total_height(px(20.)), px(80.));
+    }
 
     #[test]
     fn test_update() {
@@ -864,24 +1011,28 @@ mod tests {
                 line: Rope::from("Hello, 世界!\r"),
                 wrapped_lines: vec![0..15],
                 hidden: false,
+                extra_rows: 0,
             },
             // range: 16..36
             LineItem {
                 line: Rope::from("This is second line."),
                 wrapped_lines: vec![0..10, 10..20],
                 hidden: false,
+                extra_rows: 0,
             },
             // range: 37..56
             LineItem {
                 line: Rope::from("This is third line."),
                 wrapped_lines: vec![0..9, 9..15, 15..20],
                 hidden: false,
+                extra_rows: 0,
             },
             // range: 57..79
             LineItem {
                 line: Rope::from("这里是第 4 行。"),
                 wrapped_lines: vec![0..22],
                 hidden: false,
+                extra_rows: 0,
             },
         ];
 

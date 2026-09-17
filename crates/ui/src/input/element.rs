@@ -261,7 +261,11 @@ impl TextElement {
                     }
                 }
 
-                offset_y += line.size(line_height).height;
+                // The shaped line is text only; rows inserted under it (ghost
+                // lines) live on the `LineItem`, which the invisible branch
+                // below gets for free through `height`.
+                offset_y += line.size(line_height).height
+                    + wrap_line.extra_rows() as f32 * line_height;
                 // +1 for the last `\n`
                 prev_lines_offset += line.len() + 1;
             } else {
@@ -432,7 +436,8 @@ impl TextElement {
         let mut offset_y = visible_top;
         let mut line_corners = vec![];
 
-        for line in lines.iter() {
+        for (ix, line) in lines.iter().enumerate() {
+            let row = last_layout.visible_range.start + ix;
             let line_size = line.size(line_height);
             let line_wrap_width = line_size.width;
 
@@ -490,7 +495,7 @@ impl TextElement {
                 break;
             }
 
-            offset_y += line_size.height;
+            offset_y += line_size.height + last_layout.extra_height(row);
             // +1 for skip the last `\n`
             prev_lines_offset += line.len() + 1;
         }
@@ -733,7 +738,7 @@ impl TextElement {
             let rows = line.wrapped_lines.len();
             tops.push((row, row_offset, offset_y, rows));
             row_offset += line.len() + 1;
-            offset_y += rows * line_height;
+            offset_y += rows * line_height + last_layout.extra_height(row);
         }
 
         // The row a byte belongs to is the last one that starts at or before it.
@@ -1530,6 +1535,24 @@ impl Element for TextElement {
         self.state.update(cx, |state, cx| {
             state.text_wrapper.set_font(font, text_size, cx);
             state.text_wrapper.prepare_if_need(&state.text, cx);
+            // **Before `calculate_visible_range`.** The ghost lines of a
+            // multi-line inline completion push everything below the caret
+            // down, so the rows have to know their height before anything
+            // walks them -- counting `\n` needs no shaping, which is why this
+            // can happen here rather than where the ghost is laid out.
+            let ghost_rows = state
+                .inline_completion
+                .item
+                .as_ref()
+                .filter(|_| state.focus_handle.is_focused(window))
+                .map(|item| item.insert_text.matches('\n').count())
+                .unwrap_or(0);
+            let cursor_row = state.cursor_position().line as usize;
+            state.text_wrapper.set_extra_rows(if ghost_rows > 0 {
+                vec![(cursor_row, ghost_rows)]
+            } else {
+                vec![]
+            });
         });
 
         let state = self.state.read(cx);
@@ -1596,6 +1619,10 @@ impl Element for TextElement {
             None
         };
 
+        // `visible_range.end` may sit one past the last row (the extra row the
+        // range keeps for the partially visible line); slicing needs it clamped.
+        let visible_range_for_extra =
+            visible_range.start..visible_range.end.min(state.text_wrapper.lines.len());
         let mut last_layout = LastLayout {
             visible_range,
             visible_top,
@@ -1605,6 +1632,14 @@ impl Element for TextElement {
             line_number_width,
             lines: Rc::new(vec![]),
             cursor_bounds: None,
+            // What the wrapper was told a moment ago, cut to the viewport: the
+            // painting walks need it per visible row.
+            extra_rows: Rc::new(
+                state.text_wrapper.lines[visible_range_for_extra.clone()]
+                    .iter()
+                    .map(|line| line.extra_rows())
+                    .collect(),
+            ),
         };
 
         let run = TextRun {
@@ -1729,7 +1764,6 @@ impl Element for TextElement {
         let ghost_line_count = ghost_lines.len();
         let ghost_lines_height = ghost_line_count as f32 * line_height;
 
-        let total_wrapped_lines = state.text_wrapper.len();
         // How far past the last line the view may scroll (#252). `Half` is
         // what this was before it became a setting.
         let empty_bottom_height = if state.mode.is_code_editor() {
@@ -1763,9 +1797,11 @@ impl Element for TextElement {
                 } else {
                     longest_line_width
                 },
-            (total_wrapped_lines as f32 * line_height
+            // **One truth for the height**: the wrapper counts the text rows
+            // and everything inserted under them, so the ghost lines must not
+            // be added a second time here.
+            (state.text_wrapper.total_height(line_height)
                 + empty_bottom_height
-                + ghost_lines_height
                 // Without these the last row cannot be scrolled to, and the
                 // pad below it would never come into view (#255 / ADR-0090).
                 + state.mode.padding_top()
@@ -2095,7 +2131,7 @@ impl Element for TextElement {
                         ));
                     }
                 }
-                offset_y += height;
+                offset_y += height + prepaint.last_layout.extra_height(row);
             }
         }
 
@@ -2386,10 +2422,11 @@ impl Element for TextElement {
                     offset_y += line_height;
                 }
 
-                // Add ghost line height after cursor row for line numbers alignment
-                if !prepaint.ghost_lines.is_empty() && prepaint.current_row.is_some() {
-                    offset_y += prepaint.ghost_lines_height;
-                }
+                // Rows inserted under this one (the ghost lines of a
+                // multi-line inline completion) push the numbers below it
+                // down. **Per row** -- this used to add the whole ghost height
+                // after every row as soon as the caret had one anywhere.
+                offset_y += prepaint.last_layout.extra_height(row);
             }
         }
 

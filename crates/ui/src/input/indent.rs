@@ -234,7 +234,7 @@ impl TextElement {
                 }
             }
 
-            offset_y += height;
+            offset_y += height + last_layout.extra_height(ix);
             last_indents = current_indents;
         }
 

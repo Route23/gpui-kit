@@ -152,6 +152,10 @@ impl InputStory {
             InputEvent::PressEnter { secondary } => println!("PressEnter secondary: {}", secondary),
             InputEvent::Focus => println!("Focus"),
             InputEvent::Blur => println!("Blur"),
+            // The variants dopamine added to the fork (ADR-0062) are of no
+            // interest to the story; naming them here would only break it
+            // again the next time one is added.
+            _ => {}
         };
     }
 
