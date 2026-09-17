@@ -2358,6 +2358,18 @@ impl InputState {
     /// Goes through `deferred_scroll_offset`, so it can be called before the
     /// first layout -- which is exactly when a restored position arrives.
     pub fn scroll_to_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        // **Kill any slide already in flight** (#404). `set_cursor_position`
+        // reveals the caret through `scroll_to`, and with smooth scrolling on
+        // (#252) that hands a 120ms ease to a background task which rewrites
+        // `deferred_scroll_offset` every 8ms. It outlives this call, so the
+        // absolute offset parked below shows for exactly one frame and is then
+        // walked back to wherever the caret reveal was heading -- the jumped-to
+        // row ends up at the bottom edge instead of the top.
+        //
+        // This is the explicit "put this row here" path, so a caret reveal
+        // queued a moment ago is stale by definition.
+        self.scroll_slide = None;
+        self.scroll_slide_task = None;
         let line_height = self
             .last_layout
             .as_ref()
