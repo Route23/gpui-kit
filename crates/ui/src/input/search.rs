@@ -574,6 +574,11 @@ impl SearchPanel {
     /// **The one place a match becomes a selection.** `move_to` + `select_to`
     /// is the same pair `go_to_definition` uses, and neither takes focus --
     /// which matters, because the reader is typing in the search field.
+    ///
+    /// **The fold comes open first.** A caret cannot rest on a hidden row, so
+    /// moving into a closed fold lands on the fold's edge instead and the
+    /// `select_to` below then sweeps everything from that edge to the match --
+    /// hundreds of rows for one word.
     fn reveal(
         &mut self,
         range: &Range<usize>,
@@ -584,6 +589,14 @@ impl SearchPanel {
         let start = range.start;
         let end = range.end;
         self.editor.update(cx, |state, cx| {
+            // Both ends: a regex match may cross rows, and the fold that hides
+            // the last row is not always the one that hides the first.
+            let start_row = state.text().offset_to_point(start).row;
+            let end_row = state.text().offset_to_point(end).row;
+            state.unfold_row(start_row, cx);
+            if end_row != start_row {
+                state.unfold_row(end_row, cx);
+            }
             state.move_to(start, direction, cx);
             state.select_to(end, cx);
             if center {

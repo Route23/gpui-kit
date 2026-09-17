@@ -181,6 +181,28 @@ pub(super) fn hidden_rows(
     rows
 }
 
+/// The headers left once every fold that **hides** `row` is opened.
+///
+/// Nested folds come open together: `headers` is the set of closed folds, and
+/// a row deep inside three of them is hidden by all three -- so all three have
+/// to go. A fold never hides its own header row, only an enclosing fold does,
+/// so a header that is merely closed stays closed.
+fn headers_showing_row(
+    text: &Rope,
+    headers: &[usize],
+    row: usize,
+    tab: TabSize,
+    supplied: Option<&[FoldRange]>,
+) -> Vec<usize> {
+    headers
+        .iter()
+        .copied()
+        .filter(|&header| {
+            fold_range_with(text, header, tab, supplied).is_none_or(|r| !r.contains(&row))
+        })
+        .collect()
+}
+
 /// Move fold headers to keep up with an edit.
 ///
 /// - `edit_rows` are the rows the edit touched, **in the old text**.
@@ -440,6 +462,36 @@ impl InputState {
             self.preferred_column = None;
         }
         cx.notify();
+    }
+
+    /// Open every fold that hides `row`, leaving the rest closed.
+    ///
+    /// For **jumping into folded code**: a search hit, a definition, a line
+    /// the host was asked to reveal. The caret cannot rest on a hidden row --
+    /// [`InputState::snap_out_of_fold`] pushes it to the fold's edge -- so a
+    /// caller that moves first lands somewhere else and, if it then selects to
+    /// the end of what it found, selects the whole fold along the way.
+    ///
+    /// Call this **before** moving. Returns whether anything opened; the caret
+    /// is left exactly where it was, since the caller is about to move it.
+    pub fn unfold_row(&mut self, row: usize, cx: &mut Context<Self>) -> bool {
+        if self.folded_rows.is_empty() {
+            return false;
+        }
+        let headers = headers_showing_row(
+            &self.text,
+            &self.folded_rows,
+            row,
+            self.mode.tab_size(),
+            self.supplied_folds.as_deref(),
+        );
+        if headers.len() == self.folded_rows.len() {
+            return false;
+        }
+        self.folded_rows = headers;
+        self.update_folds();
+        cx.notify();
+        true
     }
 
     /// Unfold everything.
@@ -1020,6 +1072,51 @@ fn main() {
         assert_eq!(hidden_rows(&text, &[1], tab(), None), vec![2]);
         // A header that no longer folds contributes nothing.
         assert_eq!(hidden_rows(&text, &[2], tab(), None), Vec::<usize>::new());
+    }
+
+    /// Jumping into a nest opens the whole nest, not just the outermost fold.
+    #[test]
+    fn opening_a_row_opens_every_fold_over_it() {
+        let text = Rope::from(NESTED);
+        // Row 2 (`a();`) sits inside both `fn main() {` and `if x {`.
+        assert_eq!(headers_showing_row(&text, &[0, 1], 2, tab(), None), Vec::<usize>::new());
+        // Row 3 (`}`) is inside the outer fold only; the inner one stays shut.
+        assert_eq!(headers_showing_row(&text, &[0, 1], 3, tab(), None), vec![1]);
+    }
+
+    /// A fold does not hide its own header, so a closed header stays closed.
+    #[test]
+    fn a_header_row_is_not_hidden_by_its_own_fold() {
+        let text = Rope::from(NESTED);
+        // Row 1 heads the inner fold and is hidden by the outer one: only the
+        // outer fold opens.
+        assert_eq!(headers_showing_row(&text, &[0, 1], 1, tab(), None), vec![1]);
+        // Row 0 heads the outer fold and nothing hides it.
+        assert_eq!(headers_showing_row(&text, &[0, 1], 0, tab(), None), vec![0, 1]);
+    }
+
+    /// Rows nothing hides -- and headers that no longer fold -- are untouched.
+    #[test]
+    fn opening_leaves_unrelated_folds_alone() {
+        let text = Rope::from(NESTED);
+        // Row 4 (the last `}`) is outside every fold.
+        assert_eq!(headers_showing_row(&text, &[0, 1], 4, tab(), None), vec![0, 1]);
+        // A stale header folds nothing, so it hides nothing either. It is kept
+        // as-is; `update_folds` is what drops it.
+        assert_eq!(headers_showing_row(&text, &[2], 3, tab(), None), vec![2]);
+        assert_eq!(headers_showing_row(&text, &[], 2, tab(), None), Vec::<usize>::new());
+    }
+
+    /// Supplied ranges decide it when a server has taken folding over.
+    #[test]
+    fn opening_reads_supplied_ranges_too() {
+        let text = Rope::from(NESTED);
+        // `0..=2` by the table -- rows 1..=2, so row 3 is *not* inside it even
+        // though the indentation rule would hide it.
+        let r = vec![FoldRange { start_row: 0, end_row: 2, kind: FoldKind::Region }];
+        let s = Some(r.as_slice());
+        assert_eq!(headers_showing_row(&text, &[0], 2, tab(), s), Vec::<usize>::new());
+        assert_eq!(headers_showing_row(&text, &[0], 3, tab(), s), vec![0]);
     }
 
     #[test]

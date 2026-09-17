@@ -185,6 +185,15 @@ impl InputState {
             let start = self.text.position_to_offset(&target_range.start);
             let end = self.text.position_to_offset(&target_range.end);
 
+            // A definition inside a closed fold is the same trap the search
+            // panel hits: the caret stops at the fold's edge and `select_to`
+            // sweeps the whole block. Open it before moving.
+            let start_row = self.text.offset_to_point(start).row;
+            let end_row = self.text.offset_to_point(end).row;
+            self.unfold_row(start_row, cx);
+            if end_row != start_row {
+                self.unfold_row(end_row, cx);
+            }
             self.move_to(start, None, cx);
             self.select_to(end, cx);
         }
