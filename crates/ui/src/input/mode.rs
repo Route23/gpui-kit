@@ -1881,7 +1881,14 @@ impl InputMode {
     pub(super) fn line_highlight(&self) -> LineHighlight {
         match self {
             InputMode::CodeEditor { line_highlight, .. } => *line_highlight,
-            _ => LineHighlight::All,
+            // **A field with one line has no "current line".** Everything but
+            // the code editor used to get `All`, which painted the active-line
+            // band across the whole field -- and that band is
+            // `editor.active_line.background`, a colour a host that only
+            // themes `background` never touches. The result was a search box
+            // whose middle stayed the default dark no matter what the theme
+            // said (dopamine #420: the box read as three stacked colours).
+            _ => LineHighlight::None,
         }
     }
 
