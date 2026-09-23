@@ -1,4 +1,5 @@
 use gpui::{Context, Point, Window};
+use sum_tree::Bias;
 
 use crate::input::{
     InputState, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
@@ -45,7 +46,10 @@ impl InputState {
         direction: Option<MoveDirection>,
         cx: &mut Context<Self>,
     ) {
-        let offset = offset.clamp(0, self.text.len());
+        // The caret must sit on a char boundary: a byte offset in the middle of
+        // a multi-byte char panics the next frame (bracket matching slices the
+        // rope there), and `panic = "abort"` takes the whole app down.
+        let offset = self.text.clip_offset(offset.clamp(0, self.text.len()), Bias::Left);
         // Indent this inserted and nobody typed on goes away when the caret
         // leaves the line (`editor.trimAutoWhitespace`, #248).
         let offset = self.trim_auto_whitespace_on_leave(offset);
@@ -122,7 +126,11 @@ impl InputState {
             } else {
                 // Not in visible range, use column directly.
                 let max_line_len = self.text.slice_line(next_point.row).len();
-                new_offset = line_start_offset + column.min(max_line_len);
+                // `column` is a byte column of the *previous* line, so it can
+                // land inside a multi-byte char here. Snap back to its start.
+                new_offset = self
+                    .text
+                    .clip_offset(line_start_offset + column.min(max_line_len), Bias::Left);
             }
         }
 

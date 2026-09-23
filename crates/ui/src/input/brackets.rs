@@ -230,7 +230,9 @@ fn is_closer(ch: char, language: &str) -> bool {
 
 /// The character before `offset`, or `None` at the start of the text.
 fn prev_char(text: &Rope, offset: usize) -> Option<char> {
-    if offset == 0 {
+    // Not on a char boundary means no char ends here; `chars_at` would
+    // panic, and this runs while painting.
+    if offset == 0 || !text.is_char_boundary(offset) {
         return None;
     }
     text.chars_at(offset).reversed().next()
@@ -408,7 +410,9 @@ fn scan_backward(
 
 /// The character ending at `at`.
 fn prev_char_from(text: &Rope, at: usize) -> Option<char> {
-    if at == 0 {
+    // Not on a char boundary means no char ends here; `chars_at` would
+    // panic, and this runs while painting.
+    if at == 0 || !text.is_char_boundary(at) {
         return None;
     }
     text.chars_at(at).reversed().next()
@@ -816,5 +820,23 @@ mod tests {
         assert!(!is_closer('\'', "rust"));
         assert!(is_closer('\'', "javascript"));
         assert!(is_closer(')', "rust"));
+    }
+
+    #[test]
+    fn an_offset_inside_a_multibyte_char_does_not_panic() {
+        // "aあ(b)": `あ` is bytes 1..4, so 2 and 3 are inside it.
+        let rope = Rope::from("aあ(b)");
+        for offset in [2, 3] {
+            assert_eq!(prev_char(&rope, offset), None);
+            assert!(!is_inside_pair(&rope, offset, "rust"));
+            let _ = match_at(
+                &rope,
+                offset,
+                "rust",
+                MatchBrackets::Always,
+                0..rope.len(),
+                &[],
+            );
+        }
     }
 }
