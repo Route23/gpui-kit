@@ -643,6 +643,12 @@ impl TextElement {
         if start == end || end > state.text.len() {
             return vec![];
         }
+        // This runs while painting, where a panic aborts the whole app. A
+        // selection off a char boundary is a bug elsewhere (the IME one was
+        // Route23/dopamine#528) -- draw nothing rather than slice through it.
+        if !state.text.is_char_boundary(start) || !state.text.is_char_boundary(end) {
+            return vec![];
+        }
         let needle = state.text.slice(start..end).to_string();
         if needle.chars().count() > state.mode.selection_highlight_max_len() {
             return vec![];

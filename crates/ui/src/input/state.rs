@@ -4238,12 +4238,8 @@ impl EntityInputHandler for InputState {
             self.ime_marked_range = None;
         } else {
             self.ime_marked_range = Some((range.start..range.start + new_text.len()).into());
-            self.selected_range = new_selected_range_utf16
-                .as_ref()
-                .map(|range_utf16| self.range_from_utf16(range_utf16))
-                .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-                .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len())
-                .into();
+            self.selected_range =
+                marked_selection(range.start, new_text, new_selected_range_utf16.as_ref()).into();
         }
         self.mode.update_auto_grow(&self.text_wrapper);
         self.history.start_grouping();
@@ -4373,5 +4369,56 @@ impl Render for InputState {
             .children(self.context_menu.as_ref().map(|menu| menu.render()))
             .children(self.hover_popover.clone())
             .children(self.signature_popover.clone())
+    }
+}
+
+/// Where the IME's selection lands, as a byte range of the whole text.
+///
+/// `selected_utf16` counts from the start of the **marked text**, not the
+/// document (`NSTextInputClient`'s `setMarkedText:selectedRange:`). Converting
+/// it from the document start and adding `range.end` to its end put the
+/// selection inside a multi-byte char or past the end, and the next frame's
+/// selection highlight sliced the rope there and panicked
+/// (Route23/dopamine#528).
+fn marked_selection(
+    start: usize,
+    marked: &str,
+    selected_utf16: Option<&Range<usize>>,
+) -> Range<usize> {
+    let Some(selected) = selected_utf16 else {
+        return start + marked.len()..start + marked.len();
+    };
+    let marked = Rope::from(marked);
+    let a = marked.offset_utf16_to_offset(selected.start);
+    let b = marked.offset_utf16_to_offset(selected.end.max(selected.start));
+    start + a..start + b
+}
+
+#[cfg(test)]
+mod marked_selection_tests {
+    use super::marked_selection;
+
+    #[test]
+    fn no_selection_puts_the_caret_after_the_marked_text() {
+        assert_eq!(marked_selection(10, "あbc", None), 15..15);
+    }
+
+    #[test]
+    fn the_selection_counts_from_the_marked_text() {
+        // "あbc": あ is 1 UTF-16 unit and 3 bytes. A caret after `b` is
+        // UTF-16 2 → byte 4 of the marked text.
+        assert_eq!(marked_selection(20, "あbc", Some(&(2..2))), 24..24);
+        // Selecting the whole clause.
+        assert_eq!(marked_selection(20, "あbc", Some(&(0..3))), 20..25);
+    }
+
+    #[test]
+    fn it_stays_on_char_boundaries_and_inside_the_marked_text() {
+        let marked = "日本語";
+        for u in 0..=5 {
+            let r = marked_selection(0, marked, Some(&(u..u)));
+            assert!(marked.is_char_boundary(r.start), "{u}: {r:?}");
+            assert!(r.end <= marked.len(), "{u}: {r:?}");
+        }
     }
 }
