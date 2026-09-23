@@ -426,6 +426,8 @@ pub struct InputState {
     /// Built from the same list the squiggles are built from, so the two
     /// cannot disagree. Sorted by row for the paint loop.
     pub(super) inline_diagnostics: Vec<crate::input::InlineDiagnostic>,
+    /// Change marks beside the line numbers (dopamine #280).
+    pub(super) gutter_marks: Vec<crate::input::GutterMark>,
     /// The row the pointer is over in the fold gutter, for
     /// [`FoldingControls::MouseOver`].
     pub(super) hovered_gutter_row: Option<usize>,
@@ -566,6 +568,7 @@ impl InputState {
             supplied_folds: None,
             inlay_rows: Vec::new(),
             inline_diagnostics: Vec::new(),
+            gutter_marks: Vec::new(),
             hovered_gutter_row: None,
             loading: false,
             pattern: None,

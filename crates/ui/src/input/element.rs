@@ -2406,6 +2406,12 @@ impl Element for TextElement {
         let mut offset_y = px(0.);
         if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
             offset_y += invisible_top_padding;
+            let gutter_marks: Vec<Option<super::gutter_marks::GutterMarkKind>> = {
+                let state = self.state.read(cx);
+                (0..line_numbers.len())
+                    .map(|ix| state.gutter_mark_at(visible_range.start + ix))
+                    .collect()
+            };
 
             window.paint_quad(fill(
                 Bounds {
@@ -2432,6 +2438,21 @@ impl Element for TextElement {
                             bg_color,
                         ));
                     }
+                }
+
+                // Change marks (dopamine #280): a bar down the left edge, or a
+                // short tick on top of the row under a deletion.
+                if let Some(kind) = gutter_marks.get(ix).copied().flatten() {
+                    let color = kind.color(cx);
+                    let mark = if kind == super::gutter_marks::GutterMarkKind::Deleted {
+                        Bounds::new(
+                            point(p.x, p.y - px(1.)),
+                            size(super::gutter_marks::GUTTER_MARK_WIDTH * 2., px(2.)),
+                        )
+                    } else {
+                        Bounds::new(p, size(super::gutter_marks::GUTTER_MARK_WIDTH, height))
+                    };
+                    window.paint_quad(fill(mark, color));
                 }
 
                 if let Some(chevron) = prepaint.fold_chevrons.iter().find(|c| c.ix == ix) {
