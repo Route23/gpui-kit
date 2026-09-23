@@ -2131,6 +2131,31 @@ impl Element for TextElement {
             .then_some(prepaint.current_row)
             .flatten();
 
+        // Row backgrounds (dopamine #244), under the caret's band.
+        {
+            let state = self.state.read(cx);
+            if !state.row_backgrounds.is_empty() {
+                let mut offset_y = invisible_top_padding;
+                for (ix, line) in prepaint.last_layout.lines.iter().enumerate() {
+                    let row = visible_range.start + ix;
+                    let height = line.size(line_height).height;
+                    if let Some(color) = state.row_background(row) {
+                        let x = input_bounds.origin.x + prepaint.last_layout.line_number_width;
+                        window.paint_quad(fill(
+                            Bounds::new(point(x, origin.y + offset_y), size(bounds.size.width, height)),
+                            color,
+                        ));
+                    }
+                    offset_y += height + prepaint.last_layout.extra_height(row);
+                }
+            }
+            for (range, color) in state.range_backgrounds.clone() {
+                if let Some(path) = Self::layout_match_range(range, &prepaint.last_layout, &bounds) {
+                    window.paint_path(path, color);
+                }
+            }
+        }
+
         // Paint the band behind the caret's row.
         //
         // **Walked over the laid-out lines, not the line numbers.** It used to

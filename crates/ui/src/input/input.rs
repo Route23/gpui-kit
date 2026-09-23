@@ -30,6 +30,8 @@ pub struct Input {
     cleanable: bool,
     mask_toggle: bool,
     disabled: bool,
+    /// Not editable, but drawn like an editable field (dopamine #244).
+    read_only: bool,
     bordered: bool,
     focus_bordered: bool,
     tab_index: isize,
@@ -68,6 +70,7 @@ impl Input {
             cleanable: false,
             mask_toggle: false,
             disabled: false,
+            read_only: false,
             bordered: true,
             focus_bordered: true,
             tab_index: 0,
@@ -130,6 +133,13 @@ impl Input {
     /// Set to disable the input field.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Refuse edits but keep the normal look -- selection and copy still work
+    /// (dopamine #244: the two sides of a diff).
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 
@@ -259,7 +269,7 @@ impl RenderOnce for Input {
         const LINE_HEIGHT: Rems = Rems(1.25);
 
         self.state.update(cx, |state, _| {
-            state.disabled = self.disabled;
+            state.disabled = self.disabled || self.read_only;
             state.size = self.size;
         });
 
@@ -271,7 +281,7 @@ impl RenderOnce for Input {
             _ => px(6.),
         };
 
-        let bg = if state.disabled {
+        let bg = if state.disabled && !self.read_only {
             cx.theme().muted
         } else {
             if state.mode.is_code_editor() {

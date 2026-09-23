@@ -428,6 +428,9 @@ pub struct InputState {
     pub(super) inline_diagnostics: Vec<crate::input::InlineDiagnostic>,
     /// Change marks beside the line numbers (dopamine #280).
     pub(super) gutter_marks: Vec<crate::input::GutterMark>,
+    /// Whole-row and byte-range backgrounds (dopamine #244).
+    pub(super) row_backgrounds: Vec<(usize, gpui::Hsla)>,
+    pub(super) range_backgrounds: Vec<(std::ops::Range<usize>, gpui::Hsla)>,
     /// The row the pointer is over in the fold gutter, for
     /// [`FoldingControls::MouseOver`].
     pub(super) hovered_gutter_row: Option<usize>,
@@ -569,6 +572,8 @@ impl InputState {
             inlay_rows: Vec::new(),
             inline_diagnostics: Vec::new(),
             gutter_marks: Vec::new(),
+            row_backgrounds: Vec::new(),
+            range_backgrounds: Vec::new(),
             hovered_gutter_row: None,
             loading: false,
             pattern: None,

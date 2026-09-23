@@ -10,6 +10,7 @@ mod cursor;
 mod element;
 mod expand;
 mod fold;
+mod diff_marks;
 mod gutter_marks;
 mod indent;
 mod inlay;
