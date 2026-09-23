@@ -1573,11 +1573,16 @@ impl Element for TextElement {
                 .map(|item| item.insert_text.matches('\n').count())
                 .unwrap_or(0);
             let cursor_row = state.cursor_position().line as usize;
-            state.text_wrapper.set_extra_rows(if ghost_rows > 0 {
-                vec![(cursor_row, ghost_rows)]
-            } else {
-                vec![]
-            });
+            // Ghost lines and lens rows (dopamine #412) share the mechanism;
+            // a row that has both gets both, ghost lines first.
+            let mut extra: Vec<(usize, usize)> = state.lens_extra_rows().collect();
+            if ghost_rows > 0 {
+                match extra.iter_mut().find(|(r, _)| *r == cursor_row) {
+                    Some(e) => e.1 += ghost_rows,
+                    None => extra.push((cursor_row, ghost_rows)),
+                }
+            }
+            state.text_wrapper.set_extra_rows(extra);
         });
 
         let state = self.state.read(cx);
@@ -2249,6 +2254,7 @@ impl Element for TextElement {
 
         // Paint text with inline completion ghost line support
         let mut offset_y = mask_offset_y + invisible_top_padding;
+        let mut lens_boxes: Vec<(Bounds<Pixels>, usize, usize)> = Vec::new();
         let ghost_lines = &prepaint.ghost_lines;
         let has_ghost_lines = !ghost_lines.is_empty();
 
@@ -2368,7 +2374,45 @@ impl Element for TextElement {
                     offset_y += line_height;
                 }
             }
+
+            // The lens row for the next row (dopamine #412), in the slot the
+            // wrapper left below this one. Indented like the row it belongs to.
+            let lens = {
+                let state = self.state.read(cx);
+                state.lens_for_row(row + 1).cloned().map(|l| {
+                    let indent = state
+                        .text
+                        .slice_line(row + 1)
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .map(|c| if c == '\t' { 4 } else { 1 })
+                        .sum::<usize>();
+                    (l, indent)
+                })
+            };
+            if let Some((lens, indent)) = lens {
+                let size_ = window.text_style().font_size.to_pixels(window.rem_size()) * 0.85;
+                let color = cx.theme().muted_foreground;
+                let mut x = origin.x + prepaint.last_layout.line_number_width + column_advance * indent as f32;
+                let y = origin.y + offset_y;
+                for (i, item) in lens.items.iter().enumerate() {
+                    if i > 0 {
+                        let sep: SharedString = " | ".into();
+                        let run = TextRun { len: sep.len(), font: window.text_style().font(), color, background_color: None, underline: None, strikethrough: None };
+                        let shaped = window.text_system().shape_line(sep, size_, &[run], None);
+                        _ = shaped.paint(point(x, y), line_height, window, cx);
+                        x += shaped.width;
+                    }
+                    let run = TextRun { len: item.len(), font: window.text_style().font(), color, background_color: None, underline: None, strikethrough: None };
+                    let shaped = window.text_system().shape_line(item.clone(), size_, &[run], None);
+                    _ = shaped.paint(point(x, y), line_height, window, cx);
+                    lens_boxes.push((Bounds::new(point(x, y), size(shaped.width, line_height)), lens.row, i));
+                    x += shaped.width;
+                }
+                offset_y += line_height;
+            }
         }
+        self.state.update(cx, |s, _| s.set_lens_hitboxes(std::mem::take(&mut lens_boxes)));
 
         // Paint whitespace marks on top of the glyphs they belong to.
         Self::paint_whitespaces(

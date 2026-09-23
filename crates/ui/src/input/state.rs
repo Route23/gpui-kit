@@ -143,6 +143,9 @@ pub enum InputEvent {
     /// A link the host handed over with [`InputState::set_link_ranges`] was
     /// clicked, covering `range` (byte offsets).
     LinkClicked { range: Range<usize> },
+    /// A label drawn with [`InputState::set_lens_rows`] was clicked: the row
+    /// it sits above and the index of the label in that row (dopamine #412).
+    LensClicked { row: usize, item: usize },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -430,6 +433,9 @@ pub struct InputState {
     pub(super) gutter_marks: Vec<crate::input::GutterMark>,
     /// Whole-row and byte-range backgrounds (dopamine #244).
     pub(super) row_backgrounds: Vec<(usize, gpui::Hsla)>,
+    /// Clickable labels above rows (dopamine #412) and where the last paint put them.
+    pub(super) lens_rows: Vec<crate::input::LensRow>,
+    pub(super) lens_hitboxes: Vec<(gpui::Bounds<gpui::Pixels>, usize, usize)>,
     pub(super) range_backgrounds: Vec<(std::ops::Range<usize>, gpui::Hsla)>,
     /// The row the pointer is over in the fold gutter, for
     /// [`FoldingControls::MouseOver`].
@@ -573,6 +579,8 @@ impl InputState {
             inline_diagnostics: Vec::new(),
             gutter_marks: Vec::new(),
             row_backgrounds: Vec::new(),
+            lens_rows: Vec::new(),
+            lens_hitboxes: Vec::new(),
             range_backgrounds: Vec::new(),
             hovered_gutter_row: None,
             loading: false,
@@ -3042,6 +3050,13 @@ impl InputState {
         // caret nor starts a drag-selection.
         if self.handle_fold_gutter_click(event, cx) {
             return;
+        }
+        // A lens label (dopamine #412): the host runs it; the caret stays put.
+        if event.button == MouseButton::Left {
+            if let Some((row, item)) = self.lens_hit(event.position) {
+                cx.emit(InputEvent::LensClicked { row, item });
+                return;
+            }
         }
         // Then the row itself: clicking past the end of a folded line opens it
         // (`editor.unfoldOnClickAfterEndOfLine`), before the caret moves.

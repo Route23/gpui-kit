@@ -14,6 +14,7 @@ mod diff_marks;
 mod gutter_marks;
 mod indent;
 mod inlay;
+mod lens;
 mod inline_diag;
 mod input;
 mod lsp;
@@ -52,6 +53,7 @@ pub use comment::CommentTokens;
 pub use fold::{FoldKind, FoldRange};
 pub use gutter_marks::{GutterMark, GutterMarkKind};
 pub use inlay::InlayRow;
+pub use lens::LensRow;
 pub use inline_diag::InlineDiagnostic;
 pub use semantic::SemanticSpan;
 pub use mode::{
