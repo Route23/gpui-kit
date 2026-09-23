@@ -2,13 +2,13 @@ use gpui::SharedString;
 
 use crate::highlighter::LanguageConfig;
 
-#[cfg(not(feature = "tree-sitter-languages"))]
+#[cfg(not(feature = "tree-sitter-languages-core"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_iterator::Sequence)]
 pub enum Language {
     Json,
 }
 
-#[cfg(feature = "tree-sitter-languages")]
+#[cfg(feature = "tree-sitter-languages-core")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_iterator::Sequence)]
 pub enum Language {
     Json,
@@ -58,10 +58,10 @@ impl Language {
     }
 
     pub fn name(&self) -> &'static str {
-        #[cfg(not(feature = "tree-sitter-languages"))]
+        #[cfg(not(feature = "tree-sitter-languages-core"))]
         return "json";
 
-        #[cfg(feature = "tree-sitter-languages")]
+        #[cfg(feature = "tree-sitter-languages-core")]
         match self {
             Self::Plain => "text",
             Self::Bash => "bash",
@@ -101,10 +101,10 @@ impl Language {
 
     #[allow(unused)]
     pub fn from_str(s: &str) -> Self {
-        #[cfg(not(feature = "tree-sitter-languages"))]
+        #[cfg(not(feature = "tree-sitter-languages-core"))]
         return Self::Json;
 
-        #[cfg(feature = "tree-sitter-languages")]
+        #[cfg(feature = "tree-sitter-languages-core")]
         match s {
             "bash" | "sh" => Self::Bash,
             "c" => Self::C,
@@ -144,10 +144,10 @@ impl Language {
 
     #[allow(unused)]
     pub(super) fn injection_languages(&self) -> Vec<SharedString> {
-        #[cfg(not(feature = "tree-sitter-languages"))]
+        #[cfg(not(feature = "tree-sitter-languages-core"))]
         return vec![];
 
-        #[cfg(feature = "tree-sitter-languages")]
+        #[cfg(feature = "tree-sitter-languages-core")]
         match self {
             Self::Markdown => vec!["markdown-inline", "html", "toml", "yaml"],
             Self::MarkdownInline => vec![],
@@ -176,7 +176,7 @@ impl Language {
     ///
     /// (language, query, injection, locals)
     pub(super) fn config(&self) -> LanguageConfig {
-        #[cfg(not(feature = "tree-sitter-languages"))]
+        #[cfg(not(feature = "tree-sitter-languages-core"))]
         let (language, query, injection, locals) = match self {
             Self::Json => (
                 tree_sitter_json::LANGUAGE,
@@ -186,9 +186,21 @@ impl Language {
             ),
         };
 
-        #[cfg(feature = "tree-sitter-languages")]
+        #[cfg(feature = "tree-sitter-languages-core")]
         let (language, query, injection, locals) = match self {
             Self::Plain => (tree_sitter_json::LANGUAGE, "", "", ""),
+            // 文法を入れていない言語は Plain と同じ（#452）。
+            #[cfg(not(feature = "tree-sitter-languages-extra"))]
+            Self::Zig
+            | Self::Scala
+            | Self::CSharp
+            | Self::Proto
+            | Self::Make
+            | Self::CMake
+            | Self::Diff
+            | Self::Elixir
+            | Self::Erb
+            | Self::Ejs => (tree_sitter_json::LANGUAGE, "", "", ""),
             Self::Json => (
                 tree_sitter_json::LANGUAGE,
                 include_str!("languages/json/highlights.scm"),
@@ -255,6 +267,7 @@ impl Language {
                 "",
                 "",
             ),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::Zig => (
                 tree_sitter_zig::LANGUAGE,
                 include_str!("languages/zig/highlights.scm"),
@@ -298,6 +311,7 @@ impl Language {
                 "",
             ),
             Self::Swift => (tree_sitter_swift::LANGUAGE, "", "", ""),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::Scala => (
                 tree_sitter_scala::LANGUAGE,
                 tree_sitter_scala::HIGHLIGHTS_QUERY,
@@ -310,15 +324,19 @@ impl Language {
                 "",
                 "",
             ),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::CSharp => (tree_sitter_c_sharp::LANGUAGE, "", "", ""),
             Self::GraphQL => (tree_sitter_graphql::LANGUAGE, "", "", ""),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::Proto => (tree_sitter_proto::LANGUAGE, "", "", ""),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::Make => (
                 tree_sitter_make::LANGUAGE,
                 tree_sitter_make::HIGHLIGHTS_QUERY,
                 "",
                 "",
             ),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::CMake => (tree_sitter_cmake::LANGUAGE, "", "", ""),
             Self::TypeScript => (
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
@@ -332,24 +350,28 @@ impl Language {
                 "",
                 tree_sitter_typescript::LOCALS_QUERY,
             ),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::Diff => (
                 tree_sitter_diff::LANGUAGE,
                 tree_sitter_diff::HIGHLIGHTS_QUERY,
                 "",
                 "",
             ),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::Elixir => (
                 tree_sitter_elixir::LANGUAGE,
                 tree_sitter_elixir::HIGHLIGHTS_QUERY,
                 tree_sitter_elixir::INJECTIONS_QUERY,
                 "",
             ),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::Erb => (
                 tree_sitter_embedded_template::LANGUAGE,
                 tree_sitter_embedded_template::HIGHLIGHTS_QUERY,
                 tree_sitter_embedded_template::INJECTIONS_EJS_QUERY,
                 "",
             ),
+            #[cfg(feature = "tree-sitter-languages-extra")]
             Self::Ejs => (
                 tree_sitter_embedded_template::LANGUAGE,
                 tree_sitter_embedded_template::HIGHLIGHTS_QUERY,
@@ -374,7 +396,7 @@ impl Language {
 #[cfg(test)]
 mod tests {
     #[test]
-    #[cfg(feature = "tree-sitter-languages")]
+    #[cfg(feature = "tree-sitter-languages-core")]
     fn test_language_name() {
         use super::*;
 

@@ -20,34 +20,41 @@ inspector = ["gpui-macros/inspector", "gpui/inspector", "wry/devtools"]
 webview = ["dep:wry"]
 
 # For syntax highlighting in Markdown and CodeEditor.
-tree-sitter-languages = [
+# dopamine（ADR-0062 / #452）: 言語を 2 つの束に割る。`tree-sitter-languages` は
+# 今までどおり全部。**`-core` だけを選べば下の 9 文法（~12 MB）が入らない** ——
+# enum の variant は残し、ハイライトが無い（Plain と同じ）だけになる。
+tree-sitter-languages = ["tree-sitter-languages-core", "tree-sitter-languages-extra"]
+tree-sitter-languages-core = [
     "dep:tree-sitter-bash",
     "dep:tree-sitter-c",
-    "dep:tree-sitter-c-sharp",
-    "dep:tree-sitter-cmake",
     "dep:tree-sitter-cpp",
     "dep:tree-sitter-css",
-    "dep:tree-sitter-diff",
-    "dep:tree-sitter-elixir",
-    "dep:tree-sitter-embedded-template",
     "dep:tree-sitter-go",
     "dep:tree-sitter-graphql",
     "dep:tree-sitter-html",
     "dep:tree-sitter-java",
     "dep:tree-sitter-javascript",
     "dep:tree-sitter-jsdoc",
-    "dep:tree-sitter-make",
     "dep:tree-sitter-md",
-    "dep:tree-sitter-proto",
     "dep:tree-sitter-python",
     "dep:tree-sitter-ruby",
     "dep:tree-sitter-rust",
-    "dep:tree-sitter-scala",
     "dep:tree-sitter-sequel",
     "dep:tree-sitter-swift",
     "dep:tree-sitter-toml-ng",
     "dep:tree-sitter-typescript",
     "dep:tree-sitter-yaml",
+]
+tree-sitter-languages-extra = [
+    "tree-sitter-languages-core",
+    "dep:tree-sitter-c-sharp",
+    "dep:tree-sitter-cmake",
+    "dep:tree-sitter-diff",
+    "dep:tree-sitter-elixir",
+    "dep:tree-sitter-embedded-template",
+    "dep:tree-sitter-make",
+    "dep:tree-sitter-proto",
+    "dep:tree-sitter-scala",
     "dep:tree-sitter-zig",
 ]
 
