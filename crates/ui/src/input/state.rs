@@ -143,6 +143,19 @@ pub enum InputEvent {
     /// A link the host handed over with [`InputState::set_link_ranges`] was
     /// clicked, covering `range` (byte offsets).
     LinkClicked { range: Range<usize> },
+    /// The right mouse button went down, and the host asked to draw the
+    /// context menu itself (dopamine #565).
+    ///
+    /// Only emitted when [`InputState::context_menu_externally`] is set; the
+    /// caret has already moved to the click (unless it landed inside the
+    /// selection). The flags say which of the usual items would be enabled.
+    ContextMenu {
+        position: Point<Pixels>,
+        has_selection: bool,
+        editable: bool,
+        has_definition: bool,
+        has_code_actions: bool,
+    },
     /// A label drawn with [`InputState::set_lens_rows`] was clicked: the row
     /// it sits above and the index of the label in that row (dopamine #412).
     LensClicked { row: usize, item: usize },
@@ -369,6 +382,8 @@ impl LastLayout {
 pub struct InputState {
     pub(super) focus_handle: FocusHandle,
     pub(super) mode: InputMode,
+    /// Report right clicks instead of drawing our own menu (dopamine #565).
+    pub(super) context_menu_externally: bool,
     pub(super) text: Rope,
     pub(super) text_wrapper: TextWrapper,
     pub(super) history: History<Change>,
@@ -587,6 +602,7 @@ impl InputState {
             pattern: None,
             validate: None,
             mode: InputMode::default(),
+            context_menu_externally: false,
             last_layout: None,
             last_bounds: None,
             last_selected_range: None,
@@ -1202,6 +1218,17 @@ impl InputState {
         {
             *definitions_open_externally = externally;
         }
+        self
+    }
+
+    /// Report right clicks with [`InputEvent::ContextMenu`] instead of
+    /// opening the built-in menu (dopamine #565).
+    ///
+    /// The built-in menu is a gpui element: a host that keeps native views
+    /// (web views) in the same window would rather show a native `NSMenu`,
+    /// which nothing can draw over.
+    pub fn context_menu_externally(mut self, externally: bool) -> Self {
+        self.context_menu_externally = externally;
         self
     }
 
@@ -3121,6 +3148,20 @@ impl InputState {
 
         // Show Mouse context menu
         if event.button == MouseButton::Right {
+            if self.context_menu_externally {
+                if !self.selected_range.contains(offset) {
+                    self.move_to(offset, None, cx);
+                }
+                let editable = !self.disabled;
+                cx.emit(InputEvent::ContextMenu {
+                    position: event.position,
+                    has_selection: !self.selected_range.is_empty(),
+                    editable,
+                    has_definition: editable && self.lsp.definition_provider.is_some(),
+                    has_code_actions: editable && !self.lsp.code_action_providers.is_empty(),
+                });
+                return;
+            }
             self.handle_right_click_menu(event, offset, window, cx);
             return;
         }
