@@ -24,6 +24,13 @@ impl InputState {
     ///
     /// **Replaces the previous set.** Passing an empty vec is how a host
     /// turns the feature off.
+    /// Open links on a plain left click too, not only with ⌘ (dopamine #492).
+    /// Meant for read-only views, where a click has nothing else to do.
+    pub fn links_on_plain_click(mut self, on: bool) -> Self {
+        self.links_on_plain_click = on;
+        self
+    }
+
     pub fn set_link_ranges(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
         if self.link_ranges == ranges {
             return;

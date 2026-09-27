@@ -454,6 +454,12 @@ pub struct InputState {
     /// Clickable labels above rows (dopamine #412) and where the last paint put them.
     pub(super) lens_rows: Vec<crate::input::LensRow>,
     pub(super) lens_hitboxes: Vec<(gpui::Bounds<gpui::Pixels>, usize, usize)>,
+    /// The number to show on each row instead of counting (dopamine #492).
+    /// `None` = count as usual; an inner `None` = leave that row blank.
+    pub(super) line_number_labels: Option<Vec<Option<usize>>>,
+    /// Links open on a plain click, not only ⌘-click (dopamine #492). For
+    /// read-only views where a click has nothing else to do.
+    pub(super) links_on_plain_click: bool,
     pub(super) range_backgrounds: Vec<(std::ops::Range<usize>, gpui::Hsla)>,
     /// The row the pointer is over in the fold gutter, for
     /// [`FoldingControls::MouseOver`].
@@ -599,6 +605,8 @@ impl InputState {
             row_backgrounds: Vec::new(),
             lens_rows: Vec::new(),
             lens_hitboxes: Vec::new(),
+            line_number_labels: None,
+            links_on_plain_click: false,
             range_backgrounds: Vec::new(),
             hovered_gutter_row: None,
             loading: false,
@@ -3118,7 +3126,7 @@ impl InputState {
 
         // **After definitions**, so a symbol that is both still goes to its
         // definition rather than being opened as a path.
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary() || self.links_on_plain_click {
             if let Some(range) = self.link_at(offset) {
                 cx.emit(InputEvent::LinkClicked { range });
                 return;

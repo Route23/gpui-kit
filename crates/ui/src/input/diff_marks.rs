@@ -12,6 +12,22 @@ use gpui::{px, Hsla, Pixels};
 use super::state::InputState;
 
 impl InputState {
+    /// Show these numbers in the gutter instead of counting rows (dopamine #492):
+    /// a diff with filler rows has rows that are not lines of the file. An inner
+    /// `None` leaves the row blank; rows past the end of the list are blank too.
+    /// `None` goes back to counting. Only takes effect while line numbers are on.
+    pub fn set_line_number_labels(
+        &mut self,
+        labels: Option<Vec<Option<usize>>>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.line_number_labels == labels {
+            return;
+        }
+        self.line_number_labels = labels;
+        cx.notify();
+    }
+
     /// Paint these rows' backgrounds across the whole width of the text area.
     /// An empty list clears them.
     pub fn set_row_backgrounds(&mut self, mut rows: Vec<(usize, Hsla)>, cx: &mut gpui::Context<Self>) {

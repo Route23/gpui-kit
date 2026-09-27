@@ -1037,7 +1037,12 @@ impl TextElement {
         // What the last number actually needs, never below the caller's floor.
         // The extra column is the gap between the number and the text; drop it
         // and the two run together.
-        let digits = total_lines.max(1).to_string().len();
+        // With labels (dopamine #492) the widest label sets the width, not the row count.
+        let widest = match &state.line_number_labels {
+            Some(labels) => labels.iter().flatten().copied().max().unwrap_or(1),
+            None => total_lines.max(1),
+        };
+        let digits = widest.to_string().len();
         let line_number_len = digits.max(state.mode.min_line_number_digits()) + 1;
 
         let line_number_width = if state.mode.line_number() {
@@ -1932,7 +1937,11 @@ impl Element for TextElement {
                 // `Relative` / `Interval` do not simply count up, and may leave a
                 // row blank. Pad to `line_number_len` either way so the shaped
                 // line keeps matching the `TextRun` length below.
-                let line_no: SharedString = match line_numbers_mode.number_for(ix, current_row) {
+                let number = match &state.line_number_labels {
+                    Some(labels) => labels.get(ix).copied().flatten(),
+                    None => line_numbers_mode.number_for(ix, current_row),
+                };
+                let line_no: SharedString = match number {
                     // The trailing newline's row, when it is not numbered.
                     // Blank rather than skipped: the entry has to stay so the
                     // index keeps matching the row.
