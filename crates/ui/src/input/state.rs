@@ -159,6 +159,9 @@ pub enum InputEvent {
     /// A label drawn with [`InputState::set_lens_rows`] was clicked: the row
     /// it sits above and the index of the label in that row (dopamine #412).
     LensClicked { row: usize, item: usize },
+    /// A change mark drawn with [`InputState::set_gutter_marks`] was clicked on
+    /// `row` (dopamine #490). The caret stays put.
+    GutterMarkClicked { row: usize },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -3076,6 +3079,10 @@ impl InputState {
         // before the caret is moved, so clicking a chevron neither jumps the
         // caret nor starts a drag-selection.
         if self.handle_fold_gutter_click(event, cx) {
+            return;
+        }
+        // A change mark (dopamine #490): the host offers revert / stage.
+        if self.handle_gutter_mark_click(event, cx) {
             return;
         }
         // A lens label (dopamine #412): the host runs it; the caret stays put.

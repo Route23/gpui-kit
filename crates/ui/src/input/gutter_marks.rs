@@ -8,13 +8,17 @@
 
 use std::ops::Range;
 
-use gpui::{px, Hsla, Pixels};
+use gpui::{px, Context, Hsla, MouseButton, MouseDownEvent, Pixels};
 
 use super::state::InputState;
 use crate::ActiveTheme as _;
 
 /// The bar's width.
 pub(super) const GUTTER_MARK_WIDTH: Pixels = px(3.);
+
+/// How far from the gutter's left edge a click still counts as the mark.
+/// Wider than the bar itself so a 3px target is not a pixel hunt (dopamine #490).
+pub(super) const GUTTER_MARK_HIT_WIDTH: Pixels = px(8.);
 
 /// What happened to the rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -56,6 +60,37 @@ impl InputState {
         }
         self.gutter_marks = marks;
         cx.notify();
+    }
+
+    /// A left click on a change mark: report the row and consume the click so the
+    /// caret does not move (dopamine #490). The host decides what to offer.
+    ///
+    /// Marks are painted with the line numbers, so without them nothing is hit.
+    pub(super) fn handle_gutter_mark_click(
+        &mut self,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.button != MouseButton::Left
+            || self.gutter_marks.is_empty()
+            || !self.mode.line_number()
+        {
+            return false;
+        }
+        // `input_bounds`, not `last_bounds`: the gutter does not scroll sideways.
+        let left = self.input_bounds.origin.x;
+        if event.position.x < left || event.position.x >= left + GUTTER_MARK_HIT_WIDTH {
+            return false;
+        }
+        let Some(row) = self.row_for_mouse_position(event.position) else {
+            return false;
+        };
+        if self.gutter_mark_at(row).is_none() {
+            return false;
+        }
+        cx.emit(super::InputEvent::GutterMarkClicked { row });
+        cx.stop_propagation();
+        true
     }
 
     /// The mark on `row`, if any. A deletion marks the row below the gap.
