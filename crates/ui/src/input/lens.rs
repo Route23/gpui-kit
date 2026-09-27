@@ -40,6 +40,22 @@ impl InputState {
         cx.notify();
     }
 
+    /// The lens labels' font (dopamine #496, VS Code `editor.codeLensFontFamily` /
+    /// `codeLensFontSize`). `None` keeps the editor's family / 85% of its size.
+    /// The size is capped at the editor's: the label shares one editor row.
+    pub fn set_lens_style(
+        &mut self,
+        family: Option<SharedString>,
+        size: Option<gpui::Pixels>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.lens_font == (family.clone(), size) {
+            return;
+        }
+        self.lens_font = (family, size);
+        cx.notify();
+    }
+
     /// Rows the wrapper has to leave room for: one below the row above each lens.
     pub(super) fn lens_extra_rows(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.lens_rows.iter().map(|l| (l.row - 1, 1))

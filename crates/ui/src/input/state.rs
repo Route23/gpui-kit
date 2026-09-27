@@ -453,6 +453,9 @@ pub struct InputState {
     pub(super) row_backgrounds: Vec<(usize, gpui::Hsla)>,
     /// Clickable labels above rows (dopamine #412) and where the last paint put them.
     pub(super) lens_rows: Vec<crate::input::LensRow>,
+    /// The lens labels' font family and size (dopamine #496). `None` = the
+    /// editor's family / 85% of the editor's size.
+    pub(super) lens_font: (Option<SharedString>, Option<gpui::Pixels>),
     pub(super) lens_hitboxes: Vec<(gpui::Bounds<gpui::Pixels>, usize, usize)>,
     /// The number to show on each row instead of counting (dopamine #492).
     /// `None` = count as usual; an inner `None` = leave that row blank.
@@ -604,6 +607,7 @@ impl InputState {
             gutter_marks: Vec::new(),
             row_backgrounds: Vec::new(),
             lens_rows: Vec::new(),
+            lens_font: (None, None),
             lens_hitboxes: Vec::new(),
             line_number_labels: None,
             links_on_plain_click: false,

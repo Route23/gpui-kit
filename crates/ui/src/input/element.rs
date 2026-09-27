@@ -2406,19 +2406,25 @@ impl Element for TextElement {
                 })
             };
             if let Some((lens, indent)) = lens {
-                let size_ = window.text_style().font_size.to_pixels(window.rem_size()) * 0.85;
+                let editor_size = window.text_style().font_size.to_pixels(window.rem_size());
+                let (lens_family, lens_size) = self.state.read(cx).lens_font.clone();
+                let size_ = lens_size.map_or(editor_size * 0.85, |s| s.min(editor_size));
+                let mut lens_font = window.text_style().font();
+                if let Some(f) = lens_family {
+                    lens_font.family = f;
+                }
                 let color = cx.theme().muted_foreground;
                 let mut x = origin.x + prepaint.last_layout.line_number_width + column_advance * indent as f32;
                 let y = origin.y + offset_y;
                 for (i, item) in lens.items.iter().enumerate() {
                     if i > 0 {
                         let sep: SharedString = " | ".into();
-                        let run = TextRun { len: sep.len(), font: window.text_style().font(), color, background_color: None, underline: None, strikethrough: None };
+                        let run = TextRun { len: sep.len(), font: lens_font.clone(), color, background_color: None, underline: None, strikethrough: None };
                         let shaped = window.text_system().shape_line(sep, size_, &[run], None);
                         _ = shaped.paint(point(x, y), line_height, window, cx);
                         x += shaped.width;
                     }
-                    let run = TextRun { len: item.len(), font: window.text_style().font(), color, background_color: None, underline: None, strikethrough: None };
+                    let run = TextRun { len: item.len(), font: lens_font.clone(), color, background_color: None, underline: None, strikethrough: None };
                     let shaped = window.text_system().shape_line(item.clone(), size_, &[run], None);
                     _ = shaped.paint(point(x, y), line_height, window, cx);
                     lens_boxes.push((Bounds::new(point(x, y), size(shaped.width, line_height)), lens.row, i));
