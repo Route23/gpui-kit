@@ -2212,13 +2212,18 @@ impl Element for TextElement {
                         // the text does so `Line` and `Gutter` can be told
                         // apart.
                         let x = input_bounds.origin.x + prepaint.last_layout.line_number_width;
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(x, origin.y + offset_y),
-                                size(bounds.size.width, height),
-                            ),
-                            bg_color,
-                        ));
+                        let band = Bounds::new(
+                            point(x, origin.y + offset_y),
+                            size(bounds.size.width, height),
+                        );
+                        window.paint_quad(fill(band, bg_color));
+                        // A caller's row colour on the caret's row goes back
+                        // **over** the band (dopamine #278): a debugger moves
+                        // the caret onto the line it stopped at, and an opaque
+                        // band would hide exactly the row it wants to show.
+                        if let Some(color) = self.state.read(cx).row_background(row) {
+                            window.paint_quad(fill(band, color));
+                        }
                     }
                 }
                 offset_y += height + prepaint.last_layout.extra_height(row);
