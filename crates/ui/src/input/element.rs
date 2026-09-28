@@ -2532,8 +2532,11 @@ impl Element for TextElement {
             let (breakpoint_width, breakpoint_dots, hovered_breakpoint) = {
                 let state = self.state.read(cx);
                 let width = super::breakpoints::breakpoint_column_width(state);
-                let dots: Vec<bool> = (0..line_numbers.len())
-                    .map(|ix| width > px(0.) && state.has_breakpoint(visible_range.start + ix))
+                let dots: Vec<Option<super::breakpoints::BreakpointKind>> = (0..line_numbers.len())
+                    .map(|ix| {
+                        let row = visible_range.start + ix;
+                        (width > px(0.) && state.has_breakpoint(row)).then(|| state.breakpoint_kind(row))
+                    })
                     .collect();
                 (width, dots, state.hovered_breakpoint_row.filter(|_| width > px(0.)))
             };
@@ -2580,21 +2583,59 @@ impl Element for TextElement {
                     window.paint_quad(fill(mark, color));
                 }
 
-                let dot = breakpoint_dots.get(ix).copied().unwrap_or(false);
-                if dot || (hovered_breakpoint == Some(row) && !lines.is_empty()) {
+                let dot = breakpoint_dots.get(ix).copied().flatten();
+                if dot.is_some() || (hovered_breakpoint == Some(row) && !lines.is_empty()) {
+                    use super::breakpoints::BreakpointKind;
                     let d = super::breakpoints::BREAKPOINT_DOT;
                     let x = p.x
                         + super::breakpoints::BREAKPOINT_COLUMN_X
                         + (super::breakpoints::BREAKPOINT_COLUMN_WIDTH - d) / 2.;
                     let y = p.y + (line_height - d) / 2.;
-                    let color = if dot {
-                        cx.theme().danger
-                    } else {
-                        cx.theme().danger.opacity(0.35)
-                    };
-                    window.paint_quad(
-                        fill(Bounds::new(point(x, y), size(d, d)), color).corner_radii(d / 2.),
-                    );
+                    let bounds = Bounds::new(point(x, y), size(d, d));
+                    let bg = cx.theme().editor_background();
+                    match dot {
+                        None => window.paint_quad(
+                            fill(bounds, cx.theme().danger.opacity(0.35)).corner_radii(d / 2.),
+                        ),
+                        Some(BreakpointKind::Normal) => {
+                            window.paint_quad(fill(bounds, cx.theme().danger).corner_radii(d / 2.))
+                        }
+                        // A bar through the dot, like VS Code's `=`.
+                        Some(BreakpointKind::Conditional) => {
+                            window.paint_quad(fill(bounds, cx.theme().danger).corner_radii(d / 2.));
+                            window.paint_quad(fill(
+                                Bounds::new(point(x + d * 0.2, y + d * 0.42), size(d * 0.6, d * 0.16)),
+                                bg,
+                            ));
+                        }
+                        // A diamond: a square path turned on its corner.
+                        Some(BreakpointKind::Log) => {
+                            let c = point(x + d / 2., y + d / 2.);
+                            let r = d * 0.6;
+                            let mut b = gpui::PathBuilder::fill();
+                            b.move_to(point(c.x, c.y - r));
+                            b.line_to(point(c.x + r, c.y));
+                            b.line_to(point(c.x, c.y + r));
+                            b.line_to(point(c.x - r, c.y));
+                            b.close();
+                            if let Ok(path) = b.build() {
+                                window.paint_path(path, cx.theme().danger);
+                            }
+                        }
+                        // A ring: the dot with its middle punched out.
+                        Some(BreakpointKind::Disabled) => {
+                            let muted = cx.theme().muted_foreground;
+                            window.paint_quad(fill(bounds, muted).corner_radii(d / 2.));
+                            let inner = d * 0.56;
+                            window.paint_quad(
+                                fill(
+                                    Bounds::new(point(x + (d - inner) / 2., y + (d - inner) / 2.), size(inner, inner)),
+                                    bg,
+                                )
+                                .corner_radii(inner / 2.),
+                            );
+                        }
+                    }
                 }
 
                 if let Some(chevron) = prepaint.fold_chevrons.iter().find(|c| c.ix == ix) {

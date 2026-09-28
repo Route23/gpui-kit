@@ -26,6 +26,20 @@ pub(super) const BREAKPOINT_COLUMN_X: Pixels = px(3.);
 /// The dot's diameter.
 pub(super) const BREAKPOINT_DOT: Pixels = px(9.);
 
+/// How a dot is drawn (dopamine #278). The caller decides what each means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BreakpointKind {
+    /// A filled dot.
+    #[default]
+    Normal,
+    /// A dot with a bar through it (stops only when a condition holds).
+    Conditional,
+    /// A diamond (writes a message instead of stopping).
+    Log,
+    /// A ring in the muted colour (kept, but does nothing).
+    Disabled,
+}
+
 /// The width the column takes out of the gutter, 0 when it is off.
 pub(super) fn breakpoint_column_width(state: &InputState) -> Pixels {
     if state.breakpoint_gutter && state.mode.line_number() {
@@ -57,6 +71,22 @@ impl InputState {
         cx.notify();
     }
 
+    /// How to draw particular dots; rows not listed are [`BreakpointKind::Normal`].
+    /// Rows are the caller's: after [`super::InputEvent::BreakpointsMoved`] it is
+    /// expected to send them again.
+    pub fn set_breakpoint_kinds(&mut self, kinds: Vec<(usize, BreakpointKind)>, cx: &mut Context<Self>) {
+        let kinds: std::collections::HashMap<usize, BreakpointKind> = kinds.into_iter().collect();
+        if self.breakpoint_kinds == kinds {
+            return;
+        }
+        self.breakpoint_kinds = kinds;
+        cx.notify();
+    }
+
+    pub(super) fn breakpoint_kind(&self, row: usize) -> BreakpointKind {
+        self.breakpoint_kinds.get(&row).copied().unwrap_or_default()
+    }
+
     /// The rows that carry a dot, after any edits since they were set.
     pub fn breakpoints(&self) -> &[usize] {
         &self.breakpoints
@@ -83,13 +113,20 @@ impl InputState {
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) -> bool {
-        if event.button != MouseButton::Left || !self.in_breakpoint_column(event.position) {
+        let right = event.button == MouseButton::Right;
+        if !(event.button == MouseButton::Left || right) || !self.in_breakpoint_column(event.position) {
             return false;
         }
         let Some(row) = self.row_for_mouse_position(event.position) else {
             return false;
         };
-        cx.emit(super::InputEvent::BreakpointClicked { row });
+        // A right click asks the host for a menu (condition, log message,
+        // disable) instead of toggling.
+        if right {
+            cx.emit(super::InputEvent::BreakpointContextMenu { row, position: event.position });
+        } else {
+            cx.emit(super::InputEvent::BreakpointClicked { row });
+        }
         cx.stop_propagation();
         true
     }

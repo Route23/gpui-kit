@@ -167,6 +167,8 @@ pub enum InputEvent {
     BreakpointClicked { row: usize },
     /// An edit moved the breakpoint dots; `rows` is the new list.
     BreakpointsMoved { rows: Vec<usize> },
+    /// The breakpoint column was right-clicked on `row` (dopamine #278).
+    BreakpointContextMenu { row: usize, position: Point<Pixels> },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -456,6 +458,8 @@ pub struct InputState {
     pub(super) gutter_marks: Vec<crate::input::GutterMark>,
     /// Rows with a breakpoint dot (dopamine #278), sorted.
     pub(super) breakpoints: Vec<usize>,
+    /// How particular dots are drawn (dopamine #278).
+    pub(super) breakpoint_kinds: std::collections::HashMap<usize, crate::input::BreakpointKind>,
     /// Whether the breakpoint column is shown.
     pub(super) breakpoint_gutter: bool,
     /// The row under the pointer in the breakpoint column.
@@ -617,6 +621,7 @@ impl InputState {
             inline_diagnostics: Vec::new(),
             gutter_marks: Vec::new(),
             breakpoints: Vec::new(),
+            breakpoint_kinds: std::collections::HashMap::new(),
             breakpoint_gutter: false,
             hovered_breakpoint_row: None,
             row_backgrounds: Vec::new(),
