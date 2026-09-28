@@ -12,6 +12,7 @@ mod expand;
 mod fold;
 mod diff_marks;
 mod gutter_marks;
+mod breakpoints;
 mod indent;
 mod inlay;
 mod lens;

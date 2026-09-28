@@ -1064,6 +1064,7 @@ impl TextElement {
                 + px(6.)
                 + LINE_NUMBER_RIGHT_MARGIN
                 + fold_chevron_width(state)
+                + super::breakpoints::breakpoint_column_width(state)
         } else {
             fold_chevron_width(state)
         };
@@ -1443,6 +1444,8 @@ pub(super) struct PrepaintState {
     fold_chevrons: Vec<crate::input::fold::FoldChevron>,
     /// The chevron strip, so the cursor turns into a hand over it.
     fold_gutter_hitbox: Option<Hitbox>,
+    /// The breakpoint column (dopamine #278), for the hand cursor.
+    breakpoint_hitbox: Option<Hitbox>,
     /// The `…` badge drawn after a folded header, keyed by index into
     /// `LastLayout::lines`.
     fold_markers: Vec<(usize, ShapedLine)>,
@@ -2000,6 +2003,22 @@ impl Element for TextElement {
                 gpui::HitboxBehavior::Normal,
             )
         });
+        let breakpoint_hitbox = (super::breakpoints::breakpoint_column_width(state) > px(0.))
+            .then(|| {
+                window.insert_hitbox(
+                    Bounds::new(
+                        point(
+                            state.input_bounds.origin.x + super::breakpoints::BREAKPOINT_COLUMN_X,
+                            state.input_bounds.origin.y,
+                        ),
+                        size(
+                            super::breakpoints::BREAKPOINT_COLUMN_WIDTH,
+                            state.input_bounds.size.height,
+                        ),
+                    ),
+                    gpui::HitboxBehavior::Normal,
+                )
+            });
         let fold_markers =
             self.layout_fold_markers(state, &last_layout, text_size, &text_style, window, cx);
         let inlay_hints =
@@ -2032,6 +2051,7 @@ impl Element for TextElement {
             whitespaces,
             fold_chevrons,
             fold_gutter_hitbox,
+            breakpoint_hitbox,
             fold_markers,
             inlay_hints,
             inline_diagnostics,
@@ -2502,6 +2522,16 @@ impl Element for TextElement {
                     .map(|ix| state.gutter_mark_at(visible_range.start + ix))
                     .collect()
             };
+            // Breakpoint dots (dopamine #278): the column sits left of the
+            // numbers, so the numbers move right by its width.
+            let (breakpoint_width, breakpoint_dots, hovered_breakpoint) = {
+                let state = self.state.read(cx);
+                let width = super::breakpoints::breakpoint_column_width(state);
+                let dots: Vec<bool> = (0..line_numbers.len())
+                    .map(|ix| width > px(0.) && state.has_breakpoint(visible_range.start + ix))
+                    .collect();
+                (width, dots, state.hovered_breakpoint_row.filter(|_| width > px(0.)))
+            };
 
             window.paint_quad(fill(
                 Bounds {
@@ -2545,6 +2575,23 @@ impl Element for TextElement {
                     window.paint_quad(fill(mark, color));
                 }
 
+                let dot = breakpoint_dots.get(ix).copied().unwrap_or(false);
+                if dot || (hovered_breakpoint == Some(row) && !lines.is_empty()) {
+                    let d = super::breakpoints::BREAKPOINT_DOT;
+                    let x = p.x
+                        + super::breakpoints::BREAKPOINT_COLUMN_X
+                        + (super::breakpoints::BREAKPOINT_COLUMN_WIDTH - d) / 2.;
+                    let y = p.y + (line_height - d) / 2.;
+                    let color = if dot {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().danger.opacity(0.35)
+                    };
+                    window.paint_quad(
+                        fill(Bounds::new(point(x, y), size(d, d)), color).corner_radii(d / 2.),
+                    );
+                }
+
                 if let Some(chevron) = prepaint.fold_chevrons.iter().find(|c| c.ix == ix) {
                     let x = fold_chevron_x(
                         input_bounds.origin.x,
@@ -2553,8 +2600,9 @@ impl Element for TextElement {
                     _ = chevron.line.paint(point(x, p.y), line_height, window, cx);
                 }
 
+                let number_origin = point(p.x + breakpoint_width, p.y);
                 for line in lines {
-                    _ = line.paint(p, line_height, window, cx);
+                    _ = line.paint(number_origin, line_height, window, cx);
                     offset_y += line_height;
                 }
 
@@ -2614,6 +2662,9 @@ impl Element for TextElement {
         }
 
         if let Some(hitbox) = prepaint.fold_gutter_hitbox.as_ref() {
+            window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
+        }
+        if let Some(hitbox) = prepaint.breakpoint_hitbox.as_ref() {
             window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
         }
 

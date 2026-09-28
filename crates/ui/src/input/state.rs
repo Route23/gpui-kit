@@ -162,6 +162,11 @@ pub enum InputEvent {
     /// A change mark drawn with [`InputState::set_gutter_marks`] was clicked on
     /// `row` (dopamine #490). The caret stays put.
     GutterMarkClicked { row: usize },
+    /// The breakpoint column was clicked on `row`, with or without a dot there
+    /// (dopamine #278). The caret stays put; the host toggles.
+    BreakpointClicked { row: usize },
+    /// An edit moved the breakpoint dots; `rows` is the new list.
+    BreakpointsMoved { rows: Vec<usize> },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -449,6 +454,12 @@ pub struct InputState {
     pub(super) inline_diagnostics: Vec<crate::input::InlineDiagnostic>,
     /// Change marks beside the line numbers (dopamine #280).
     pub(super) gutter_marks: Vec<crate::input::GutterMark>,
+    /// Rows with a breakpoint dot (dopamine #278), sorted.
+    pub(super) breakpoints: Vec<usize>,
+    /// Whether the breakpoint column is shown.
+    pub(super) breakpoint_gutter: bool,
+    /// The row under the pointer in the breakpoint column.
+    pub(super) hovered_breakpoint_row: Option<usize>,
     /// Whole-row and byte-range backgrounds (dopamine #244).
     pub(super) row_backgrounds: Vec<(usize, gpui::Hsla)>,
     /// Clickable labels above rows (dopamine #412) and where the last paint put them.
@@ -605,6 +616,9 @@ impl InputState {
             inlay_rows: Vec::new(),
             inline_diagnostics: Vec::new(),
             gutter_marks: Vec::new(),
+            breakpoints: Vec::new(),
+            breakpoint_gutter: false,
+            hovered_breakpoint_row: None,
             row_backgrounds: Vec::new(),
             lens_rows: Vec::new(),
             lens_font: (None, None),
@@ -3097,6 +3111,10 @@ impl InputState {
         if self.handle_gutter_mark_click(event, cx) {
             return;
         }
+        // The breakpoint column (dopamine #278): the host toggles the row.
+        if self.handle_breakpoint_click(event, cx) {
+            return;
+        }
         // A lens label (dopamine #412): the host runs it; the caret stays put.
         if event.button == MouseButton::Left {
             if let Some((row, item)) = self.lens_hit(event.position) {
@@ -3212,6 +3230,7 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         self.track_fold_gutter_hover(event.position, cx);
+        self.track_breakpoint_hover(event.position, cx);
 
         // Show diagnostic popover on mouse move
         let offset = self.index_for_mouse_position(event.position);
@@ -4202,6 +4221,7 @@ impl EntityInputHandler for InputState {
         // would be worse than not having the feature. `update_folds` then drops
         // any header that no longer heads a fold.
         self.shift_folds_for_edit(&old_text, &range);
+        self.shift_breakpoints_for_edit(&old_text, &range, cx);
         self.update_folds();
         self.mode
             .update_highlighter(&range, &self.text, &new_text, true, cx);
@@ -4288,6 +4308,7 @@ impl EntityInputHandler for InputState {
         self.text_wrapper
             .update(&self.text, &range, &Rope::from(new_text), cx);
         self.shift_folds_for_edit(&old_text, &range);
+        self.shift_breakpoints_for_edit(&old_text, &range, cx);
         self.update_folds();
         self.mode
             .update_highlighter(&range, &self.text, &new_text, true, cx);
