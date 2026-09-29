@@ -65,6 +65,19 @@ impl InputState {
         cx.notify();
     }
 
+    /// Values drawn after the end of their rows **whether or not inlay hints
+    /// are turned on** -- a debugger's current values (dopamine #278). Shown
+    /// after the language server's hint on the same row. Empty clears them.
+    pub fn set_pinned_inlays(&mut self, mut rows: Vec<InlayRow>, cx: &mut gpui::Context<Self>) {
+        rows.sort_by_key(|r| r.row);
+        rows.dedup_by_key(|r| r.row);
+        if self.pinned_inlay_rows == rows {
+            return;
+        }
+        self.pinned_inlay_rows = rows;
+        cx.notify();
+    }
+
     /// Stop drawing inlay hints.
     pub fn clear_inlay_hints(&mut self, cx: &mut gpui::Context<Self>) {
         if self.inlay_rows.is_empty() {
@@ -110,7 +123,8 @@ impl TextElement {
         window: &mut Window,
         cx: &App,
     ) -> Vec<(usize, ShapedLine)> {
-        if state.inlay_rows.is_empty() || !state.inlay_hints_visible(window) {
+        let visible = !state.inlay_rows.is_empty() && state.inlay_hints_visible(window);
+        if !visible && state.pinned_inlay_rows.is_empty() {
             return vec![];
         }
 
@@ -129,10 +143,16 @@ impl TextElement {
             if state.is_folded(row) {
                 continue;
             }
-            let Ok(at) = state.inlay_rows.binary_search_by_key(&row, |r| r.row) else {
-                continue;
+            let find = |rows: &[InlayRow]| {
+                rows.binary_search_by_key(&row, |r| r.row).ok().map(|i| rows[i].label.clone())
             };
-            let label = state.inlay_rows[at].label.clone();
+            let hint = if visible { find(&state.inlay_rows) } else { None };
+            let label: SharedString = match (hint, find(&state.pinned_inlay_rows)) {
+                (Some(h), Some(p)) => format!("{h}   {p}").into(),
+                (Some(h), None) => h,
+                (None, Some(p)) => p,
+                (None, None) => continue,
+            };
             let line = window.text_system().shape_line(
                 label.clone(),
                 size,

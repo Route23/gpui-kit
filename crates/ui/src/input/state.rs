@@ -169,6 +169,8 @@ pub enum InputEvent {
     BreakpointsMoved { rows: Vec<usize> },
     /// The breakpoint column was right-clicked on `row` (dopamine #278).
     BreakpointContextMenu { row: usize, position: Point<Pixels> },
+    /// The breakpoint column was middle-clicked on `row` (dopamine #278).
+    BreakpointMiddleClick { row: usize },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -449,6 +451,8 @@ pub struct InputState {
     /// variant, and this grows with the file rather than with the settings.
     /// Sorted by row so the paint loop can look a row up quickly.
     pub(super) inlay_rows: Vec<crate::input::InlayRow>,
+    /// Values shown whatever the inlay setting (dopamine #278).
+    pub(super) pinned_inlay_rows: Vec<crate::input::InlayRow>,
     /// Diagnostics to draw at the end of a row, keyed by row.
     ///
     /// Built from the same list the squiggles are built from, so the two
@@ -462,6 +466,8 @@ pub struct InputState {
     pub(super) breakpoint_kinds: std::collections::HashMap<usize, crate::input::BreakpointKind>,
     /// Whether the breakpoint column is shown.
     pub(super) breakpoint_gutter: bool,
+    /// Whether breakpoints are also marked in the scrollbar track.
+    pub(super) breakpoint_ruler: bool,
     /// The row under the pointer in the breakpoint column.
     pub(super) hovered_breakpoint_row: Option<usize>,
     /// Whole-row and byte-range backgrounds (dopamine #244).
@@ -618,11 +624,13 @@ impl InputState {
             folded_rows: Vec::new(),
             supplied_folds: None,
             inlay_rows: Vec::new(),
+            pinned_inlay_rows: Vec::new(),
             inline_diagnostics: Vec::new(),
             gutter_marks: Vec::new(),
             breakpoints: Vec::new(),
             breakpoint_kinds: std::collections::HashMap::new(),
             breakpoint_gutter: false,
+            breakpoint_ruler: false,
             hovered_breakpoint_row: None,
             row_backgrounds: Vec::new(),
             lens_rows: Vec::new(),
@@ -3118,6 +3126,11 @@ impl InputState {
         }
         // The breakpoint column (dopamine #278): the host toggles the row.
         if self.handle_breakpoint_click(event, cx) {
+            return;
+        }
+        // A middle click anywhere else means nothing to the editor (it was
+        // only wired up for the breakpoint column).
+        if event.button == MouseButton::Middle {
             return;
         }
         // A lens label (dopamine #412): the host runs it; the caret stays put.

@@ -60,6 +60,15 @@ impl InputState {
         cx.notify();
     }
 
+    /// Also mark the dots in the scrollbar track (VS Code
+    /// `debug.showBreakpointsInOverviewRuler`). Off by default.
+    pub fn set_breakpoint_ruler(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.breakpoint_ruler != on {
+            self.breakpoint_ruler = on;
+            cx.notify();
+        }
+    }
+
     /// Draw a dot on these rows (0-based). An empty list clears them.
     pub fn set_breakpoints(&mut self, mut rows: Vec<usize>, cx: &mut Context<Self>) {
         rows.sort_unstable();
@@ -114,7 +123,8 @@ impl InputState {
         cx: &mut Context<Self>,
     ) -> bool {
         let right = event.button == MouseButton::Right;
-        if !(event.button == MouseButton::Left || right) || !self.in_breakpoint_column(event.position) {
+        let middle = event.button == MouseButton::Middle;
+        if !(event.button == MouseButton::Left || right || middle) || !self.in_breakpoint_column(event.position) {
             return false;
         }
         let Some(row) = self.row_for_mouse_position(event.position) else {
@@ -124,6 +134,9 @@ impl InputState {
         // disable) instead of toggling.
         if right {
             cx.emit(super::InputEvent::BreakpointContextMenu { row, position: event.position });
+        } else if middle {
+            // VS Code `debug.gutterMiddleClickAction`: the host decides what to add.
+            cx.emit(super::InputEvent::BreakpointMiddleClick { row });
         } else {
             cx.emit(super::InputEvent::BreakpointClicked { row });
         }

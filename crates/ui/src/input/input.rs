@@ -396,6 +396,12 @@ impl RenderOnce for Input {
                 MouseButton::Right,
                 window.listener_for(&self.state, InputState::on_mouse_down),
             )
+            // The breakpoint column's middle click (dopamine #278). Elsewhere a
+            // middle click does nothing: `on_mouse_down` only acts on it there.
+            .on_mouse_down(
+                MouseButton::Middle,
+                window.listener_for(&self.state, InputState::on_mouse_down),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 window.listener_for(&self.state, InputState::on_mouse_up),

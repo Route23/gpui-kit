@@ -142,7 +142,8 @@ impl super::InputState {
         use crate::{ActiveTheme as _, RopeExt as _};
 
         let want = self.mode.scrollbar_marks();
-        if !want.any() {
+        let breakpoints = self.breakpoint_ruler && self.breakpoint_gutter && !self.breakpoints.is_empty();
+        if !want.any() && !breakpoints {
             return vec![];
         }
         let total = self.text.lines_len().max(1);
@@ -184,6 +185,15 @@ impl super::InputState {
         }
         if let Some(min) = want.diagnostics {
             out.extend(self.diagnostic_marks(min, total, cx));
+        }
+        // Breakpoint dots (dopamine #278, VS Code `debug.showBreakpointsInOverviewRuler`).
+        if breakpoints {
+            out.extend(marks_for_rows(
+                self.breakpoints.iter().copied(),
+                total,
+                cx.theme().danger.opacity(0.9),
+                0.,
+            ));
         }
         if want.cursors {
             out.extend(marks_for_rows(
