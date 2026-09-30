@@ -966,7 +966,10 @@ impl Node {
                                                     }),
                                             )
                                         })
-                                        .child(div().overflow_hidden().child(text)),
+                                        // flex 行の中で `overflow_hidden` だけだと最小幅が 0 になり、
+                                        // 本文が 0 幅に潰れて**箇条書きの文字が消える**（dopamine #651）。
+                                        // 残りの幅を取らせる。
+                                        .child(div().flex_1().min_w_0().overflow_hidden().child(text)),
                                 );
                             }
                             Node::List { .. } => {
