@@ -63,6 +63,26 @@ impl InputState {
         highlighter.string_ranges(&(0..self.text.len()))
     }
 
+    /// The syntax colours of the whole buffer as `(byte range, colour)`, sorted and
+    /// non-overlapping; ranges without a colour are left out (dopamine #494, the minimap).
+    /// Empty when the highlighter has not parsed yet.
+    pub fn syntax_colors(&self, cx: &gpui::App) -> Vec<(std::ops::Range<usize>, gpui::Hsla)> {
+        use crate::ActiveTheme as _;
+        let super::mode::InputMode::CodeEditor { highlighter, .. } = &self.mode else {
+            return vec![];
+        };
+        let highlighter = highlighter.borrow();
+        let Some(highlighter) = highlighter.as_ref() else {
+            return vec![];
+        };
+        highlighter
+            .styles(&(0..self.text.len()), &cx.theme().highlight_theme)
+            .into_iter()
+            .filter_map(|(r, s)| s.color.map(|c| (r, c)))
+            .filter(|(r, _)| !r.is_empty())
+            .collect()
+    }
+
     /// Hide these byte ranges behind a solid bar (dopamine #247). **Replaces the previous
     /// set**; an empty vec turns it off. The text underneath is untouched — copy still copies it.
     pub fn set_redactions(&mut self, ranges: Vec<std::ops::Range<usize>>, cx: &mut Context<Self>) {
