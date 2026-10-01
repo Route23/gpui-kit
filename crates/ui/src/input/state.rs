@@ -3605,6 +3605,19 @@ impl InputState {
             .push(Change::new(range.clone(), &old_text, new_range, new_text));
     }
 
+    /// A copy of the undo / redo history, to hand back with [`Self::set_undo_history`]
+    /// when the same text is opened again (dopamine #247, `files.restoreUndoStack`).
+    pub fn undo_history(&self) -> UndoHistory {
+        UndoHistory(self.history.clone())
+    }
+
+    /// Put back a history taken with [`Self::undo_history`]. **The caller makes sure the
+    /// text is the same as when it was taken** — the changes are byte ranges into it.
+    pub fn set_undo_history(&mut self, history: UndoHistory) {
+        self.history = history.0;
+        self.history.ignore = false;
+    }
+
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
@@ -4521,3 +4534,7 @@ mod marked_selection_tests {
         }
     }
 }
+
+/// An opaque copy of an input's undo / redo history (see [`InputState::undo_history`]).
+#[derive(Clone)]
+pub struct UndoHistory(History<Change>);

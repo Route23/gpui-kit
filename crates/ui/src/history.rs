@@ -20,7 +20,7 @@ pub trait HistoryItem: Clone + PartialEq {
 ///
 /// - Undo/redo operations in Input
 /// - Tracking tab history for prev/next features
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct History<I: HistoryItem> {
     undos: Vec<I>,
     redos: Vec<I>,
