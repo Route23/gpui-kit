@@ -531,6 +531,9 @@ pub struct InputState {
     /// Sorted by `range.start` and non-overlapping; `semantic_spans_in` leans
     /// on that to find the visible slice by binary search.
     pub(super) semantic_spans: Vec<super::SemanticSpan>,
+    /// Byte ranges painted over with a solid bar (dopamine #247, Zed `redact_private_values`).
+    /// The host recomputes them on every change.
+    pub(super) redactions: Vec<Range<usize>>,
     /// The one the pointer is on **with the modifier held**, if any.
     pub(super) link_hover: Option<Range<usize>>,
 
@@ -669,6 +672,7 @@ impl InputState {
             expand_stack: Vec::new(),
             link_ranges: Vec::new(),
             semantic_spans: Vec::new(),
+            redactions: Vec::new(),
             link_hover: None,
             silent_replace_text: false,
             size: Size::default(),

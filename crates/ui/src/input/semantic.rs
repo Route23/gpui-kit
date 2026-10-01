@@ -50,6 +50,29 @@ impl InputState {
         cx.notify();
     }
 
+    /// The string spans of the whole buffer (dopamine #247), or nothing when the
+    /// highlighter has not parsed yet. Used to keep trailing spaces inside strings on save.
+    pub fn string_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        let super::mode::InputMode::CodeEditor { highlighter, .. } = &self.mode else {
+            return vec![];
+        };
+        let highlighter = highlighter.borrow();
+        let Some(highlighter) = highlighter.as_ref() else {
+            return vec![];
+        };
+        highlighter.string_ranges(&(0..self.text.len()))
+    }
+
+    /// Hide these byte ranges behind a solid bar (dopamine #247). **Replaces the previous
+    /// set**; an empty vec turns it off. The text underneath is untouched — copy still copies it.
+    pub fn set_redactions(&mut self, ranges: Vec<std::ops::Range<usize>>, cx: &mut Context<Self>) {
+        if self.redactions == ranges {
+            return;
+        }
+        self.redactions = ranges;
+        cx.notify();
+    }
+
     /// Drop them all -- the file changed, the server died, the setting went
     /// off. Cheap to call when there is nothing to drop.
     pub fn clear_semantic_spans(&mut self, cx: &mut Context<Self>) {

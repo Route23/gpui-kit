@@ -593,6 +593,26 @@ impl SyntaxHighlighter {
     /// Brackets inside them are not code — a `(` in `"a (b"` has no partner —
     /// so anything that pairs brackets has to skip these. Reuses the same
     /// query pass `styles` runs, and the result is merged and sorted.
+    /// The byte ranges in `range` that are string text (strings, regexes, …), merged and
+    /// sorted. Comments are left out (dopamine #247: keep trailing spaces inside strings).
+    pub fn string_ranges(&self, range: &Range<usize>) -> Vec<Range<usize>> {
+        let mut out: Vec<Range<usize>> = self
+            .match_styles(range.clone())
+            .into_iter()
+            .filter(|item| item.name.starts_with("string"))
+            .map(|item| item.range)
+            .collect();
+        out.sort_by_key(|r| r.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(out.len());
+        for r in out {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        merged
+    }
+
     pub fn skipped_ranges(&self, range: &Range<usize>) -> Vec<Range<usize>> {
         let mut out: Vec<Range<usize>> = self
             .match_styles(range.clone())

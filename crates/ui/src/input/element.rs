@@ -1431,6 +1431,8 @@ pub(super) struct PrepaintState {
     /// The outlines of the bracket next to the caret and its partner
     bracket_match_paths: Vec<Path<Pixels>>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
+    /// Bars over redacted values (dopamine #247), painted on top of the glyphs.
+    redaction_paths: Vec<Path<Pixels>>,
     hover_definition_hitbox: Option<Hitbox>,
     link_hitbox: Option<Hitbox>,
     document_highlight_paths: Vec<(Path<Pixels>, Hsla)>,
@@ -1898,6 +1900,13 @@ impl Element for TextElement {
             self.layout_document_colors(&document_colors, &last_layout, &bounds);
         let document_highlight_paths =
             self.layout_document_highlights(&last_layout, &bounds, cx);
+        let redaction_paths: Vec<Path<Pixels>> = self
+            .state
+            .read(cx)
+            .redactions
+            .iter()
+            .filter_map(|r| Self::layout_match_range_rounded(r.clone(), &last_layout, &bounds, Some(px(2.))))
+            .collect();
 
         let state = self.state.read(cx);
         let line_numbers_mode = state.mode.line_numbers();
@@ -2043,6 +2052,7 @@ impl Element for TextElement {
             link_hitbox,
             document_highlight_paths,
             document_color_paths,
+            redaction_paths,
             sticky_lines,
             indent_guide_paths,
             indent_guide_bands,
@@ -2459,6 +2469,11 @@ impl Element for TextElement {
             }
         }
         self.state.update(cx, |s, _| s.set_lens_hitboxes(std::mem::take(&mut lens_boxes)));
+
+        // Paint the redaction bars over the glyphs they hide (dopamine #247).
+        for path in prepaint.redaction_paths.iter() {
+            window.paint_path(path.clone(), cx.theme().muted_foreground);
+        }
 
         // Paint whitespace marks on top of the glyphs they belong to.
         Self::paint_whitespaces(
