@@ -380,6 +380,28 @@ impl TextElement {
         (cursor_bounds, scroll_offset, current_row)
     }
 
+    /// A 2px caret bar at `offset`, if that position is on screen (dopamine #390).
+    pub(crate) fn caret_bounds(offset: usize, last_layout: &LastLayout, bounds: &Bounds<Pixels>) -> Option<Bounds<Pixels>> {
+        if offset < last_layout.visible_range_offset.start || offset > last_layout.visible_range_offset.end {
+            return None;
+        }
+        let line_height = last_layout.line_height;
+        let mut prev_lines_offset = last_layout.visible_range_offset.start;
+        let mut offset_y = last_layout.visible_top;
+        for (ix, line) in last_layout.lines.iter().enumerate() {
+            let row = last_layout.visible_range.start + ix;
+            if let Some(pos) = line.position_for_index(offset.saturating_sub(prev_lines_offset), line_height) {
+                if offset >= prev_lines_offset {
+                    let origin = bounds.origin + point(last_layout.line_number_width + pos.x, offset_y + pos.y);
+                    return Some(Bounds::new(origin, size(px(2.), line_height)));
+                }
+            }
+            offset_y += line.size(line_height).height + last_layout.extra_height(row);
+            prev_lines_offset += line.len() + 1;
+        }
+        None
+    }
+
     /// Layout the match range to a Path.
     pub(crate) fn layout_match_range(
         range: Range<usize>,
@@ -1434,6 +1456,10 @@ pub(super) struct PrepaintState {
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     /// Bars over redacted values (dopamine #247), painted on top of the glyphs.
     redaction_paths: Vec<Path<Pixels>>,
+    /// The other carets' selections and bars (dopamine #390), and where a dragged
+    /// selection would land.
+    extra_selection_paths: Vec<Path<Pixels>>,
+    extra_carets: Vec<Bounds<Pixels>>,
     hover_definition_hitbox: Option<Hitbox>,
     link_hitbox: Option<Hitbox>,
     document_highlight_paths: Vec<(Path<Pixels>, Hsla)>,
@@ -1901,6 +1927,29 @@ impl Element for TextElement {
             self.layout_document_colors(&document_colors, &last_layout, &bounds);
         let document_highlight_paths =
             self.layout_document_highlights(&last_layout, &bounds, cx);
+        let (extra_selection_paths, extra_carets) = {
+            let state = self.state.read(cx);
+            let radius = selection_radius(state);
+            let mut paths = Vec::new();
+            let mut carets = Vec::new();
+            for s in &state.extra_selections {
+                if !s.is_empty() {
+                    let r = s.start.max(last_layout.visible_range_offset.start)..s.end.min(last_layout.visible_range_offset.end);
+                    if let Some(p) = Self::layout_match_range_rounded(r, &last_layout, &bounds, radius) {
+                        paths.push(p);
+                    }
+                }
+                if let Some(b) = Self::caret_bounds(s.end, &last_layout, &bounds) {
+                    carets.push(b);
+                }
+            }
+            if let Some(drop) = state.sel_drag.as_ref().and_then(|d| d.drop) {
+                if let Some(b) = Self::caret_bounds(drop, &last_layout, &bounds) {
+                    carets.push(b);
+                }
+            }
+            (paths, carets)
+        };
         let redaction_paths: Vec<Path<Pixels>> = self
             .state
             .read(cx)
@@ -2054,6 +2103,8 @@ impl Element for TextElement {
             document_highlight_paths,
             document_color_paths,
             redaction_paths,
+            extra_selection_paths,
+            extra_carets,
             sticky_lines,
             indent_guide_paths,
             indent_guide_bands,
@@ -2280,6 +2331,10 @@ impl Element for TextElement {
             if let Some(path) = prepaint.selection_path.take() {
                 window.paint_path(path, cx.theme().selection);
             }
+            // The other carets' selections (dopamine #390).
+            for path in prepaint.extra_selection_paths.iter() {
+                window.paint_path(path.clone(), cx.theme().selection);
+            }
 
             // Paint the matching bracket's outline. Drawn after the selection
             // so it stays readable inside one.
@@ -2474,6 +2529,12 @@ impl Element for TextElement {
         // Paint the redaction bars over the glyphs they hide (dopamine #247).
         for path in prepaint.redaction_paths.iter() {
             window.paint_path(path.clone(), cx.theme().muted_foreground);
+        }
+
+        // The other carets (dopamine #390) — thin bars, not blinking, so they read
+        // as "also here" next to the primary one.
+        for b in prepaint.extra_carets.iter() {
+            window.paint_quad(fill(*b, cx.theme().caret));
         }
 
         // Paint whitespace marks on top of the glyphs they belong to.

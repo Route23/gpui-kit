@@ -24,6 +24,7 @@ mod lsp;
 mod mask_pattern;
 mod mode;
 mod movement;
+mod multi_cursor;
 mod number_input;
 mod otp_input;
 pub(crate) mod popovers;
@@ -70,6 +71,7 @@ pub use scrollbar_marks::{MarkSeverity, ScrollbarMarks};
 pub use number_input::{NumberInput, NumberInputEvent, StepAction};
 pub use otp_input::*;
 pub use state::*;
+pub use multi_cursor::MultiCursorOptions;
 
 pub use lsp_types::Position;
 pub use search::{SearchBehavior, SearchOptions};

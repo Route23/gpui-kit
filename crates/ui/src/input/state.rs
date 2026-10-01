@@ -105,6 +105,10 @@ actions!(
         UnfoldAll,
         ToggleComment,
         ToggleBlockComment,
+        AddNextOccurrence,
+        SelectAllOccurrences,
+        AddCursorAbove,
+        AddCursorBelow,
     ]
 );
 
@@ -306,6 +310,12 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-/", ToggleComment, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-alt-/", ToggleBlockComment, Some(CONTEXT)),
+        // More carets (dopamine #390). ⌥⌘↑/↓ is the pane focus in dopamine, so
+        // the vertical ones take ⌃⇧↑/↓ (VS Code on Linux / Windows).
+        KeyBinding::new("cmd-d", AddNextOccurrence, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-l", SelectAllOccurrences, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-up", AddCursorAbove, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-down", AddCursorBelow, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-alt-/", ToggleBlockComment, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-cmd-right", ExpandSelection, Some(CONTEXT)),
@@ -418,6 +428,13 @@ pub struct InputState {
     /// - "Hello 世界💝" = 16
     /// - "💝" = 4
     pub(super) selected_range: Selection,
+    /// Carets besides the primary one (dopamine #390, see `multi_cursor.rs`).
+    pub(super) extra_selections: Vec<Selection>,
+    pub(super) multi_cursor: super::multi_cursor::MultiCursorOptions,
+    /// ⇧⌥-drag: where the column selection started.
+    pub(super) box_anchor: Option<usize>,
+    /// A selection being dragged to a new place (`editor.dragAndDrop`).
+    pub(super) sel_drag: Option<super::multi_cursor::SelectionDrag>,
     pub(super) search_panel: Option<Entity<SearchPanel>>,
     pub(super) searchable: bool,
     /// Range for save the selected word, use to keep word range when drag move.
@@ -618,6 +635,10 @@ impl InputState {
             caret_moved_explicitly: false,
             history,
             selected_range: Selection::default(),
+            extra_selections: Vec::new(),
+            multi_cursor: Default::default(),
+            box_anchor: None,
+            sel_drag: None,
             search_panel: None,
             searchable: false,
             selected_word_range: None,
@@ -2564,6 +2585,7 @@ impl InputState {
     }
 
     pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.extra_selections.clear();
         self.selected_range = (0..self.text.len()).into();
         cx.notify();
     }
@@ -3102,6 +3124,13 @@ impl InputState {
             return;
         }
 
+        // Extra carets go first (VS Code): Escape is back to one caret.
+        if !self.extra_selections.is_empty() {
+            self.extra_selections.clear();
+            cx.notify();
+            return;
+        }
+
         // Clear inline completion on escape
         if self.has_inline_completion() {
             self.clear_inline_completion(cx);
@@ -3188,6 +3217,33 @@ impl InputState {
             }
         }
 
+        // More carets (dopamine #390). ⇧⌥-drag is a column selection;
+        // ⌥-click (or ⌘-click, by the option) adds a caret.
+        if event.button == MouseButton::Left && event.click_count == 1 {
+            if event.modifiers.shift && event.modifiers.alt {
+                self.box_anchor = Some(self.cursor());
+                self.box_select(self.cursor(), offset, cx);
+                return;
+            }
+            let adds = if self.multi_cursor.alt_adds { event.modifiers.alt } else { event.modifiers.platform };
+            if adds && !event.modifiers.shift {
+                self.selecting = false;
+                self.add_caret(offset, cx);
+                return;
+            }
+            // Drag the selection to move it (`editor.dragAndDrop`).
+            if !event.modifiers.shift {
+                if let Some(drag) = self.selection_drag_start(offset) {
+                    self.sel_drag = Some(drag);
+                    return;
+                }
+            }
+        }
+        self.box_anchor = None;
+        if event.button == MouseButton::Left {
+            self.extra_selections.clear();
+        }
+
         // Triple click to select the line.
         //
         // **This was simply missing** -- `click_count == 3` appeared nowhere,
@@ -3245,10 +3301,23 @@ impl InputState {
 
     pub(super) fn on_mouse_up(
         &mut self,
-        _: &MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
+        self.box_anchor = None;
+        // A selection drag (dopamine #390): drop it, or — if it never moved —
+        // put the caret where the click was, as a plain click would have.
+        if let Some(drag) = self.sel_drag.take() {
+            if drag.drop.is_some() {
+                self.finish_selection_drag(drag, window, cx);
+            } else {
+                let offset = self.index_for_mouse_position(event.position);
+                self.move_to(offset, None, cx);
+            }
+            self.selecting = false;
+            return;
+        }
         if self.selected_range.is_empty() {
             self.selection_reversed = false;
         }
@@ -3595,6 +3664,12 @@ impl InputState {
 
             // Re-indent the block to where it landed (#248). **Before the
             // edit** -- moving text after it is in would be a second undo step.
+            // Several carets (dopamine #390): one line each, or all of it at each.
+            if !self.extra_selections.is_empty() {
+                self.paste_multi(&new_text, window, cx);
+                return;
+            }
+
             if let Some(fixed) = self.reindent_paste(&new_text) {
                 new_text = fixed;
             }
@@ -3634,6 +3709,7 @@ impl InputState {
     }
 
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        self.extra_selections.clear();
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
             for change in changes {
@@ -3645,6 +3721,7 @@ impl InputState {
     }
 
     pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        self.extra_selections.clear();
         self.history.ignore = true;
         if let Some(changes) = self.history.redo() {
             for change in changes {
@@ -3995,12 +4072,42 @@ impl InputState {
             return;
         }
 
+        let offset = self.index_for_mouse_position(event.position);
+        // Dragging a selection (dopamine #390): just follow the drop point.
+        if let Some(drag) = self.sel_drag.as_mut() {
+            if drag.drop != Some(offset) {
+                drag.drop = Some(offset);
+                cx.notify();
+            }
+            return;
+        }
+        // ⇧⌥-drag: the column selection follows the pointer.
+        if let Some(anchor) = self.box_anchor {
+            self.box_select(anchor, offset, cx);
+            return;
+        }
+
         if !self.selecting {
             return;
         }
 
-        let offset = self.index_for_mouse_position(event.position);
         self.select_to(offset, cx);
+    }
+
+    pub(super) fn on_add_next_occurrence(&mut self, _: &AddNextOccurrence, _: &mut Window, cx: &mut Context<Self>) {
+        self.add_next_occurrence(cx);
+    }
+
+    pub(super) fn on_select_all_occurrences(&mut self, _: &SelectAllOccurrences, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all_occurrences(cx);
+    }
+
+    pub(super) fn on_add_cursor_above(&mut self, _: &AddCursorAbove, _: &mut Window, cx: &mut Context<Self>) {
+        self.add_caret_vertically(false, cx);
+    }
+
+    pub(super) fn on_add_cursor_below(&mut self, _: &AddCursorBelow, _: &mut Window, cx: &mut Context<Self>) {
+        self.add_caret_vertically(true, cx);
     }
 
     fn is_valid_input(&self, new_text: &str, cx: &mut Context<Self>) -> bool {
@@ -4194,6 +4301,14 @@ impl EntityInputHandler for InputState {
         cx: &mut Context<Self>,
     ) {
         if self.disabled {
+            return;
+        }
+
+        // Typing with several carets (dopamine #390): the same text at each.
+        // IME composition stays on the primary caret only.
+        if !self.extra_selections.is_empty() && range_utf16.is_none() && self.ime_marked_range.is_none() {
+            let t = new_text.to_string();
+            self.each_cursor(window, cx, |s, w, cx| s.replace_text_in_range(None, &t, w, cx));
             return;
         }
 
