@@ -13,6 +13,7 @@ mod fold;
 mod diff_marks;
 mod gutter_marks;
 mod breakpoints;
+mod runnables;
 pub use breakpoints::BreakpointKind;
 mod indent;
 mod inlay;

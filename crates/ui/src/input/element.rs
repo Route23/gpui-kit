@@ -1065,6 +1065,7 @@ impl TextElement {
                 + LINE_NUMBER_RIGHT_MARGIN
                 + fold_chevron_width(state)
                 + super::breakpoints::breakpoint_column_width(state)
+                + super::runnables::runnable_column_width(state)
         } else {
             fold_chevron_width(state)
         };
@@ -2555,6 +2556,17 @@ impl Element for TextElement {
                     .collect();
                 (width, dots, state.hovered_breakpoint_row.filter(|_| width > px(0.)))
             };
+            // Run triangles (dopamine #496), right of the breakpoint column.
+            let (runnable_width, runnable_x, runnables) = {
+                let state = self.state.read(cx);
+                let rows: Vec<bool> =
+                    (0..line_numbers.len()).map(|ix| state.has_runnable(visible_range.start + ix)).collect();
+                (
+                    super::runnables::runnable_column_width(state),
+                    super::runnables::runnable_column_x(state),
+                    rows,
+                )
+            };
 
             window.paint_quad(fill(
                 Bounds {
@@ -2661,7 +2673,22 @@ impl Element for TextElement {
                     _ = chevron.line.paint(point(x, p.y), line_height, window, cx);
                 }
 
-                let number_origin = point(p.x + breakpoint_width, p.y);
+                if runnables.get(ix).copied().unwrap_or(false) && !lines.is_empty() {
+                    let h = super::runnables::RUNNABLE_TRIANGLE;
+                    let w = h * 0.86;
+                    let x = p.x + runnable_x + (super::runnables::RUNNABLE_COLUMN_WIDTH - w) / 2.;
+                    let y = p.y + (line_height - h) / 2.;
+                    let mut b = gpui::PathBuilder::fill();
+                    b.move_to(point(x, y));
+                    b.line_to(point(x + w, y + h / 2.));
+                    b.line_to(point(x, y + h));
+                    b.close();
+                    if let Ok(path) = b.build() {
+                        window.paint_path(path, cx.theme().success);
+                    }
+                }
+
+                let number_origin = point(p.x + breakpoint_width + runnable_width, p.y);
                 for line in lines {
                     _ = line.paint(number_origin, line_height, window, cx);
                     offset_y += line_height;

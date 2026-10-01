@@ -165,6 +165,8 @@ pub enum InputEvent {
     /// The breakpoint column was clicked on `row`, with or without a dot there
     /// (dopamine #278). The caret stays put; the host toggles.
     BreakpointClicked { row: usize },
+    /// A ▶ in the run column was clicked (dopamine #496).
+    RunnableClicked { row: usize },
     /// An edit moved the breakpoint dots; `rows` is the new list.
     BreakpointsMoved { rows: Vec<usize> },
     /// The breakpoint column was right-clicked on `row` (dopamine #278).
@@ -466,6 +468,9 @@ pub struct InputState {
     pub(super) breakpoint_kinds: std::collections::HashMap<usize, crate::input::BreakpointKind>,
     /// Whether the breakpoint column is shown.
     pub(super) breakpoint_gutter: bool,
+    /// The ▶ column (dopamine #496) and its rows.
+    pub(super) runnable_gutter: bool,
+    pub(super) runnable_rows: Vec<usize>,
     /// Whether breakpoints are also marked in the scrollbar track.
     pub(super) breakpoint_ruler: bool,
     /// The row under the pointer in the breakpoint column.
@@ -633,6 +638,8 @@ impl InputState {
             breakpoints: Vec::new(),
             breakpoint_kinds: std::collections::HashMap::new(),
             breakpoint_gutter: false,
+            runnable_gutter: false,
+            runnable_rows: Vec::new(),
             breakpoint_ruler: false,
             hovered_breakpoint_row: None,
             row_backgrounds: Vec::new(),
@@ -3126,6 +3133,10 @@ impl InputState {
         }
         // A change mark (dopamine #490): the host offers revert / stage.
         if self.handle_gutter_mark_click(event, cx) {
+            return;
+        }
+        // The run column (dopamine #496).
+        if self.handle_runnable_click(event, cx) {
             return;
         }
         // The breakpoint column (dopamine #278): the host toggles the row.
