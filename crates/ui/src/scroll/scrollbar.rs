@@ -34,6 +34,36 @@ const MARK_HEIGHT: Pixels = px(2.);
 
 const FADE_OUT_DURATION: f32 = 3.0;
 const FADE_OUT_DELAY: f32 = 2.0;
+/// How far into the fade the thumb still looks fully opaque: the opacity is
+/// `1 - t^10`, which is 0.994 at `t = 0.6`.
+const FADE_OUT_FLAT: f32 = 0.6;
+/// How often the fade is drawn once it shows.
+const FADE_OUT_TICK: f32 = 1. / 30.;
+
+/// How long to wait before drawing the thumb again, `elapsed` seconds after
+/// the last scroll. `None` once it has faded out.
+///
+/// The fade used to ask for an animation frame on every frame it drew. That
+/// notifies the view being drawn -- in dopamine, the whole window -- at the
+/// rate of the display, for a full second after every scroll, and for the
+/// first six tenths of it the thumb does not visibly change (dopamine #880).
+/// A timer wakes it instead: once when the fade starts to show, then at
+/// [`FADE_OUT_TICK`], and a last time when it is over so that the thumb is
+/// drawn gone.
+fn next_fade_frame(elapsed: f32) -> Option<f32> {
+    // A timer can fire a hair early; never wait for less than this.
+    const MIN: f32 = 0.004;
+    let wait = if elapsed < FADE_OUT_DELAY {
+        FADE_OUT_DELAY - elapsed
+    } else if elapsed < FADE_OUT_DELAY + FADE_OUT_FLAT {
+        FADE_OUT_DELAY + FADE_OUT_FLAT - elapsed
+    } else if elapsed < FADE_OUT_DURATION {
+        FADE_OUT_TICK.min(FADE_OUT_DURATION - elapsed)
+    } else {
+        return None;
+    };
+    Some(wait.max(MIN))
+}
 
 /// Scrollbar show mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash, Default, JsonSchema)]
@@ -699,27 +729,31 @@ impl Element for Scrollbar {
                             } else {
                                 Self::style_for_hovered_bar(cx)
                             };
-                        } else if elapsed < FADE_OUT_DELAY {
-                            idle_state.0 = cx.theme().scrollbar_thumb;
-
-                            if !state.get().idle_timer_scheduled {
-                                let state = state.clone();
-                                state.set(state.get().with_idle_timer_scheduled(true));
-                                let current_view = window.current_view();
-                                let next_delay = Duration::from_secs_f32(FADE_OUT_DELAY - elapsed);
-                                window
-                                    .spawn(cx, async move |cx| {
-                                        Timer::after(next_delay).await;
-                                        state.set(state.get().with_idle_timer_scheduled(false));
-                                        cx.update(|_, cx| cx.notify(current_view)).ok();
-                                    })
-                                    .detach();
+                        } else {
+                            if elapsed < FADE_OUT_DELAY {
+                                idle_state.0 = cx.theme().scrollbar_thumb;
+                            } else if elapsed < FADE_OUT_DURATION {
+                                let opacity = 1.0 - (elapsed - FADE_OUT_DELAY).powi(10);
+                                idle_state.0 = cx.theme().scrollbar_thumb.opacity(opacity);
                             }
-                        } else if elapsed < FADE_OUT_DURATION {
-                            let opacity = 1.0 - (elapsed - FADE_OUT_DELAY).powi(10);
-                            idle_state.0 = cx.theme().scrollbar_thumb.opacity(opacity);
 
-                            window.request_animation_frame();
+                            // One timer at a time, for the next moment the
+                            // thumb has to look different. See `next_fade_frame`.
+                            if let Some(next_delay) = next_fade_frame(elapsed) {
+                                if !state.get().idle_timer_scheduled {
+                                    let state = state.clone();
+                                    state.set(state.get().with_idle_timer_scheduled(true));
+                                    let current_view = window.current_view();
+                                    let next_delay = Duration::from_secs_f32(next_delay);
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            Timer::after(next_delay).await;
+                                            state.set(state.get().with_idle_timer_scheduled(false));
+                                            cx.update(|_, cx| cx.notify(current_view)).ok();
+                                        })
+                                        .detach();
+                                }
+                            }
                         }
                     }
 
@@ -1098,5 +1132,70 @@ impl Element for Scrollbar {
                 }
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod fade_tests {
+    use super::*;
+
+    /// Follow the timer from a scroll to the thumb being gone.
+    fn frames_after_a_scroll() -> Vec<f32> {
+        let mut at = 0.;
+        let mut frames = vec![];
+        while let Some(wait) = next_fade_frame(at) {
+            at += wait;
+            frames.push(at);
+            assert!(frames.len() < 1000, "the fade never ends");
+        }
+        frames
+    }
+
+    /// A scroll costs a couple of dozen frames, not a second of them at the
+    /// rate of the display (dopamine #880).
+    #[test]
+    fn the_fade_is_drawn_a_handful_of_times() {
+        let frames = frames_after_a_scroll();
+        assert!(frames.len() <= 16, "{} frames: {frames:?}", frames.len());
+
+        // Nothing is drawn while the thumb is opaque or looks it...
+        assert!((frames[0] - FADE_OUT_DELAY).abs() < 0.01);
+        assert!((frames[1] - (FADE_OUT_DELAY + FADE_OUT_FLAT)).abs() < 0.01);
+        // ...then it steps at the tick...
+        for pair in frames[1..].windows(2) {
+            assert!(pair[1] - pair[0] <= FADE_OUT_TICK + 0.001, "{pair:?}");
+        }
+        // ...and the last frame is past the end, so the thumb is drawn gone.
+        let last = *frames.last().unwrap();
+        assert!(last >= FADE_OUT_DURATION, "{last}");
+        assert!(last < FADE_OUT_DURATION + 0.05, "{last}");
+    }
+
+    /// Until the first step, the thumb is within a hundredth of opaque.
+    #[test]
+    fn nothing_visible_is_skipped() {
+        let opacity = 1.0 - FADE_OUT_FLAT.powi(10);
+        assert!(opacity > 0.99, "{opacity}");
+    }
+
+    /// Asked late -- another view drew in between -- it still ends, past the
+    /// end of the fade.
+    #[test]
+    fn it_ends_wherever_it_is_picked_up() {
+        for start in [0.0, 1.999, 2.0, 2.3, 2.6, 2.95, 2.9999] {
+            let mut at = start;
+            let mut frames = 0;
+            while let Some(wait) = next_fade_frame(at) {
+                assert!(wait > 0.);
+                at += wait;
+                frames += 1;
+                assert!(frames < 1000, "from {start}");
+            }
+            assert!(frames > 0, "from {start}");
+            assert!(at >= FADE_OUT_DURATION, "from {start}: stopped at {at}");
+        }
+        // Once it is over there is nothing left to draw.
+        assert_eq!(next_fade_frame(FADE_OUT_DURATION), None);
+        assert_eq!(next_fade_frame(10.), None);
     }
 }

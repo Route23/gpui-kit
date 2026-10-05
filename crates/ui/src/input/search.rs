@@ -400,6 +400,14 @@ impl InputState {
 
         let text = self.text.clone();
         search_panel.update(cx, |this, _| {
+            // **Closed: nobody is looking.** The panel is created once and
+            // then only hidden, so without this every keystroke kept copying
+            // the whole text and searching it for the last query for as long
+            // as the editor lived (dopamine #879). Opening it again looks
+            // afresh (`on_action_search`).
+            if !this.open {
+                return;
+            }
             this.matcher.update(&text);
         });
     }
@@ -453,11 +461,6 @@ impl InputState {
 }
 
 impl SearchPanel {
-    /// What the panel has found, for the scrollbar marks (#252).
-    pub(super) fn matched_ranges(&self) -> Rc<Vec<Range<usize>>> {
-        self.matcher.matched_ranges.clone()
-    }
-
     pub fn new(
         editor: Entity<InputState>,
         options: SearchOptions,

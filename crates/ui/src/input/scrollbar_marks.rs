@@ -207,9 +207,13 @@ impl super::InputState {
     }
 
     /// What ⌘F has found, when the panel is open.
+    ///
+    /// Through `matcher()`, which is what knows whether it is open. This used
+    /// to read the matches directly, so the marks stayed in the scrollbar
+    /// after Esc -- and moved with every keystroke (dopamine #879).
     fn search_matches(&self, cx: &gpui::App) -> Option<std::rc::Rc<Vec<std::ops::Range<usize>>>> {
         let panel = self.search_panel.as_ref()?;
-        Some(panel.read(cx).matched_ranges())
+        Some(panel.read(cx).matcher()?.matched_ranges.clone())
     }
 
     /// Rows holding another run of the selected text.
