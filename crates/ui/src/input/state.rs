@@ -4399,7 +4399,7 @@ impl EntityInputHandler for InputState {
             diagnostics.reset(&self.text)
         }
         self.text_wrapper
-            .update(&self.text, &range, &Rope::from(new_text), cx);
+            .update(&self.text, &range, new_text.len(), cx);
         // Folds are shifted, not dropped -- losing them on every keystroke
         // would be worse than not having the feature. `update_folds` then drops
         // any header that no longer heads a fold.
@@ -4501,7 +4501,7 @@ impl EntityInputHandler for InputState {
             diagnostics.reset(&self.text)
         }
         self.text_wrapper
-            .update(&self.text, &range, &Rope::from(new_text), cx);
+            .update(&self.text, &range, new_text.len(), cx);
         self.shift_folds_for_edit(&old_text, &range);
         self.shift_breakpoints_for_edit(&old_text, &range, cx);
         self.update_folds();

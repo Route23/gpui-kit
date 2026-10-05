@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui::{App, Font, LineFragment, Pixels, Point, ShapedLine, Size, Window, point, px, size};
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 use smallvec::SmallVec;
 
 use crate::input::RopeExt;
@@ -9,12 +9,20 @@ use crate::input::RopeExt;
 /// A line with soft wrapped lines info.
 #[derive(Debug, Clone)]
 pub(super) struct LineItem {
-    /// The original line text, without end `\n`.
-    line: Rope,
+    /// The bytes length of the line, without the end `\n`.
+    ///
+    /// **Only the length.** This was the line's text, as a `Rope` of its own
+    /// that nothing read but for its length -- and a `Rope` owns a leaf of
+    /// about 1 KB however short its text is. 100,000 rows kept 120 MB next to
+    /// the document they were copied from (dopamine #878).
+    len: usize,
     /// The soft wrapped lines relative byte range (0..line.len) of this line (Include first line).
     ///
     /// Not contains the line end `\n`.
-    pub(super) wrapped_lines: Vec<Range<usize>>,
+    ///
+    /// Inline while there is one range, which is every row that does not
+    /// wrap: as a `Vec` this was one more allocation a row.
+    pub(super) wrapped_lines: SmallVec<[Range<usize>; 1]>,
     /// Hidden by a fold.
     ///
     /// The wrap info is kept, so unfolding needs no re-wrap (which would need
@@ -33,7 +41,7 @@ impl LineItem {
     /// Get the bytes length of this line.
     #[inline]
     pub(super) fn len(&self) -> usize {
-        self.line.len()
+        self.len
     }
 
     /// Get number of soft wrapped lines of this line (include the first line).
@@ -107,7 +115,15 @@ pub(super) struct TextWrapper {
     /// the lines would be dropped mid-frame.
     extra_rows: Vec<(usize, usize)>,
 
+    /// Whether `lines` has every row of `text`.
+    ///
+    /// It has once the whole text has gone through [`Self::update`] in one
+    /// go. A text that was only put in ([`Self::set_default_text`]) has not,
+    /// and [`Self::prepare_if_need`] is what makes up for it.
     _initialized: bool,
+    /// How many times every row was laid out, for the tests to count.
+    #[cfg(test)]
+    rebuilds: usize,
 }
 
 #[allow(unused)]
@@ -124,12 +140,16 @@ impl TextWrapper {
             hidden_rows: Vec::new(),
             extra_rows: Vec::new(),
             _initialized: false,
+            #[cfg(test)]
+            rebuilds: 0,
         }
     }
 
     #[inline]
     pub(super) fn set_default_text(&mut self, text: &Rope) {
         self.text = text.clone();
+        // Its rows are not laid out here.
+        self._initialized = false;
     }
 
     /// Get the total number of lines including wrapped lines.
@@ -216,7 +236,41 @@ impl TextWrapper {
 
         self.font = font;
         self.font_size = font_size;
+
+        // The font only decides where a row wraps. Without a wrap width every
+        // row is one line whatever it is drawn in, so laying them all out
+        // again gave back the table it started from -- and the first frame of
+        // an editor always came here: the wrapper is made with the window's
+        // font, the editor is drawn in its own (dopamine #878).
+        if self.wrap_width.is_none() {
+            self.refresh_longest_row();
+            return;
+        }
+
         self.update_all(&self.text.clone(), cx);
+    }
+
+    /// Look for the longest row again, the way laying every row out does.
+    ///
+    /// The one thing that could come out differently for rows that do not
+    /// wrap: the row remembered as the longest is not kept right through
+    /// every edit, and a new font was a moment it got looked for afresh.
+    fn refresh_longest_row(&mut self) {
+        let mut longest = std::mem::take(&mut self.longest_row);
+        // As in `_update`: the search starts over only when the row
+        // remembered is one of the rows gone through.
+        if longest.row < self.lines.len() {
+            longest = LongestRow::default();
+        }
+        for (row, line) in self.lines.iter().enumerate() {
+            if line.len() > longest.len {
+                longest = LongestRow {
+                    row,
+                    len: line.len(),
+                };
+            }
+        }
+        self.longest_row = longest;
     }
 
     pub(super) fn prepare_if_need(&mut self, text: &Rope, cx: &mut App) {
@@ -233,36 +287,31 @@ impl TextWrapper {
     ///
     /// - `changed_text`: The text [`Rope`] that has changed.
     /// - `range`: The `selected_range` before change.
-    /// - `new_text`: The inserted text.
+    /// - `new_len`: The bytes length of the inserted text.
     /// - `force`: Whether to force the update, if false, the update will be skipped if the text is the same.
     /// - `cx`: The application context.
     pub(super) fn update(
         &mut self,
         changed_text: &Rope,
         range: &Range<usize>,
-        new_text: &Rope,
+        new_len: usize,
         cx: &mut App,
     ) {
         let mut line_wrapper = cx
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
-        self._update(
-            changed_text,
-            range,
-            new_text,
-            &mut |line_str, wrap_width| {
-                line_wrapper
-                    .wrap_line(&[LineFragment::text(line_str)], wrap_width)
-                    .collect()
-            },
-        );
+        self._update(changed_text, range, new_len, &mut |line_str, wrap_width| {
+            line_wrapper
+                .wrap_line(&[LineFragment::text(line_str)], wrap_width)
+                .collect()
+        });
     }
 
     fn _update<F>(
         &mut self,
         changed_text: &Rope,
         range: &Range<usize>,
-        new_text: &Rope,
+        new_len: usize,
         wrap_line: &mut F,
     ) where
         F: FnMut(&str, Pixels) -> Vec<gpui::Boundary>,
@@ -284,22 +333,27 @@ impl TextWrapper {
         // To add the new lines.
         let new_start_row = changed_text.offset_to_point(range.start).row;
         let new_start_offset = changed_text.line_start_offset(new_start_row);
-        let new_end_row = changed_text
-            .offset_to_point(range.start + new_text.len())
-            .row;
+        let new_end_row = changed_text.offset_to_point(range.start + new_len).row;
         let new_end_offset = changed_text.line_end_offset(new_end_row);
         let new_range = new_start_offset..new_end_offset;
+        // Every row of the text is about to be laid out.
+        let whole = new_start_row == 0 && new_end_row + 1 == changed_text.lines_len();
+        if whole {
+            // None of the old rows is kept, so they go first: the new table
+            // used to be made next to the old one, two of them for a while.
+            self.lines = Vec::new();
+        }
 
-        let mut new_lines = vec![];
+        let new_rows = new_end_row.saturating_sub(new_start_row) + 1;
+        let mut new_lines = Vec::with_capacity(new_rows);
         let wrap_width = self.wrap_width;
 
         // line not contains `\n`.
-        for (ix, line) in Rope::from(changed_text.slice(new_range))
-            .iter_lines()
-            .enumerate()
-        {
-            let line_str = line.to_string();
-            let mut wrapped_lines = vec![];
+        //
+        // Read where they are. The range used to be copied into a `Rope`, and
+        // each row of that into a `String`, to measure rows that are not kept.
+        for_each_row(changed_text.slice(new_range), |ix, line_str| {
+            let mut wrapped_lines = SmallVec::new();
             let mut prev_boundary_ix = 0;
 
             if line_str.len() > longest_row_len {
@@ -310,7 +364,7 @@ impl TextWrapper {
             // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
             if let Some(wrap_width) = wrap_width {
                 // Here only have wrapped line, if there is no wrap meet, the `line_wraps` result will empty.
-                for boundary in wrap_line(&line_str, wrap_width) {
+                for boundary in wrap_line(line_str, wrap_width) {
                     wrapped_lines.push(prev_boundary_ix..boundary.ix);
                     prev_boundary_ix = boundary.ix;
                 }
@@ -318,18 +372,30 @@ impl TextWrapper {
 
             // Reset of the line
             if !line_str[prev_boundary_ix..].is_empty() || prev_boundary_ix == 0 {
-                wrapped_lines.push(prev_boundary_ix..line.len());
+                wrapped_lines.push(prev_boundary_ix..line_str.len());
             }
 
             new_lines.push(LineItem {
-                line: Rope::from(line),
+                len: line_str.len(),
                 wrapped_lines,
                 hidden: false,
                 extra_rows: 0,
             });
-        }
+        });
+        debug_assert_eq!(new_lines.len(), new_rows);
 
-        if self.lines.len() == 0 {
+        if whole {
+            // The table is these rows. From here on an edit keeps it whole,
+            // so `prepare_if_need` has nothing left to do: opening a file
+            // laid every row out when the text was set, and then once more
+            // for the first frame (dopamine #878).
+            self.lines = new_lines;
+            self._initialized = true;
+            #[cfg(test)]
+            {
+                self.rebuilds += 1;
+            }
+        } else if self.lines.len() == 0 {
             self.lines = new_lines;
         } else {
             self.lines.splice(rows_range, new_lines);
@@ -348,7 +414,7 @@ impl TextWrapper {
     ///
     /// If the `text` is the same as the current text, do nothing.
     fn update_all(&mut self, text: &Rope, cx: &mut App) {
-        self.update(text, &(0..text.len()), &text, cx);
+        self.update(text, &(0..text.len()), text.len(), cx);
     }
 
     /// Return display point (with soft wrap) from the given byte offset in the text.
@@ -415,6 +481,34 @@ impl TextWrapper {
         let offset = self.text.point_to_offset(point);
         self.offset_to_display_point(offset)
     }
+}
+
+/// Hand every row of `text` to `f`, in order: its index, and its text without
+/// the `\n` (a `\r` stays, as in [`RopeExt::slice_line`]).
+///
+/// The text is read where it is. A row is only copied when the rope keeps it
+/// in more than one piece, and then into a buffer that is used again.
+fn for_each_row(text: RopeSlice<'_>, mut f: impl FnMut(usize, &str)) {
+    let mut row = 0;
+    // The start of a row that ends in a later chunk.
+    let mut pending = String::new();
+    for chunk in text.chunks() {
+        let mut rest = chunk;
+        while let Some(end) = rest.find('\n') {
+            if pending.is_empty() {
+                f(row, &rest[..end]);
+            } else {
+                pending.push_str(&rest[..end]);
+                f(row, &pending);
+                pending.clear();
+            }
+            row += 1;
+            rest = &rest[end + 1..];
+        }
+        pending.push_str(rest);
+    }
+    // What follows the last `\n` is a row too, also when it is empty.
+    f(row, &pending);
 }
 
 /// The actually display point in the text.
@@ -628,7 +722,16 @@ impl LineLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+    use crate::{
+        Root,
+        input::{Input, InputState, LensRow, Position},
+    };
+    use gpui::{
+        AppContext as _, Boundary, Context, Entity, FontFeatures, FontStyle, FontWeight,
+        IntoElement, ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext,
+        Window, div, px,
+    };
+    use smallvec::smallvec;
 
     fn test_font() -> gpui::Font {
         gpui::Font {
@@ -648,7 +751,7 @@ mod tests {
     fn four_rows() -> (Rope, TextWrapper) {
         let text = Rope::from("one\ntwo\nthree\nfour");
         let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
-        wrapper._update(&text, &(0..text.len()), &text, &mut no_wrap);
+        wrapper._update(&text, &(0..text.len()), text.len(), &mut no_wrap);
         (text, wrapper)
     }
 
@@ -696,7 +799,7 @@ mod tests {
 
         let range = text.len()..text.len();
         text.replace(range.clone(), "\nfive");
-        wrapper._update(&text, &range, &Rope::from("\nfive"), &mut no_wrap);
+        wrapper._update(&text, &range, "\nfive".len(), &mut no_wrap);
 
         assert_eq!(wrapper.lines.len(), 5);
         assert_eq!(wrapper.lines[1].extra_rows(), 3);
@@ -747,7 +850,7 @@ mod tests {
             assert_eq!(actual_lines, expected_lines);
         }
 
-        wrapper._update(&text, &(0..text.len()), &text, &mut fake_wrap_line);
+        wrapper._update(&text, &(0..text.len()), text.len(), &mut fake_wrap_line);
         assert_eq!(wrapper.lines.len(), 4);
         assert_wrapper_lines(
             &text,
@@ -764,7 +867,7 @@ mod tests {
         let range = text.len()..text.len();
         let new_text = "New text";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &Rope::from(new_text), &mut fake_wrap_line);
+        wrapper._update(&text, &range, new_text.len(), &mut fake_wrap_line);
         assert_eq!(
             text.to_string(),
             "Hello, 世界!\r\nThis is second line.\nThis is third line.\n这里是第 4 行。New text"
@@ -786,7 +889,7 @@ mod tests {
         let range = 0..5;
         let new_text = "AAA";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &Rope::from(new_text), &mut fake_wrap_line);
+        wrapper._update(&text, &range, new_text.len(), &mut fake_wrap_line);
         assert_eq!(
             text.to_string(),
             "AAA, 世界!\r\nThis is second line.\nThis is third line.\n这里是第 4 行。New text"
@@ -808,7 +911,7 @@ mod tests {
         let end_offset = text.line_end_offset(1);
         let range = start_offset..end_offset + 1;
         text.replace(range.clone(), "");
-        wrapper._update(&text, &range, &Rope::from(""), &mut fake_wrap_line);
+        wrapper._update(&text, &range, 0, &mut fake_wrap_line);
         assert_eq!(
             text.to_string(),
             "AAA, 世界!\r\nThis is third line.\n这里是第 4 行。New text"
@@ -828,7 +931,7 @@ mod tests {
         let range = text.line_start_offset(0)..text.line_end_offset(1) + 1;
         let new_text = "This is a new line.\nThis is new line 2.\n";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &Rope::from(new_text), &mut fake_wrap_line);
+        wrapper._update(&text, &range, new_text.len(), &mut fake_wrap_line);
         assert_eq!(
             text.to_string(),
             "This is a new line.\nThis is new line 2.\n这里是第 4 行。New text"
@@ -848,7 +951,7 @@ mod tests {
         let range = text.len()..text.len();
         let new_text = "\nThis is a new line at the end.";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &Rope::from(new_text), &mut fake_wrap_line);
+        wrapper._update(&text, &range, new_text.len(), &mut fake_wrap_line);
         assert_eq!(
             text.to_string(),
             "This is a new line.\nThis is new line 2.\n这里是第 4 行。New text\nThis is a new line at the end."
@@ -869,7 +972,7 @@ mod tests {
         let range = 0..0;
         let new_text = "This is a new line at the beginning.\n";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &Rope::from(new_text), &mut fake_wrap_line);
+        wrapper._update(&text, &range, new_text.len(), &mut fake_wrap_line);
         assert_eq!(
             text.to_string(),
             "This is a new line at the beginning.\nThis is a new line.\nThis is new line 2.\n这里是第 4 行。New text\nThis is a new line at the end."
@@ -891,16 +994,16 @@ mod tests {
         let range = 0..text.len();
         let new_text = "";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &Rope::from(new_text), &mut fake_wrap_line);
+        wrapper._update(&text, &range, new_text.len(), &mut fake_wrap_line);
         assert_eq!(text.to_string(), "");
         assert_eq!(wrapper.lines.len(), 1);
-        assert_eq!(wrapper.lines[0].wrapped_lines, vec![0..0]);
+        assert_eq!(wrapper.lines[0].wrapped_lines.as_slice(), [0..0]);
 
         // Test update_all
         let range = 0..text.len();
         let new_text = "This is a full text.\nThis is a second line.";
         text.replace(range.clone(), new_text);
-        wrapper._update(&text, &range, &text, &mut fake_wrap_line);
+        wrapper._update(&text, &range, text.len(), &mut fake_wrap_line);
         assert_eq!(
             text.to_string(),
             "This is a full text.\nThis is a second line."
@@ -923,7 +1026,7 @@ mod tests {
         };
         let mut wrapper = TextWrapper::new(font, px(14.), None);
         let text = Rope::from("a\nb\nc\nd\n");
-        wrapper._update(&text, &(0..text.len()), &text, &mut fake_wrap_line);
+        wrapper._update(&text, &(0..text.len()), text.len(), &mut fake_wrap_line);
         assert_eq!(wrapper.len(), 5, "4 lines plus the row after the last \\n");
 
         // Hiding rows 1 and 2 drops them from the visual line count and from
@@ -935,7 +1038,7 @@ mod tests {
         assert_eq!(wrapper.lines[2].height(px(20.)), px(0.));
         assert_eq!(wrapper.lines[3].height(px(20.)), px(20.));
         // The wrap info survives, so unfolding needs no re-wrap.
-        assert_eq!(wrapper.lines[1].wrapped_lines, vec![0..1]);
+        assert_eq!(wrapper.lines[1].wrapped_lines.as_slice(), [0..1]);
 
         // **Vertical cursor movement rides on this**: a display point never
         // lands on a hidden row, so `move_vertical` steps over a fold with no
@@ -971,7 +1074,7 @@ mod tests {
         };
         let mut wrapper = TextWrapper::new(font, px(14.), None);
         let mut text = Rope::from("a\nb\nc\nd\n");
-        wrapper._update(&text, &(0..text.len()), &text, &mut fake_wrap_line);
+        wrapper._update(&text, &(0..text.len()), text.len(), &mut fake_wrap_line);
         wrapper.set_hidden_rows(vec![2]);
         assert_eq!(wrapper.len(), 4);
 
@@ -979,7 +1082,7 @@ mod tests {
         // spliced-in rows come back with stale ones.
         let range = 0..1;
         text.replace(range.clone(), "AA");
-        wrapper._update(&text, &range, &Rope::from("AA"), &mut fake_wrap_line);
+        wrapper._update(&text, &range, "AA".len(), &mut fake_wrap_line);
         assert_eq!(wrapper.len(), 4, "row 2 is still hidden after the edit");
         assert_eq!(wrapper.lines[2].height(px(20.)), px(0.));
     }
@@ -1013,29 +1116,29 @@ mod tests {
         wrapper.lines = vec![
             // range: 0..15
             LineItem {
-                line: Rope::from("Hello, 世界!\r"),
-                wrapped_lines: vec![0..15],
+                len: "Hello, 世界!\r".len(),
+                wrapped_lines: smallvec![0..15],
                 hidden: false,
                 extra_rows: 0,
             },
             // range: 16..36
             LineItem {
-                line: Rope::from("This is second line."),
-                wrapped_lines: vec![0..10, 10..20],
+                len: "This is second line.".len(),
+                wrapped_lines: smallvec![0..10, 10..20],
                 hidden: false,
                 extra_rows: 0,
             },
             // range: 37..56
             LineItem {
-                line: Rope::from("This is third line."),
-                wrapped_lines: vec![0..9, 9..15, 15..20],
+                len: "This is third line.".len(),
+                wrapped_lines: smallvec![0..9, 9..15, 15..20],
                 hidden: false,
                 extra_rows: 0,
             },
             // range: 57..79
             LineItem {
-                line: Rope::from("这里是第 4 行。"),
-                wrapped_lines: vec![0..22],
+                len: "这里是第 4 行。".len(),
+                wrapped_lines: smallvec![0..22],
                 hidden: false,
                 extra_rows: 0,
             },
@@ -1103,5 +1206,609 @@ mod tests {
             wrapper.display_point_to_offset(DisplayPoint::new(0, 0, 15)),
             15
         );
+    }
+
+    // ── a row is a length, laid out once (dopamine #878) ───────────────────
+
+    /// What `for_each_row` hands over.
+    fn rows_of(text: RopeSlice<'_>) -> Vec<String> {
+        let mut rows = vec![];
+        for_each_row(text, |ix, row| {
+            assert_eq!(ix, rows.len());
+            rows.push(row.to_string());
+        });
+        rows
+    }
+
+    /// The rows the way they were read before: the range copied into a `Rope`
+    /// of its own, and each row of that into a `String`.
+    fn rows_by_copying(text: RopeSlice<'_>) -> Vec<String> {
+        Rope::from(text)
+            .iter_lines()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    /// (length, where it wraps, visual lines, rows inserted under it) of every row.
+    fn rows(wrapper: &TextWrapper) -> Vec<(usize, Vec<Range<usize>>, usize, usize)> {
+        wrapper
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.len(),
+                    line.wrapped_lines.to_vec(),
+                    line.lines_len(),
+                    line.extra_rows(),
+                )
+            })
+            .collect()
+    }
+
+    /// Break a row every `n` bytes.
+    fn wrap_every(n: usize) -> impl FnMut(&str, Pixels) -> Vec<Boundary> {
+        move |line, _| {
+            (1..)
+                .map(|i| i * n)
+                .take_while(|ix| *ix < line.len())
+                .map(|ix| Boundary { ix, next_indent: 0 })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn rows_read_in_place_are_the_rows_that_were_copied() {
+        for text in [
+            "",
+            "\n",
+            "one",
+            "one\n",
+            "\none",
+            "one\n\ntwo",
+            "one\r\ntwo\r\n",
+            "Hello, 世界!\r\nThis is second line.\n这里是第 4 行。",
+        ] {
+            let rope = Rope::from(text);
+            assert_eq!(
+                rows_of(rope.slice(..)),
+                rows_by_copying(rope.slice(..)),
+                "{text:?}"
+            );
+        }
+
+        // Long enough to be kept in many pieces: rows that end in the next
+        // piece, rows longer than a piece, multi-byte characters at the seams.
+        let mut text = String::new();
+        for i in 0..4000 {
+            match i % 7 {
+                0 => {}
+                1 => text.push_str(&"x".repeat(i % 97)),
+                2 => text.push_str(&"长".repeat(i % 53)),
+                3 => text.push_str(&format!("    let v{i} = {i};\r")),
+                4 => text.push_str(&"long ".repeat(700)),
+                _ => text.push_str(&format!("fn f{i}() {{}}")),
+            }
+            text.push('\n');
+        }
+        let mut rope = Rope::from(text.as_str());
+        // Edits leave the pieces uneven, which a rope built in one go is not.
+        let mut seed = 878_u64;
+        for _ in 0..300 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let at = (seed >> 16) as usize % rope.len();
+            let at = rope.clip_offset(at, sum_tree::Bias::Left);
+            let piece = ["\n", "é", "\r\n", "tail of a row\nhead of the next"];
+            rope.insert(at, piece[(seed >> 8) as usize % piece.len()]);
+        }
+        assert!(rope.chunks().count() > 100, "kept in many pieces");
+
+        let rows = rows_of(rope.slice(..));
+        assert_eq!(rows.len(), rope.lines_len());
+        assert_eq!(rows, rows_by_copying(rope.slice(..)));
+
+        // Some rows out of the middle, as an edit hands them over.
+        let range = rope.line_start_offset(1000)..rope.line_end_offset(1200);
+        assert_eq!(
+            rows_of(rope.slice(range.clone())),
+            rows_by_copying(rope.slice(range))
+        );
+
+        // And the table made of them has a row for each, as long as it is --
+        // all of them at once, and after an edit in the middle.
+        let lens_of = |wrapper: &TextWrapper| -> Vec<usize> {
+            wrapper.lines.iter().map(|line| line.len()).collect()
+        };
+        let row_lens = |rope: &Rope| -> Vec<usize> {
+            (0..rope.lines_len())
+                .map(|row| rope.line_len(row))
+                .collect()
+        };
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+        wrapper._update(&rope, &(0..0), rope.len(), &mut no_wrap);
+        assert_eq!(lens_of(&wrapper), row_lens(&rope));
+
+        let at = rope.line_start_offset(2000);
+        rope.insert(at, "x\ny");
+        wrapper._update(&rope, &(at..at), 3, &mut no_wrap);
+        assert_eq!(lens_of(&wrapper), row_lens(&rope));
+    }
+
+    /// A row keeps what is asked of it -- how long it is, where it wraps, two
+    /// marks -- and not a copy of its text.
+    #[test]
+    fn a_row_keeps_a_length_not_its_text() {
+        // The copy was a `Rope` in the row, and about 1 KB behind it.
+        assert!(
+            std::mem::size_of::<LineItem>() <= 56,
+            "{} bytes in a row",
+            std::mem::size_of::<LineItem>()
+        );
+
+        let text = Rope::from("Hello, 世界!\r\n\nlast");
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+        wrapper._update(&text, &(0..0), text.len(), &mut no_wrap);
+        assert_eq!(wrapper.lines.len(), 3);
+        for (row, line) in wrapper.lines.iter().enumerate() {
+            assert_eq!(line.len(), text.line_len(row));
+            // One range for a row that does not wrap, kept in the row itself.
+            assert_eq!(line.wrapped_lines.as_slice(), [0..line.len()]);
+            assert!(!line.wrapped_lines.spilled());
+        }
+    }
+
+    /// Soft wrap, a fold and rows inserted under a row at once -- through an
+    /// edit, and through every row being laid out again.
+    #[test]
+    fn wrapped_folded_and_inserted_rows_keep_their_height() {
+        let mut text = Rope::from("abcdefghij\nab\n\nabcdefgh\nabcde");
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(100.)));
+        wrapper._update(&text, &(0..0), text.len(), &mut wrap_every(4));
+        let h = px(20.);
+        let heights = |wrapper: &TextWrapper| -> Vec<Pixels> {
+            wrapper.lines.iter().map(|line| line.height(h)).collect()
+        };
+
+        assert_eq!(
+            rows(&wrapper),
+            vec![
+                (10, vec![0..4, 4..8, 8..10], 3, 0),
+                (2, vec![0..2], 1, 0),
+                (0, vec![0..0], 1, 0),
+                (8, vec![0..4, 4..8], 2, 0),
+                (5, vec![0..4, 4..5], 2, 0),
+            ]
+        );
+        assert_eq!(wrapper.len(), 9);
+        assert_eq!(wrapper.total_height(h), px(180.));
+
+        // Row 3 folded, with what is inserted under it; two rows under row 0.
+        wrapper.set_hidden_rows(vec![3]);
+        wrapper.set_extra_rows(vec![(0, 2), (3, 1)]);
+        let marked = [px(100.), px(20.), px(20.), px(0.), px(40.)];
+        assert_eq!(heights(&wrapper), marked);
+        assert_eq!(wrapper.len(), 7);
+        assert_eq!(wrapper.total_height(h), px(180.));
+
+        // An edit in a wrapped row: that row is laid out again, alone.
+        let range = 10..10;
+        text.replace(range.clone(), "kl");
+        wrapper._update(&text, &range, 2, &mut wrap_every(4));
+        assert_eq!(wrapper.lines[0].len(), 12);
+        assert_eq!(
+            wrapper.lines[0].wrapped_lines.as_slice(),
+            [0..4, 4..8, 8..12]
+        );
+        assert_eq!(heights(&wrapper), marked);
+
+        // Every row again, as a new wrap width does it.
+        let before = rows(&wrapper);
+        wrapper._update(&text, &(0..text.len()), text.len(), &mut wrap_every(4));
+        assert_eq!(rows(&wrapper), before);
+        assert_eq!(heights(&wrapper), marked);
+        assert_eq!(wrapper.len(), 7);
+        assert_eq!(wrapper.total_height(h), px(180.));
+    }
+
+    /// The whole text goes through `update` when it is set, and that is its
+    /// layout: the first frame finds nothing left to do.
+    #[gpui::test]
+    fn rows_laid_out_with_the_text_are_not_laid_out_again(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text = Rope::from("one\ntwo\nthree");
+            let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+            wrapper.update(&text, &(0..0), text.len(), cx);
+            assert_eq!(wrapper.rebuilds, 1);
+
+            wrapper.prepare_if_need(&text, cx);
+            assert_eq!(wrapper.rebuilds, 1);
+            assert_eq!(wrapper.lines.len(), 3);
+        });
+    }
+
+    /// A text that was only put in (`default_value`) has no rows yet, and an
+    /// edit before the first frame lays out the rows it touches, not the
+    /// rest. `prepare_if_need` makes up for both, as it did.
+    #[gpui::test]
+    fn a_text_that_was_only_put_in_is_laid_out_when_asked(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let lens = |wrapper: &TextWrapper| -> Vec<usize> {
+                wrapper.lines.iter().map(|line| line.len()).collect()
+            };
+
+            let mut text = Rope::from("one\ntwo\nthree");
+            let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+            wrapper.set_default_text(&text);
+            assert!(wrapper.lines.is_empty());
+
+            let at = text.line_start_offset(1);
+            text.replace(at..at, "x");
+            wrapper.update(&text, &(at..at), 1, cx);
+            assert_eq!(lens(&wrapper), [4], "only the row that was touched");
+            assert_eq!(wrapper.rebuilds, 0);
+
+            wrapper.prepare_if_need(&text, cx);
+            assert_eq!(wrapper.rebuilds, 1);
+            assert_eq!(lens(&wrapper), [3, 4, 5]);
+
+            wrapper.prepare_if_need(&text, cx);
+            assert_eq!(wrapper.rebuilds, 1, "laid out now");
+
+            // Another text put in is rows not laid out, again -- and fewer
+            // of them, with none of the old ones left behind.
+            let text = Rope::from("a\nb");
+            wrapper.set_default_text(&text);
+            wrapper.prepare_if_need(&text, cx);
+            assert_eq!(wrapper.rebuilds, 2);
+            assert_eq!(lens(&wrapper), [1, 1]);
+        });
+    }
+
+    /// Without a wrap width no row depends on the font; with one, every row
+    /// does. Either way a fold and the rows inserted under a row stay.
+    #[gpui::test]
+    fn a_new_font_lays_out_only_rows_that_wrap(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text = Rope::from(format!(
+                "{}\nshort\n\n{}",
+                "word ".repeat(40),
+                "x".repeat(90)
+            ));
+            // What a wrapper made with this font and width from the start has.
+            let fresh = |font_size: Pixels, wrap_width: Option<Pixels>, cx: &mut App| {
+                let mut wrapper = TextWrapper::new(test_font(), font_size, wrap_width);
+                wrapper.update(&text, &(0..0), text.len(), cx);
+                wrapper.set_hidden_rows(vec![1]);
+                wrapper.set_extra_rows(vec![(0, 2)]);
+                rows(&wrapper)
+            };
+
+            let mut wrapper = TextWrapper::new(test_font(), px(16.), None);
+            wrapper.update(&text, &(0..0), text.len(), cx);
+            wrapper.set_hidden_rows(vec![1]);
+            wrapper.set_extra_rows(vec![(0, 2)]);
+            assert_eq!(wrapper.rebuilds, 1);
+            let one_line_each = rows(&wrapper);
+            assert_eq!(one_line_each[0], (200, vec![0..200], 1, 2));
+            assert_eq!(one_line_each[1], (5, vec![0..5], 0, 0), "folded");
+
+            wrapper.set_font(test_font(), px(14.), cx);
+            assert_eq!(wrapper.rebuilds, 1, "no row wraps, so none was laid out");
+            assert_eq!(rows(&wrapper), one_line_each);
+            assert_eq!(rows(&wrapper), fresh(px(14.), None, cx));
+
+            // The font was taken all the same: it is the one the rows wrap in
+            // once there is a width.
+            wrapper.set_wrap_width(Some(px(300.)), cx);
+            assert_eq!(wrapper.rebuilds, 2);
+            let wrapped = rows(&wrapper);
+            assert!(wrapped[0].1.len() > 1, "the long row wraps");
+            assert_eq!(wrapped[0].3, 2, "rows inserted under it are still there");
+            assert_eq!(wrapped[1].2, 0, "the fold is still closed");
+            assert_eq!(wrapped, fresh(px(14.), Some(px(300.)), cx));
+            assert_ne!(wrapped, fresh(px(16.), Some(px(300.)), cx));
+
+            // With a width the font decides, and every row is laid out again.
+            wrapper.set_font(test_font(), px(28.), cx);
+            assert_eq!(wrapper.rebuilds, 3);
+            let larger = rows(&wrapper);
+            assert!(larger[0].1.len() > wrapped[0].1.len(), "fewer letters fit");
+            assert_eq!(larger[0].3, 2);
+            assert_eq!(larger[1].2, 0);
+            assert_eq!(larger, fresh(px(28.), Some(px(300.)), cx));
+
+            // The same font again is nothing to do.
+            wrapper.set_font(test_font(), px(28.), cx);
+            assert_eq!(wrapper.rebuilds, 3);
+        });
+    }
+
+    /// Rows that do not wrap are not laid out for a new font, but the longest
+    /// of them is still looked for again, as laying them out did: it is not
+    /// kept right through every edit.
+    #[gpui::test]
+    fn a_new_font_still_looks_for_the_longest_row(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut text = Rope::from("the longest row there is\nshort\na middling row");
+            let mut wrapper = TextWrapper::new(test_font(), px(16.), None);
+            wrapper.update(&text, &(0..0), text.len(), cx);
+            assert_eq!((wrapper.longest_row.row, wrapper.longest_row.len), (0, 24));
+
+            // Cut the longest row short.
+            text.replace(0..24, "cut");
+            wrapper.update(&text, &(0..24), 3, cx);
+
+            wrapper.set_font(test_font(), px(14.), cx);
+            assert_eq!(wrapper.rebuilds, 1);
+            assert_eq!((wrapper.longest_row.row, wrapper.longest_row.len), (2, 14));
+        });
+    }
+
+    /// A window with one editor in it.
+    struct Editor {
+        input: Entity<InputState>,
+    }
+
+    impl Render for Editor {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(Input::new(&self.input).h_full())
+        }
+    }
+
+    /// Open an editor the way a host opens a file: it is made (`build`), given
+    /// what `then` hands it -- its text, a fold to put back, lenses -- and
+    /// only then drawn.
+    fn open(
+        build: impl FnOnce(InputState) -> InputState,
+        then: impl FnOnce(&mut InputState, &mut Window, &mut Context<InputState>),
+        cx: &mut TestAppContext,
+    ) -> (Entity<InputState>, &'static mut VisualTestContext) {
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.add_window(|window, cx| {
+            let state = cx.new(|cx| build(InputState::new(window, cx)));
+            state.update(cx, |state, cx| then(state, window, cx));
+            input = Some(state.clone());
+            let editor = cx.new(|_| Editor { input: state });
+            Root::new(editor, window, cx)
+        });
+        let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        cx.run_until_parked();
+        (input.unwrap(), cx)
+    }
+
+    /// The rows were laid out three times before the first frame was out:
+    /// when the text was set, for the editor's font, and because nobody had
+    /// noted that they were laid out.
+    #[gpui::test]
+    fn opening_a_file_lays_the_rows_out_once(cx: &mut TestAppContext) {
+        let text = "fn main() {\n    println!(\"hello\");\n}\n".repeat(50);
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(false),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+
+        let rem_size = cx.update(|window, _| window.rem_size());
+        input.read_with(cx, |state, _| {
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            let wrapper = &state.text_wrapper;
+            assert_ne!(wrapper.font_size, rem_size, "in the editor's own font");
+            assert_eq!(wrapper.lines.len(), 151);
+            assert_eq!(wrapper.len(), 151);
+            assert_eq!(wrapper.rebuilds, 1);
+        });
+
+        // A new text in the same editor is one more layout, not three.
+        input.update_in(cx, |state, window, cx| {
+            state.set_value("one\ntwo", window, cx);
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.text_wrapper.lines.len(), 2);
+            assert_eq!(state.text_wrapper.rebuilds, 2);
+        });
+    }
+
+    /// The same for an input that is not an editor: three times it was.
+    #[gpui::test]
+    fn a_one_line_input_is_laid_out_once_too(cx: &mut TestAppContext) {
+        let (line, cx) = open(
+            |state| state,
+            |state, window, cx| state.set_value("one line", window, cx),
+            cx,
+        );
+        line.read_with(cx, |state, _| {
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            assert_eq!(state.text_wrapper.lines.len(), 1);
+            assert_eq!(state.text_wrapper.lines[0].len(), 8);
+            assert_eq!(state.text_wrapper.rebuilds, 1);
+        });
+    }
+
+    /// A text that was only put in has no rows until the first frame lays
+    /// them out -- once, where it was once for the font and once more.
+    #[gpui::test]
+    fn a_default_value_is_laid_out_by_the_first_frame(cx: &mut TestAppContext) {
+        let (input, cx) = open(
+            |state| {
+                state
+                    .code_editor("text")
+                    .soft_wrap(false)
+                    .default_value("one\ntwo\nthree")
+            },
+            |state, _, _| assert!(state.text_wrapper.lines.is_empty()),
+            cx,
+        );
+        input.read_with(cx, |state, _| {
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            let lens: Vec<usize> = state.text_wrapper.lines.iter().map(LineItem::len).collect();
+            assert_eq!(lens, [3, 3, 5]);
+            assert_eq!(state.text_wrapper.rebuilds, 1);
+        });
+    }
+
+    /// Typing in an opened file lays out the rows it touches and no others,
+    /// and the frame that follows finds every row as long as its text (the
+    /// element asserts as much for the rows it draws).
+    #[gpui::test]
+    fn an_edit_in_an_opened_file_lays_out_its_own_rows(cx: &mut TestAppContext) {
+        let text = "one\ntwo\nthree\nfour\n".repeat(30);
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(false),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        let in_step = |state: &InputState| {
+            let wrapper = &state.text_wrapper;
+            assert_eq!(wrapper.rebuilds, 1, "no edit laid every row out");
+            assert_eq!(wrapper.lines.len(), state.text.lines_len());
+            for (row, line) in wrapper.lines.iter().enumerate() {
+                assert_eq!(line.len(), state.text.line_len(row), "row {row}");
+            }
+        };
+
+        // A row grows, and a row is added under it.
+        input.update_in(cx, |state, window, cx| {
+            state.set_cursor_position(Position::new(1, 3), window, cx);
+            state.insert(" and a half\nnearly three", window, cx);
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.text.lines_len(), 122);
+            assert_eq!(state.text_wrapper.lines[1].len(), "two and a half".len());
+            in_step(state);
+        });
+
+        // Five rows go.
+        input.update_in(cx, |state, window, cx| {
+            let range = lsp_types::Range::new(Position::new(4, 0), Position::new(9, 0));
+            state.replace_text_in_lsp_range(&range, "", window, cx);
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.text.lines_len(), 117);
+            in_step(state);
+        });
+    }
+
+    /// With soft wrap the width is only known once the editor has been drawn,
+    /// so the rows are laid out when the text is set and once more for the
+    /// width -- in the editor's font, which they were not laid out for when
+    /// it arrived. That used to be four times.
+    #[gpui::test]
+    fn opening_a_file_with_soft_wrap_lays_the_rows_out_twice(cx: &mut TestAppContext) {
+        let text = format!("{}\nshort\n\n{}\n", "word ".repeat(200), "x".repeat(500));
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(true),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+
+        let rem_size = cx.update(|window, _| window.rem_size());
+        let (font, font_size, wrap_width, wrapped) = input.read_with(cx, |state, _| {
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            let wrapper = &state.text_wrapper;
+            assert_eq!(wrapper.rebuilds, 2);
+            assert_eq!(wrapper.lines.len(), 5);
+            assert!(
+                wrapper.lines[0].wrapped_lines.len() > 1,
+                "the long row wraps"
+            );
+            assert!(wrapper.len() > 5);
+            (
+                wrapper.font.clone(),
+                wrapper.font_size,
+                wrapper.wrap_width,
+                rows(wrapper),
+            )
+        });
+        assert!(wrap_width.is_some());
+        assert_ne!(font_size, rem_size);
+
+        // What laying every row out for that font and that width gives.
+        let text = Rope::from(text);
+        let fresh = |font_size: Pixels, cx: &mut App| {
+            let mut wrapper = TextWrapper::new(font.clone(), font_size, wrap_width);
+            wrapper.update(&text, &(0..0), text.len(), cx);
+            rows(&wrapper)
+        };
+        cx.update(|_, cx| {
+            assert_eq!(wrapped, fresh(font_size, cx));
+            assert_ne!(
+                wrapped,
+                fresh(rem_size, cx),
+                "not in the font it was made with"
+            );
+        });
+    }
+
+    /// A fold put back before the first frame and a lens above a row, in a
+    /// file opened with soft wrap: every row is as tall as laying it out
+    /// from scratch makes it.
+    #[gpui::test]
+    fn a_fold_and_a_lens_keep_their_height_when_a_file_opens(cx: &mut TestAppContext) {
+        let text = format!(
+            "fn main() {{\n    let a = 1;\n    let b = 2;\n}}\n{}\ntail",
+            "word ".repeat(200)
+        );
+        let (input, cx) = open(
+            |state| state.code_editor("text").folding(true).soft_wrap(true),
+            |state, window, cx| {
+                state.set_value(text.clone(), window, cx);
+                state.set_folded_rows(&[0], cx);
+                state.set_lens_rows(
+                    vec![LensRow {
+                        row: 5,
+                        items: vec!["Run".into()],
+                    }],
+                    cx,
+                );
+            },
+            cx,
+        );
+
+        let h = px(20.);
+        let rem_size = cx.update(|window, _| window.rem_size());
+        let (font, font_size, wrap_width, hidden, opened) = input.read_with(cx, |state, _| {
+            let wrapper = &state.text_wrapper;
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            assert!(state.is_folded(0));
+            assert_eq!(wrapper.rebuilds, 2);
+            assert_ne!(wrapper.font_size, rem_size, "in the editor's own font");
+            (
+                wrapper.font.clone(),
+                wrapper.font_size,
+                wrapper.wrap_width,
+                wrapper.hidden_rows.clone(),
+                rows(wrapper),
+            )
+        });
+        assert!(hidden.contains(&1) && hidden.contains(&2), "{hidden:?}");
+
+        // Row 0 shows, its body does not; the long row wraps, and carries the
+        // row the lens above `tail` sits in.
+        assert_eq!(opened[0].2, 1);
+        assert_eq!((opened[1].2, opened[2].2), (0, 0));
+        assert!(opened[4].2 > 1);
+        assert_eq!(opened[4].3, 1);
+        assert_eq!((opened[5].2, opened[5].3), (1, 0));
+
+        // Every row as tall as laying it out from scratch makes it, in that
+        // font and for that width.
+        let lines: usize = opened.iter().map(|row| row.2 + row.3).sum();
+        let text = Rope::from(text);
+        cx.update(|_, cx| {
+            let mut fresh = TextWrapper::new(font, font_size, wrap_width);
+            fresh.update(&text, &(0..0), text.len(), cx);
+            fresh.set_hidden_rows(hidden);
+            fresh.set_extra_rows(vec![(4, 1)]);
+            assert_eq!(opened, rows(&fresh));
+            assert_eq!(fresh.total_height(h), lines as f32 * h);
+        });
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.text_wrapper.total_height(h), lines as f32 * h);
+        });
     }
 }
