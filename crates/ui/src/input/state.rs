@@ -2316,8 +2316,10 @@ impl InputState {
         // (compiling its queries) and parsed the whole new text with it, for
         // nothing: the next render builds and parses again. Opening a file
         // paid for both twice, on the main thread (dopamine #877). A whole new
-        // text wants a parse from scratch either way, and that is the one the
-        // next edit or the pending update does.
+        // text wants a parse from scratch either way, and that is the one that
+        // comes next: the pending update, the next edit, or whoever asks about
+        // the syntax first (`SyntaxHighlighter::update` parses from scratch
+        // when it has no tree, whatever edit it is handed).
         self.reset_highlighter(cx);
         self.replacing_all = true;
         self.replace_text_in_range_silent(Some(range), &text, window, cx);

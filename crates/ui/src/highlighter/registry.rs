@@ -461,14 +461,18 @@ impl HighlightTheme {
 /// Registry for code highlighter languages.
 pub struct LanguageRegistry {
     languages: Mutex<HashMap<SharedString, LanguageConfig>>,
-    /// Compiled queries, by the language's name and the query's source.
+    /// Compiled queries, by the grammar and the query's source -- the two
+    /// things a compiled query is made from. (Not by the language's name: two
+    /// registrations can share a name and a source and still be different
+    /// grammars, `ts` and `tsx` for one.)
     ///
     /// Compiling is the expensive part of building a highlighter -- 20 ms for
     /// Rust, 50 ms for TypeScript with its ten injected languages -- and every
     /// editor used to compile its own, on the main thread, each time a file
     /// was opened (dopamine #877). A compiled query is immutable, so they are
-    /// shared. Emptied whenever a language is registered.
-    queries: Mutex<HashMap<(SharedString, SharedString), Arc<tree_sitter::Query>>>,
+    /// shared. Emptied whenever a language is registered, so that what a
+    /// replaced grammar compiled does not stay around.
+    queries: Mutex<HashMap<(tree_sitter::Language, SharedString), Arc<tree_sitter::Query>>>,
 }
 
 impl LanguageRegistry {
@@ -491,20 +495,20 @@ impl LanguageRegistry {
             .lock()
             .unwrap()
             .insert(lang.to_string().into(), config.clone());
-        // A name can mean another grammar now.
+        // Let go of what the grammar this one replaces had compiled.
         if let Ok(mut queries) = self.queries.lock() {
             queries.clear();
         }
     }
 
-    /// `source` compiled for `config`'s grammar, compiled at most once for as
-    /// long as no language is registered.
+    /// `source` compiled for `config`'s grammar. Compiled once per grammar and
+    /// source for as long as no language is registered.
     pub(crate) fn query(
         &self,
         config: &LanguageConfig,
         source: &str,
     ) -> Result<Arc<tree_sitter::Query>, tree_sitter::QueryError> {
-        let key = (config.name.clone(), SharedString::from(source.to_string()));
+        let key = (config.language.clone(), SharedString::from(source.to_string()));
         if let Ok(queries) = self.queries.lock() {
             if let Some(query) = queries.get(&key) {
                 return Ok(query.clone());
@@ -593,5 +597,27 @@ mod tests {
         registry.register("query-cache-test", &json);
         let after = registry.query(&json, source).expect("compiles");
         assert!(!Arc::ptr_eq(&before, &after));
+
+        // The same name and the same source, but another grammar, is another
+        // query: what it compiles to depends on the grammar, not on the name.
+        #[cfg(feature = "tree-sitter-languages-core")]
+        {
+            let source = "(string) @string";
+            let as_rust = LanguageConfig::new(
+                "query-cache-test",
+                tree_sitter_rust::LANGUAGE.into(),
+                vec![],
+                "",
+                "",
+                "",
+            );
+            // `string` is not a node of the Rust grammar: with the JSON
+            // grammar's query handed back, this would be `Ok`.
+            let json_query = registry.query(&json, source).expect("compiles");
+            match registry.query(&as_rust, source) {
+                Ok(rust_query) => assert!(!Arc::ptr_eq(&json_query, &rust_query)),
+                Err(_) => {}
+            }
+        }
     }
 }

@@ -50,9 +50,13 @@ impl InputState {
         cx.notify();
     }
 
-    /// The string spans of the whole buffer (dopamine #247), or nothing when the
-    /// highlighter has not parsed yet. Used to keep trailing spaces inside strings on save.
+    /// The string spans of the whole buffer (dopamine #247). Used to keep trailing
+    /// spaces inside strings on save.
+    ///
+    /// **Parses now if nothing has yet** -- "no strings" from an editor that simply
+    /// had not been rendered since its text was set made a save trim inside strings.
     pub fn string_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        self.mode.ensure_highlighter(&self.text);
         let super::mode::InputMode::CodeEditor { highlighter, .. } = &self.mode else {
             return vec![];
         };
@@ -65,9 +69,10 @@ impl InputState {
 
     /// The syntax colours of the whole buffer as `(byte range, colour)`, sorted and
     /// non-overlapping; ranges without a colour are left out (dopamine #494, the minimap).
-    /// Empty when the highlighter has not parsed yet.
+    /// Parses now if nothing has yet, like [`Self::string_ranges`].
     pub fn syntax_colors(&self, cx: &gpui::App) -> Vec<(std::ops::Range<usize>, gpui::Hsla)> {
         use crate::ActiveTheme as _;
+        self.mode.ensure_highlighter(&self.text);
         let super::mode::InputMode::CodeEditor { highlighter, .. } = &self.mode else {
             return vec![];
         };

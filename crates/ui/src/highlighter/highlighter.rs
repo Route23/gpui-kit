@@ -445,6 +445,14 @@ impl SyntaxHighlighter {
             return;
         }
 
+        // **No tree yet: there is nothing for `edit` to be an edit of.** A
+        // highlighter that has parsed nothing and is handed the keystroke that
+        // made it necessary -- the first one after the whole text was replaced
+        // -- used to edit an empty tree at that offset and re-parse. The
+        // parser then reuses the empty tree's end-of-file node and stops: a
+        // tree of nothing, and no colours until the file is opened again
+        // (dopamine #877). The first parse is of the whole text.
+        let edit = if self.tree.is_some() { edit } else { None };
         let edit = edit.unwrap_or(InputEdit {
             start_byte: 0,
             old_end_byte: 0,
@@ -1688,6 +1696,38 @@ mod tests {
             // One that has queries still is.
             assert!(highlighter("rust", MACRO).tree.is_some());
             assert!(highlighter("json", text).tree.is_some());
+        }
+        /// A highlighter that has parsed nothing has no tree for an edit to be
+        /// an edit *of*. Handed one anyway -- the first keystroke after the
+        /// whole text was replaced -- it used to "re-parse" an empty tree,
+        /// reuse its end-of-file node, and end up with a tree of nothing: no
+        /// colours until the file was opened again (dopamine #877).
+        #[test]
+        fn the_first_update_parses_from_scratch_whatever_edit_comes_with_it() {
+            let text = Rope::from(MACRO);
+            let at = MACRO.find("json!").unwrap();
+            let mut edited = SyntaxHighlighter::new("rust");
+            edited.update(
+                Some(InputEdit {
+                    start_byte: at,
+                    old_end_byte: at,
+                    new_end_byte: at + 1,
+                    start_position: Point::new(1, 4),
+                    old_end_position: Point::new(1, 4),
+                    new_end_position: Point::new(1, 5),
+                }),
+                &text,
+            );
+
+            let fresh = highlighter("rust", MACRO);
+            let theme = HighlightTheme::default_dark();
+            let rows = rows_of(MACRO);
+            assert_eq!(
+                row_by_row(&edited, &rows, &theme),
+                row_by_row(&fresh, &rows, &theme)
+            );
+            let tree = edited.tree.as_ref().expect("parsed");
+            assert_eq!(tree.root_node().end_byte(), MACRO.len());
         }
     }
 }

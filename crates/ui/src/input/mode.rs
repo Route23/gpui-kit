@@ -2107,6 +2107,31 @@ impl InputMode {
         }
     }
 
+    /// Build the highlighter now if there is none, parsing `text` from scratch.
+    ///
+    /// The whole text being replaced leaves it gone until the next render (see
+    /// `InputState::replace_text`). An editor that is not on screen is not
+    /// rendered, and whoever asked it about its syntax in the meantime -- the
+    /// strings to leave alone when a save trims trailing spaces, the colours
+    /// of the minimap -- got "there is none" and acted on it (dopamine #877).
+    /// The render that comes later finds a highlighter and leaves it alone, so
+    /// this is still the one parse.
+    pub(super) fn ensure_highlighter(&self, text: &Rope) {
+        if let InputMode::CodeEditor {
+            language,
+            highlighter,
+            ..
+        } = &self
+        {
+            let mut highlighter = highlighter.borrow_mut();
+            if highlighter.is_none() {
+                let mut new_highlighter = SyntaxHighlighter::new(language);
+                new_highlighter.update(None, text);
+                highlighter.replace(new_highlighter);
+            }
+        }
+    }
+
     pub(super) fn update_highlighter(
         &mut self,
         selected_range: &Range<usize>,
