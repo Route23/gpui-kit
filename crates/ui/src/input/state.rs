@@ -2378,13 +2378,20 @@ impl InputState {
         debug_assert!(self.mode.is_multi_line());
         self.soft_wrap = wrap;
         if wrap {
-            let wrap_width = self
-                .last_layout
-                .as_ref()
-                .and_then(|b| b.wrap_width)
-                .unwrap_or(self.input_bounds.size.width);
+            // **Only once there has been a frame.** Before it there is no
+            // width to wrap at: the bounds this falls back on are set by the
+            // first paint, and are none wide until then. Every row was laid
+            // out nearly a letter to a line for that, and again for the
+            // editor's font, before the first frame brought the width
+            // (dopamine #878). That paint is what brings it now, as it does
+            // for an input made with soft wrap on (`set_input_bounds`).
+            if let Some(last_layout) = self.last_layout.as_ref() {
+                let wrap_width = last_layout
+                    .wrap_width
+                    .unwrap_or(self.input_bounds.size.width);
 
-            self.text_wrapper.set_wrap_width(Some(wrap_width), cx);
+                self.text_wrapper.set_wrap_width(Some(wrap_width), cx);
+            }
 
             // Reset scroll to left 0
             let mut offset = self.scroll_handle.offset();
@@ -4345,6 +4352,12 @@ impl EntityInputHandler for InputState {
         if range_utf16.is_none() && self.selected_range.is_empty() {
             if let Some(drop) = self.outdent_for_closer(new_text) {
                 self.text.replace(drop.clone(), "");
+                // The wrap table hears of this edit here. What follows may
+                // be the caret stepping over a closer that is already there,
+                // and then nothing below is reached: the next frame drew a
+                // row that was longer in the table than in the text, which
+                // is a slice out of range (dopamine #878).
+                self.text_wrapper.update(&self.text, &drop, 0, cx);
                 self.selected_range = (drop.start..drop.start).into();
             }
         }

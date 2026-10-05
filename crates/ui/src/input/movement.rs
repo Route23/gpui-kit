@@ -52,7 +52,7 @@ impl InputState {
         let offset = self.text.clip_offset(offset.clamp(0, self.text.len()), Bias::Left);
         // Indent this inserted and nobody typed on goes away when the caret
         // leaves the line (`editor.trimAutoWhitespace`, #248).
-        let offset = self.trim_auto_whitespace_on_leave(offset);
+        let offset = self.trim_auto_whitespace_on_leave(offset, cx);
         // Parameter hints go away when the caret leaves the call (#246).
         self.hide_signature_help_if_outside(offset, cx);
         // The caret must never come to rest inside a folded region. This is the

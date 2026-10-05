@@ -9,6 +9,8 @@
 //! this fork ships highlight and injection queries only. `Brackets` covers the
 //! cases those queries are mostly used for and costs nothing new.
 
+use gpui::App;
+
 use super::brackets::Pair;
 use crate::RopeExt as _;
 
@@ -310,7 +312,7 @@ impl super::InputState {
     /// Returns the target offset, moved back if text before it went away.
     /// **Not an undo step** -- it removes what the editor put there itself,
     /// so putting it in the history would make Undo restore whitespace.
-    pub(super) fn trim_auto_whitespace_on_leave(&mut self, target: usize) -> usize {
+    pub(super) fn trim_auto_whitespace_on_leave(&mut self, target: usize, cx: &mut App) -> usize {
         let Some(range) = self.auto_ws.clone() else {
             return target;
         };
@@ -342,6 +344,10 @@ impl super::InputState {
             return target;
         }
         self.text.replace(range.clone(), "");
+        // The wrap table has to hear of it: the next frame is drawn from the
+        // table, and a row that is longer there than in the text is a slice
+        // out of range (dopamine #878).
+        self.text_wrapper.update(&self.text, &range, 0, cx);
         if target >= range.end {
             target - range.len()
         } else {

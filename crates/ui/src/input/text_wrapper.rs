@@ -120,6 +120,11 @@ pub(super) struct TextWrapper {
     /// It has once the whole text has gone through [`Self::update`] in one
     /// go. A text that was only put in ([`Self::set_default_text`]) has not,
     /// and [`Self::prepare_if_need`] is what makes up for it.
+    ///
+    /// **Nothing makes up for a change the table was not told of.** Whoever
+    /// writes to the text hands the change to `update`: the element draws a
+    /// frame from these rows, and a row that is longer here than in the text
+    /// is a slice out of range there.
     _initialized: bool,
     /// How many times every row was laid out, for the tests to count.
     #[cfg(test)]
@@ -487,7 +492,8 @@ impl TextWrapper {
 /// the `\n` (a `\r` stays, as in [`RopeExt::slice_line`]).
 ///
 /// The text is read where it is. A row is only copied when the rope keeps it
-/// in more than one piece, and then into a buffer that is used again.
+/// in more than one piece -- or when it is the last, which no `\n` ends --
+/// and then into a buffer that is used again.
 fn for_each_row(text: RopeSlice<'_>, mut f: impl FnMut(usize, &str)) {
     let mut row = 0;
     // The start of a row that ends in a later chunk.
@@ -724,14 +730,128 @@ mod tests {
     use super::*;
     use crate::{
         Root,
-        input::{Input, InputState, LensRow, Position},
+        input::{AutoIndent, Enter, Input, InputState, LensRow, Position},
     };
     use gpui::{
-        AppContext as _, Boundary, Context, Entity, FontFeatures, FontStyle, FontWeight,
-        IntoElement, ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext,
-        Window, div, px,
+        AppContext as _, Boundary, Context, Entity, EntityInputHandler as _, FontFeatures,
+        FontStyle, FontWeight, IntoElement, ParentElement as _, Render, Styled as _,
+        TestAppContext, VisualTestContext, Window, div, px,
     };
     use smallvec::smallvec;
+
+    /// What a piece of code asks of the heap, for the tests that are about
+    /// nothing else: how a table is made does not show in what it says.
+    ///
+    /// **This is the allocator of the whole test binary** -- a binary has
+    /// one. It hands everything on to the system's, which is what the binary
+    /// had without it, and counts on the way. The counts are kept for each
+    /// thread on its own, because tests run side by side and one must not
+    /// count what another asked for.
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        #[derive(Clone, Copy)]
+        struct Count {
+            /// Times this thread asked for room.
+            asked: usize,
+            /// Bytes it holds. Signed: what one thread took, another may
+            /// give back.
+            held: isize,
+            /// The most `held` has been since a measurement began.
+            most: isize,
+        }
+
+        thread_local! {
+            // `const`, and nothing to drop: reaching it never allocates, and
+            // it is still there while a thread that is going away frees.
+            static COUNT: Cell<Count> = const {
+                Cell::new(Count {
+                    asked: 0,
+                    held: 0,
+                    most: 0,
+                })
+            };
+        }
+
+        fn count(change: impl FnOnce(&mut Count)) {
+            let _ = COUNT.try_with(|count| {
+                let mut now = count.get();
+                change(&mut now);
+                count.set(now);
+            });
+        }
+
+        fn took(bytes: usize) {
+            count(|count| {
+                count.asked = count.asked.wrapping_add(1);
+                count.held = count.held.wrapping_add(bytes as isize);
+                count.most = count.most.max(count.held);
+            });
+        }
+
+        fn gave_back(bytes: usize) {
+            count(|count| count.held = count.held.wrapping_sub(bytes as isize));
+        }
+
+        struct Counting;
+
+        #[global_allocator]
+        static HEAP: Counting = Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                took(layout.size());
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                took(layout.size());
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                gave_back(layout.size());
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                gave_back(layout.size());
+                took(new_size);
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        /// What was asked of the heap while something ran.
+        pub(super) struct Asked {
+            /// How many times it asked for room.
+            pub(super) times: usize,
+            /// How far over where it started the bytes it held went, at the
+            /// most. Room given back and taken again does not add up.
+            pub(super) over: usize,
+        }
+
+        /// Run `f` and say what it asked of the heap, on this thread.
+        pub(super) fn measure<R>(f: impl FnOnce() -> R) -> (R, Asked) {
+            let before = COUNT.get();
+            COUNT.set(Count {
+                most: before.held,
+                ..before
+            });
+            let out = f();
+            let after = COUNT.get();
+            // A measurement around this one keeps its own high-water mark.
+            COUNT.set(Count {
+                most: after.most.max(before.most),
+                ..after
+            });
+            let asked = Asked {
+                times: after.asked.wrapping_sub(before.asked),
+                over: after.most.saturating_sub(before.held).max(0) as usize,
+            };
+            (out, asked)
+        }
+    }
 
     fn test_font() -> gpui::Font {
         gpui::Font {
@@ -1335,6 +1455,48 @@ mod tests {
         assert_eq!(lens_of(&wrapper), row_lens(&rope));
     }
 
+    /// The same rows, and not copies of them: a row that lies in one piece of
+    /// the rope is handed over where it is. The test above cannot tell -- it
+    /// reads what a row says, and a copy says the same.
+    #[test]
+    fn a_row_in_one_piece_is_read_where_it_is() {
+        let rope = Rope::from("one\ntwo\n\nlast");
+        let mut pieces = rope.chunks();
+        let piece = pieces.next().unwrap().as_bytes().as_ptr_range();
+        assert!(pieces.next().is_none(), "kept in one piece");
+
+        let mut in_place = vec![];
+        for_each_row(rope.slice(..), |_, row| {
+            in_place.push(piece.contains(&row.as_ptr()));
+        });
+        // Nothing says the last row is over but the text being over, so it
+        // is the one that goes through the buffer.
+        assert_eq!(in_place, [true, true, true, false]);
+
+        // In a text kept in many pieces, the rows that are copied are the
+        // ones that end in a later piece than they begin in -- no more than
+        // one a piece, and there are far fewer pieces than rows.
+        let rope = Rope::from("let v = 00000;\n".repeat(10_000));
+        let pieces: Vec<_> = rope
+            .chunks()
+            .map(|piece| piece.as_bytes().as_ptr_range())
+            .collect();
+        assert!(pieces.len() > 100, "kept in many pieces");
+        let (mut rows, mut copied) = (0, 0);
+        for_each_row(rope.slice(..), |_, row| {
+            rows += 1;
+            if !pieces.iter().any(|piece| piece.contains(&row.as_ptr())) {
+                copied += 1;
+            }
+        });
+        assert_eq!(rows, 10_001);
+        assert!(
+            copied <= pieces.len() && pieces.len() * 10 < rows,
+            "{copied} of {rows} rows copied, {} pieces",
+            pieces.len()
+        );
+    }
+
     /// A row keeps what is asked of it -- how long it is, where it wraps, two
     /// marks -- and not a copy of its text.
     #[test]
@@ -1356,6 +1518,64 @@ mod tests {
             assert_eq!(line.wrapped_lines.as_slice(), [0..line.len()]);
             assert!(!line.wrapped_lines.spilled());
         }
+    }
+
+    /// Laying every row out takes one table, not something for each row, and
+    /// laying them out again lets the old table go before the new one is
+    /// made. Neither shows in what the table says, only in what the heap was
+    /// asked for.
+    #[test]
+    fn every_row_laid_out_is_one_table_on_the_heap() {
+        const ROWS: usize = 10_000;
+        let text_of = |row: &str| Rope::from(format!("{}last", row.repeat(ROWS - 1)));
+        let table = ROWS * std::mem::size_of::<LineItem>();
+
+        let text = text_of("let v = 00000;\n");
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+        let ((), first) = heap::measure(|| {
+            wrapper._update(&text, &(0..0), text.len(), &mut no_wrap);
+        });
+        assert_eq!(wrapper.lines.len(), ROWS);
+        assert!(first.over >= table, "the table was seen being made");
+        // The table, and the buffer the rows that end in a later piece are
+        // put together in. It was a `String` for every row, on top of a copy
+        // of the text.
+        assert!(
+            first.times * 100 < ROWS,
+            "the heap was asked {} times for {ROWS} rows",
+            first.times
+        );
+
+        // Another text of as many rows, the way setting a value hands it
+        // over: at no time are there two tables.
+        let other = text_of("let w = 11111;\n");
+        let ((), again) = heap::measure(|| {
+            wrapper._update(&other, &(0..text.len()), other.len(), &mut no_wrap);
+        });
+        assert_eq!(wrapper.lines.len(), ROWS);
+        assert!(again.times * 100 < ROWS, "asked {} times", again.times);
+        assert!(
+            again.over < table / 2,
+            "{} bytes over where it started; a table is {table}",
+            again.over
+        );
+
+        // With rows that wrap, which keep their ranges on the heap, the way
+        // a new width lays them out. The first time the ranges are new...
+        wrapper.wrap_width = Some(px(100.));
+        let mut wrap = wrap_every(4);
+        wrapper._update(&other, &(0..other.len()), other.len(), &mut wrap);
+        assert!(wrapper.lines[0].wrapped_lines.spilled());
+        // ...and after that they go with the table they belong to.
+        let ((), wrapped) = heap::measure(|| {
+            wrapper._update(&other, &(0..other.len()), other.len(), &mut wrap);
+        });
+        assert_eq!(wrapper.len(), 4 * (ROWS - 1) + 1);
+        assert!(
+            wrapped.over < table / 2,
+            "{} bytes over where it started; a table is {table}",
+            wrapped.over
+        );
     }
 
     /// Soft wrap, a fold and rows inserted under a row at once -- through an
@@ -1809,6 +2029,173 @@ mod tests {
         });
         input.read_with(cx, |state, _| {
             assert_eq!(state.text_wrapper.total_height(h), lines as f32 * h);
+        });
+    }
+
+    // ── the table hears of every change to the text ────────────────────────
+
+    /// The table has a row for every row of the text, as long as it is. The
+    /// element draws a frame from the table, and a row that is longer there
+    /// than in the text is a slice out of range.
+    #[track_caller]
+    fn assert_rows_in_step(state: &InputState) {
+        let wrapper = &state.text_wrapper;
+        assert_eq!(wrapper.lines.len(), state.text.lines_len());
+        for (row, line) in wrapper.lines.iter().enumerate() {
+            assert_eq!(line.len(), state.text.line_len(row), "row {row}");
+        }
+    }
+
+    /// An editor that indents a new row the way `how` says, and takes the
+    /// indent back when the caret leaves the row if `trim_auto` is set.
+    fn indenting(state: InputState, how: AutoIndent, trim_auto: bool) -> InputState {
+        state
+            .code_editor("text")
+            .soft_wrap(false)
+            .auto_indent(how, false, false, trim_auto, false)
+    }
+
+    /// Indent that Enter wrote and nobody typed after is taken back when the
+    /// caret leaves the row (`trim_auto_whitespace`). That is a change to the
+    /// text which does not go through `replace_text_in_range`, and the table
+    /// was not told of it.
+    #[gpui::test]
+    fn indent_taken_back_when_the_caret_leaves_reaches_the_table(cx: &mut TestAppContext) {
+        let (input, cx) = open(
+            |state| indenting(state, AutoIndent::Keep, true),
+            |state, window, cx| state.set_value("    foo\nbar", window, cx),
+            cx,
+        );
+
+        input.update_in(cx, |state, window, cx| {
+            state.move_to(7, None, cx);
+            state.enter(&Enter { secondary: false }, window, cx);
+            assert_eq!(state.text.to_string(), "    foo\n    \nbar");
+            assert_rows_in_step(state);
+        });
+        cx.run_until_parked();
+
+        input.update_in(cx, |state, _, cx| {
+            state.move_to(0, None, cx);
+            assert_eq!(state.text.to_string(), "    foo\n\nbar");
+            assert_rows_in_step(state);
+        });
+        // The frame that follows is drawn from the table.
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| assert_rows_in_step(state));
+    }
+
+    /// A closing bracket typed as the first thing on a row pulls the row back
+    /// a level (`AutoIndent::Brackets`), as an edit of its own. When the
+    /// bracket is already there the caret only steps over it, and nothing
+    /// that an edit goes on to do was reached -- the table among it.
+    #[gpui::test]
+    fn indent_pulled_back_by_a_closer_reaches_the_table(cx: &mut TestAppContext) {
+        let (input, cx) = open(
+            |state| indenting(state, AutoIndent::Brackets, false),
+            |state, window, cx| state.set_value("{\n    }\n{\n    ", window, cx),
+            cx,
+        );
+
+        // In front of the closer: one level goes -- two columns, the tab size
+        // an editor is made with -- and the caret is past the closer that
+        // was there.
+        input.update_in(cx, |state, window, cx| {
+            state.move_to(6, None, cx);
+            state.replace_text_in_range(None, "}", window, cx);
+            assert_eq!(state.text.to_string(), "{\n  }\n{\n    ");
+            assert_eq!(state.cursor(), 5);
+            assert_rows_in_step(state);
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| assert_rows_in_step(state));
+
+        // With no closer to step over, the bracket is typed after the row is
+        // pulled back: two edits of the one row.
+        input.update_in(cx, |state, window, cx| {
+            state.move_to(state.text.len(), None, cx);
+            state.replace_text_in_range(None, "}", window, cx);
+            assert_eq!(state.text.to_string(), "{\n  }\n{\n  }");
+            assert_rows_in_step(state);
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| assert_rows_in_step(state));
+    }
+
+    /// Soft wrap turned on in an editor that has not been drawn has no width
+    /// to wrap at: the bounds it would take one from have not been set, and
+    /// are none wide. Every row was laid out nearly a letter to a line for
+    /// that, and once more for the editor's font, before the first frame
+    /// brought the width -- four layouts for a file opened this way.
+    #[gpui::test]
+    fn soft_wrap_turned_on_before_the_first_frame_waits_for_a_width(cx: &mut TestAppContext) {
+        let text = format!("{}\nshort\n\n{}\n", "word ".repeat(200), "x".repeat(500));
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(false),
+            |state, window, cx| {
+                state.set_value(text.clone(), window, cx);
+                state.set_soft_wrap(true, window, cx);
+                assert_eq!(state.text_wrapper.wrap_width, None, "no width yet");
+                assert_eq!(state.text_wrapper.rebuilds, 1);
+            },
+            cx,
+        );
+
+        let (font, font_size, wrap_width, wrapped) = input.read_with(cx, |state, _| {
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            let wrapper = &state.text_wrapper;
+            assert_eq!(wrapper.rebuilds, 2);
+            assert!(
+                wrapper.lines[0].wrapped_lines.len() > 1,
+                "the long row wraps"
+            );
+            (
+                wrapper.font.clone(),
+                wrapper.font_size,
+                wrapper.wrap_width,
+                rows(wrapper),
+            )
+        });
+        assert!(wrap_width.is_some_and(|width| width > px(0.)));
+
+        // What an editor made with soft wrap on comes to: every row laid out
+        // for the editor's font and the width of its first frame.
+        let text = Rope::from(text);
+        cx.update(|_, cx| {
+            let mut fresh = TextWrapper::new(font, font_size, wrap_width);
+            fresh.update(&text, &(0..0), text.len(), cx);
+            assert_eq!(wrapped, rows(&fresh));
+        });
+    }
+
+    /// Once there has been a frame there is a width, and turning soft wrap
+    /// on wraps at once, as it did.
+    #[gpui::test]
+    fn soft_wrap_turned_on_after_a_frame_wraps_at_once(cx: &mut TestAppContext) {
+        let text = format!("{}\nshort\n", "word ".repeat(200));
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(false),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        input.update_in(cx, |state, window, cx| {
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            assert_eq!(state.text_wrapper.rebuilds, 1);
+            assert_eq!(state.text_wrapper.lines[0].wrapped_lines.len(), 1);
+
+            state.set_soft_wrap(true, window, cx);
+            let wrapper = &state.text_wrapper;
+            assert_eq!(wrapper.wrap_width, Some(state.input_bounds.size.width));
+            assert_eq!(wrapper.rebuilds, 2);
+            assert!(
+                wrapper.lines[0].wrapped_lines.len() > 1,
+                "the long row wraps"
+            );
+
+            // And off again, which needs no width.
+            state.set_soft_wrap(false, window, cx);
+            assert_eq!(state.text_wrapper.wrap_width, None);
+            assert_eq!(state.text_wrapper.lines[0].wrapped_lines.len(), 1);
         });
     }
 }
