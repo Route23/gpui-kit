@@ -461,6 +461,14 @@ impl HighlightTheme {
 /// Registry for code highlighter languages.
 pub struct LanguageRegistry {
     languages: Mutex<HashMap<SharedString, LanguageConfig>>,
+    /// Compiled queries, by the language's name and the query's source.
+    ///
+    /// Compiling is the expensive part of building a highlighter -- 20 ms for
+    /// Rust, 50 ms for TypeScript with its ten injected languages -- and every
+    /// editor used to compile its own, on the main thread, each time a file
+    /// was opened (dopamine #877). A compiled query is immutable, so they are
+    /// shared. Emptied whenever a language is registered.
+    queries: Mutex<HashMap<(SharedString, SharedString), Arc<tree_sitter::Query>>>,
 }
 
 impl LanguageRegistry {
@@ -472,6 +480,7 @@ impl LanguageRegistry {
                     .map(|language| (language.name().into(), language.config()))
                     .collect(),
             ),
+            queries: Mutex::new(HashMap::new()),
         });
         &INSTANCE
     }
@@ -482,6 +491,32 @@ impl LanguageRegistry {
             .lock()
             .unwrap()
             .insert(lang.to_string().into(), config.clone());
+        // A name can mean another grammar now.
+        if let Ok(mut queries) = self.queries.lock() {
+            queries.clear();
+        }
+    }
+
+    /// `source` compiled for `config`'s grammar, compiled at most once for as
+    /// long as no language is registered.
+    pub(crate) fn query(
+        &self,
+        config: &LanguageConfig,
+        source: &str,
+    ) -> Result<Arc<tree_sitter::Query>, tree_sitter::QueryError> {
+        let key = (config.name.clone(), SharedString::from(source.to_string()));
+        if let Ok(queries) = self.queries.lock() {
+            if let Some(query) = queries.get(&key) {
+                return Ok(query.clone());
+            }
+        }
+        // Compiled outside the lock: it takes tens of milliseconds.
+        let query = Arc::new(tree_sitter::Query::new(&config.language, source)?);
+        match self.queries.lock() {
+            // Whoever got here first wins, so that everyone holds the same one.
+            Ok(mut queries) => Ok(queries.entry(key).or_insert(query).clone()),
+            Err(_) => Ok(query),
+        }
     }
 
     /// Returns a list of all registered language names.
@@ -520,5 +555,43 @@ mod tests {
         assert!(registry.language("rs").is_some());
         assert!(registry.language("javascript").is_some());
         assert!(registry.language("js").is_some());
+    }
+
+    /// A query is compiled once per language and source, and compiled again
+    /// after a language is registered: the name may mean another grammar.
+    #[test]
+    fn a_query_is_compiled_once_until_a_language_is_registered() {
+        use super::LanguageRegistry;
+        use std::sync::Arc;
+        let registry = LanguageRegistry::singleton();
+        let json = LanguageConfig::new(
+            "query-cache-test",
+            tree_sitter_json::LANGUAGE.into(),
+            vec![],
+            "",
+            "",
+            "",
+        );
+        let source = "(string) @string";
+
+        // Other tests register languages too, which empties what is kept --
+        // so a pair may straddle that. Not five in a row.
+        let shared = (0..5).any(|_| {
+            let a = registry.query(&json, source).expect("compiles");
+            let b = registry.query(&json, source).expect("compiles");
+            Arc::ptr_eq(&a, &b)
+        });
+        assert!(shared);
+
+        // Another source is another query; a bad one is an error, not a panic.
+        let a = registry.query(&json, source).expect("compiles");
+        let other = registry.query(&json, "(number) @number").expect("compiles");
+        assert!(!Arc::ptr_eq(&a, &other));
+        assert!(registry.query(&json, "(no_such_node) @x").is_err());
+
+        let before = registry.query(&json, source).expect("compiles");
+        registry.register("query-cache-test", &json);
+        let after = registry.query(&json, source).expect("compiles");
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 }

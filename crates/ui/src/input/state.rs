@@ -565,6 +565,9 @@ pub struct InputState {
     ///
     /// If true, will call some update (for example LSP, Syntax Highlight) before render.
     _pending_update: bool,
+    /// Set while [`Self::replace_text`] swaps the whole text, so that the edit
+    /// does not build a highlighter that is about to be thrown away.
+    replacing_all: bool,
     /// The caret moved, so the occurrence highlights are stale (#253).
     ///
     /// Asking needs a `&mut Window`, and `move_to` has none -- so the ask is
@@ -707,6 +710,7 @@ impl InputState {
             _subscriptions,
             _context_menu_task: Task::ready(Ok(())),
             _pending_update: false,
+            replacing_all: false,
             pending_highlight: false,
             scroll_slide: None,
             scroll_slide_task: None,
@@ -2307,8 +2311,17 @@ impl InputState {
     ) {
         let text: SharedString = text.into();
         let range = 0..self.text.chars().map(|c| c.len_utf16()).sum();
-        self.replace_text_in_range_silent(Some(range), &text, window, cx);
+        // **The highlighter goes first, and stays gone until the edit is in.**
+        // It used to be dropped *after* the edit -- which had just built one
+        // (compiling its queries) and parsed the whole new text with it, for
+        // nothing: the next render builds and parses again. Opening a file
+        // paid for both twice, on the main thread (dopamine #877). A whole new
+        // text wants a parse from scratch either way, and that is the one the
+        // next edit or the pending update does.
         self.reset_highlighter(cx);
+        self.replacing_all = true;
+        self.replace_text_in_range_silent(Some(range), &text, window, cx);
+        self.replacing_all = false;
     }
 
     /// Set with disabled mode.
@@ -4384,8 +4397,11 @@ impl EntityInputHandler for InputState {
         self.shift_folds_for_edit(&old_text, &range);
         self.shift_breakpoints_for_edit(&old_text, &range, cx);
         self.update_folds();
-        self.mode
-            .update_highlighter(&range, &self.text, &new_text, true, cx);
+        // Not while the whole text is being replaced; see `replace_text`.
+        if !self.replacing_all {
+            self.mode
+                .update_highlighter(&range, &self.text, &new_text, true, cx);
+        }
         self.lsp.update(&self.text, window, cx);
         self.selected_range = (new_offset..new_offset).into();
         // Put the caret back inside the pair, or keep the wrapped text selected.
@@ -4471,8 +4487,11 @@ impl EntityInputHandler for InputState {
         self.shift_folds_for_edit(&old_text, &range);
         self.shift_breakpoints_for_edit(&old_text, &range, cx);
         self.update_folds();
-        self.mode
-            .update_highlighter(&range, &self.text, &new_text, true, cx);
+        // Not while the whole text is being replaced; see `replace_text`.
+        if !self.replacing_all {
+            self.mode
+                .update_highlighter(&range, &self.text, &new_text, true, cx);
+        }
         self.lsp.update(&self.text, window, cx);
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.

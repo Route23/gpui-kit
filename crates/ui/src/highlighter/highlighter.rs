@@ -21,8 +21,10 @@ use tree_sitter::{
 #[allow(unused)]
 pub struct SyntaxHighlighter {
     language: SharedString,
-    query: Option<Query>,
-    injection_queries: HashMap<SharedString, Query>,
+    /// Shared with every other highlighter of the language; see
+    /// `LanguageRegistry::query`.
+    query: Option<Arc<Query>>,
+    injection_queries: HashMap<SharedString, Arc<Query>>,
 
     locals_pattern_index: usize,
     highlights_pattern_index: usize,
@@ -275,7 +277,9 @@ impl SyntaxHighlighter {
 
         // Construct a single query by concatenating the three query strings, but record the
         // range of pattern indices that belong to each individual string.
-        let query = Query::new(&config.language, &query_source).context("new query")?;
+        let query = LanguageRegistry::singleton()
+            .query(&config, &query_source)
+            .context("new query")?;
 
         let mut locals_pattern_index = 0;
         let mut highlights_pattern_index = 0;
@@ -357,7 +361,7 @@ impl SyntaxHighlighter {
         let mut injection_capture_names = HashMap::new();
         for inj_language in config.injection_languages.iter() {
             if let Some(inj_config) = LanguageRegistry::singleton().language(&inj_language) {
-                match Query::new(&inj_config.language, &inj_config.highlights) {
+                match LanguageRegistry::singleton().query(&inj_config, &inj_config.highlights) {
                     Ok(q) => {
                         injection_capture_names.insert(inj_config.name.clone(), shared_names(&q));
                         injection_queries.insert(inj_config.name.clone(), q);
@@ -429,6 +433,18 @@ impl SyntaxHighlighter {
             *skipped = None;
         }
 
+        // **Nothing to ask the tree, so no tree.** A file with no grammar of
+        // its own (`.txt`, `.log`, an extension nobody knows) is "parsed" as
+        // JSON with empty queries: not one capture comes out of it, and since
+        // it is not JSON the parser spends its time recovering from errors --
+        // 680 ms for a 5 MB log, on the main thread (dopamine #877). Without a
+        // tree `match_styles` answers what it answered with one: nothing.
+        if !self.has_patterns() {
+            self.tree = None;
+            self.text = text.clone();
+            return;
+        }
+
         let edit = edit.unwrap_or(InputEdit {
             start_byte: 0,
             old_end_byte: 0,
@@ -463,6 +479,13 @@ impl SyntaxHighlighter {
 
         self.tree = Some(new_tree);
         self.text = text.clone();
+    }
+
+    /// Whether any query could capture anything.
+    fn has_patterns(&self) -> bool {
+        self.query
+            .as_ref()
+            .is_some_and(|query| query.pattern_count() > 0)
     }
 
     /// Match the visible ranges of nodes in the Tree for highlighting.
@@ -1615,6 +1638,56 @@ mod tests {
                 .styles(&visible, &theme)
                 .iter()
                 .all(|(r, _)| r.start >= visible.start && r.end <= visible.end + 1));
+        }
+        /// Compiling the queries is most of what building a highlighter costs,
+        /// and they never change: the second highlighter of a language gets
+        /// the first one's (dopamine #877).
+        #[test]
+        fn highlighters_of_one_language_share_their_queries() {
+            // Registering a language empties what is kept, and another test
+            // does that -- so a pair may straddle it. Not five in a row.
+            let shared = (0..5).any(|_| {
+                let first = SyntaxHighlighter::new("rust");
+                let second = SyntaxHighlighter::new("rust");
+                let (Some(a), Some(b)) = (&first.query, &second.query) else {
+                    panic!("no query for rust");
+                };
+                assert!(!first.injection_queries.is_empty());
+                Arc::ptr_eq(a, b)
+                    && first.injection_queries.iter().all(|(language, query)| {
+                        Arc::ptr_eq(query, &second.injection_queries[language])
+                    })
+            });
+            assert!(shared, "each highlighter compiled its own queries");
+
+            // Another language is another query.
+            let rust = SyntaxHighlighter::new("rust");
+            let other = SyntaxHighlighter::new("javascript");
+            assert!(!Arc::ptr_eq(
+                rust.query.as_ref().unwrap(),
+                other.query.as_ref().unwrap()
+            ));
+        }
+
+        /// A file with no grammar of its own has nothing to ask a tree, so it
+        /// is not parsed -- and is styled exactly as before: not at all.
+        #[test]
+        fn a_language_without_queries_is_not_parsed() {
+            let text = "{ \"not\": json, just [text] }\nsecond line\n";
+            let plain = highlighter("text", text);
+            assert!(plain.tree.is_none());
+            let theme = HighlightTheme::default_dark();
+            for row in rows_of(text) {
+                assert_eq!(
+                    plain.styles(&row, &theme),
+                    vec![(row.clone(), HighlightStyle::default())]
+                );
+            }
+            assert!(plain.skipped_ranges(&(0..text.len())).is_empty());
+
+            // One that has queries still is.
+            assert!(highlighter("rust", MACRO).tree.is_some());
+            assert!(highlighter("json", text).tree.is_some());
         }
     }
 }
