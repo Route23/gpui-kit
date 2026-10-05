@@ -756,7 +756,7 @@ mod tests {
         TestAppContext, VisualTestContext, Window, div, px,
     };
     use smallvec::smallvec;
-    use std::rc::Rc;
+    use std::{rc::Rc, time::Duration};
 
     /// What a piece of code asks of the heap, for the tests that are about
     /// nothing else: how a table is made does not show in what it says.
@@ -2247,10 +2247,13 @@ mod tests {
         width: Option<Pixels>,
         /// `None`: the size an input is drawn in.
         font_size: Option<Pixels>,
+        /// How many frames of it have been drawn.
+        frames: usize,
     }
 
     impl Render for Framed {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.frames += 1;
             let mut input = Input::new(&self.input).h_full();
             if let Some(font_size) = self.font_size {
                 input = input.text_size(font_size);
@@ -2285,6 +2288,7 @@ mod tests {
                 input: input.clone(),
                 width,
                 font_size: None,
+                frames: 0,
             });
             made = Some((frame.clone(), input));
             Root::new(frame, window, cx)
@@ -2508,6 +2512,266 @@ mod tests {
             assert_eq!(state.text.len(), text.len());
             assert_eq!(state.text.line_len(105), 500);
         });
+    }
+
+    /// Where the last frame of an editor was drawn, and where it left the
+    /// editor.
+    #[derive(Debug, PartialEq)]
+    struct Place {
+        /// How far up the frame had the text moved.
+        drawn_at: Pixels,
+        /// How far up the editor has it now.
+        left_at: Pixels,
+        /// The rows the frame laid out.
+        rows: Range<usize>,
+        /// How many of those have a line inside the editor.
+        in_view: usize,
+    }
+
+    fn place_of(input: &Entity<InputState>, cx: &mut VisualTestContext) -> Place {
+        input.read_with(cx, |state, _| {
+            let layout = state.last_layout.as_ref().expect("a frame was drawn");
+            let drawn_at = state.last_bounds.unwrap().origin.y - state.input_bounds.origin.y;
+            let mut top = layout.visible_top + drawn_at;
+            let mut in_view = 0;
+            for row in layout.visible_range.clone() {
+                let bottom = top + state.text_wrapper.lines[row].height(layout.line_height);
+                if bottom > px(0.) && top < state.input_bounds.size.height {
+                    in_view += 1;
+                }
+                top = bottom;
+            }
+            Place {
+                drawn_at,
+                left_at: state.scroll_handle.offset().y,
+                rows: layout.visible_range.clone(),
+                in_view,
+            }
+        })
+    }
+
+    /// How far up an editor has its text when it is scrolled all the way
+    /// down, for rows that are `rows` high together: the last of them stops
+    /// half the editor up (`ScrollBeyondLastLine::Half`, which an editor
+    /// starts with).
+    fn end_of(rows: Pixels, input: &Entity<InputState>, cx: &mut VisualTestContext) -> Pixels {
+        input.read_with(cx, |state, _| state.input_bounds.size.height / 2. - rows)
+    }
+
+    /// How high the rows of an editor are together.
+    fn height_of_rows(input: &Entity<InputState>, cx: &mut VisualTestContext) -> Pixels {
+        input.read_with(cx, |state, _| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            state.text_wrapper.total_height(line_height)
+        })
+    }
+
+    /// An editor 600px wide with 300 rows of several lines each, scrolled
+    /// all the way down, and a frame of it drawn there. Nothing draws it from
+    /// here on but what a test does: it does not have the focus, so no caret
+    /// blinks, and the scrollbar that showed the scroll has faded.
+    fn at_the_end_of_rows_that_wrap(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Framed>,
+        Entity<InputState>,
+        &'static mut VisualTestContext,
+    ) {
+        let row = "word ".repeat(100);
+        let text = vec![row.as_str(); 300].join("\n");
+        let (frame, input, cx) = open_framed(
+            |state| state.code_editor("text").soft_wrap(true),
+            &text,
+            Some(px(600.)),
+            cx,
+        );
+        input.update_in(cx, |state, _, cx| state.scroll_to_row(299, cx));
+        cx.run_until_parked();
+        // The frame that made the scroll was laid out for where it was asked
+        // to go, which is further than an editor scrolls. One more, where it
+        // was left, and the time it takes the scrollbar to fade.
+        input.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        wrapped_frame(&input, cx);
+
+        let end = end_of(height_of_rows(&input, cx), &input, cx);
+        let place = place_of(&input, cx);
+        assert_eq!((place.drawn_at, place.left_at), (end, end));
+        assert_eq!(place.rows.end, 300);
+        assert!(place.in_view > 0, "{place:?}");
+        (frame, input, cx)
+    }
+
+    /// Rows that come to wrap to fewer lines make the text shorter, and a
+    /// view at its end is then past the end: by more than the editor is high
+    /// here, so that where the view was is below the last row. The frame
+    /// that draws the new rows is drawn at the end of the text as it is now,
+    /// which is where the editor is left.
+    ///
+    /// It was drawn where the longer text had it: no row of the text in it,
+    /// and the place only put right once it was painted -- by a `notify`
+    /// from the paint, which draws no frame. The editor stayed empty until
+    /// something else drew the window.
+    #[gpui::test]
+    fn rows_that_get_shorter_under_a_view_at_the_end_are_drawn_at_the_end(cx: &mut TestAppContext) {
+        let (frame, input, cx) = at_the_end_of_rows_that_wrap(cx);
+        let frames = |cx: &mut VisualTestContext| frame.read_with(cx, |frame, _| frame.frames);
+        let numbered = wrapped_frame(&input, cx);
+        let long = height_of_rows(&input, cx);
+        let was = place_of(&input, cx);
+
+        // The numbers go, and with them a line of every row.
+        let before = frames(cx);
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx)
+        });
+        let bare = wrapped_frame(&input, cx);
+        assert_eq!(bare.rebuilds, numbered.rebuilds + 1);
+        assert_eq!(frames(cx), before + 1, "one frame, and none after it");
+        let short = height_of_rows(&input, cx);
+        let editor = input.read_with(cx, |state, _| state.input_bounds.size.height);
+        assert!(
+            long - short > editor,
+            "shorter by more than the editor is high: {long:?} to {short:?}"
+        );
+        assert!(
+            -was.left_at > short,
+            "where the view was is below the last row"
+        );
+
+        let cut = place_of(&input, cx);
+        let end = end_of(short, &input, cx);
+        assert_eq!(
+            (cut.drawn_at, cut.left_at),
+            (end, end),
+            "drawn at the end of the text, where the editor is left"
+        );
+        assert_eq!(cut.rows.end, 300);
+        assert!(cut.rows.start < 299, "{cut:?}");
+        assert!(cut.in_view > 0, "rows of the text in view: {cut:?}");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.first_visible_row()),
+            Some(cut.rows.start)
+        );
+        // What the paint cuts to, and a wheel after it, is that end as well.
+        let paint_cuts_to = input.read_with(cx, |state, _| {
+            (state.input_bounds.size.height - state.scroll_size.height).min(px(0.))
+        });
+        assert_eq!(paint_cuts_to, end);
+
+        // And the next frame has nothing to put right.
+        input.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(frames(cx), before + 2);
+        assert_eq!(place_of(&input, cx), cut);
+
+        // The same when it is the editor that gets wider.
+        let before = frames(cx);
+        frame.update(cx, |frame, cx| {
+            frame.width = None;
+            cx.notify();
+        });
+        wrapped_frame(&input, cx);
+        assert_eq!(frames(cx), before + 1);
+        let shorter = height_of_rows(&input, cx);
+        assert!(short - shorter > editor, "{short:?} to {shorter:?}");
+        let wide = place_of(&input, cx);
+        let end = end_of(shorter, &input, cx);
+        assert_eq!((wide.drawn_at, wide.left_at), (end, end));
+        assert_eq!(wide.rows.end, 300);
+        assert!(wide.in_view > 0, "{wide:?}");
+    }
+
+    /// The scrollbar is laid out after the text, so it finds the view where
+    /// it was cut to and shows that as it shows a scroll: its thumb comes,
+    /// and goes again by its own timer. An editor nothing else draws is
+    /// drawn for that fade and no longer.
+    ///
+    /// (The bar itself is made before the frame, for the height the frame
+    /// before left: its thumb stands where it would in the longer text until
+    /// the next frame, as it does after anything that changes how long the
+    /// text is.)
+    #[gpui::test]
+    fn the_scrollbar_shows_a_view_that_was_cut_and_fades(cx: &mut TestAppContext) {
+        let (frame, input, cx) = at_the_end_of_rows_that_wrap(cx);
+        let frames = |cx: &mut VisualTestContext| frame.read_with(cx, |frame, _| frame.frames);
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx)
+        });
+        cx.run_until_parked();
+        let cut = frames(cx);
+
+        cx.executor().advance_clock(Duration::from_secs(10));
+        let faded = frames(cx);
+        assert!(
+            (1..=16).contains(&(faded - cut)),
+            "{} frames for the fade",
+            faded - cut
+        );
+        cx.executor().advance_clock(Duration::from_secs(60));
+        assert_eq!(frames(cx), faded, "still drawing after the fade");
+    }
+
+    /// Not when a scroll is waiting to be made as the rows get shorter: the
+    /// frame is laid out for where that one goes, and the paint makes it, as
+    /// it did. Cutting ahead of it would show the scrollbar a place that no
+    /// frame is drawn at -- it is laid out after the text and before the
+    /// paint -- and it would light its thumb there, and draw the frames to
+    /// fade it again.
+    #[gpui::test]
+    fn a_scroll_waiting_to_be_made_is_not_cut_ahead_of(cx: &mut TestAppContext) {
+        let (frame, input, cx) = at_the_end_of_rows_that_wrap(cx);
+        let frames = |cx: &mut VisualTestContext| frame.read_with(cx, |frame, _| frame.frames);
+
+        let before = frames(cx);
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx);
+            state.scroll_to_row(0, cx);
+        });
+        wrapped_frame(&input, cx);
+        let top = place_of(&input, cx);
+        assert_eq!((top.drawn_at, top.left_at), (px(0.), px(0.)));
+        assert_eq!(top.rows.start, 0);
+        assert_eq!(frames(cx), before + 1);
+
+        // A scroll made while a frame is painted lights no thumb in it, and
+        // sets no timer to fade one.
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert_eq!(frames(cx), before + 1, "a thumb was lit, and faded");
+    }
+
+    /// The cut does not ask what left the view past the end. An offset a
+    /// host puts there, and an editor that gets higher under a view at the
+    /// end, were laid out for the old place and put right by the paint in
+    /// the same way, since before the rows were wrapped for a gutter.
+    #[gpui::test]
+    fn a_view_left_past_the_end_is_drawn_at_the_end(cx: &mut TestAppContext) {
+        let (frame, input, cx) = at_the_end_of_rows_that_wrap(cx);
+        let frames = |cx: &mut VisualTestContext| frame.read_with(cx, |frame, _| frame.frames);
+        // Where the one frame drawn since `before` has the text: at its end.
+        let drawn_at_the_end = |before: usize, cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            assert_eq!(frames(cx), before + 1, "one frame, and none after it");
+            let end = end_of(height_of_rows(&input, cx), &input, cx);
+            let place = place_of(&input, cx);
+            assert_eq!((place.drawn_at, place.left_at), (end, end));
+            assert_eq!(place.rows.end, 300);
+            assert!(place.in_view > 0, "{place:?}");
+            end
+        };
+        let was = place_of(&input, cx).left_at;
+
+        // A host scrolls it further than it goes.
+        let before = frames(cx);
+        input.update(cx, |state, cx| state.set_scroll_offset_y(px(100_000.), cx));
+        assert_eq!(drawn_at_the_end(before, cx), was);
+
+        // The window gets higher, and the last row stops further down in it.
+        let before = frames(cx);
+        cx.simulate_resize(gpui::size(px(1920.), px(1600.)));
+        assert!(drawn_at_the_end(before, cx) > was);
     }
 
     /// Nor does it take what is on the rows: a fold stays closed through the
@@ -2957,24 +3221,40 @@ mod tests {
         assert_eq!(narrow.rebuilds, narrower.rebuilds + 1);
     }
 
-    /// An editor that is nothing wide has no width to wrap at, and its rows
-    /// stay as they are: a pane that grows in from nothing is drawn so once,
-    /// and a row for every letter is the most a layout can come to.
-    #[gpui::test]
-    fn an_editor_that_is_nothing_wide_keeps_its_rows(cx: &mut TestAppContext) {
+    /// What the gutter and the room kept right of the caret leave of an
+    /// editor for its text, as of the last frame.
+    fn room_for_text(input: &Entity<InputState>, cx: &mut VisualTestContext) -> Pixels {
+        input.read_with(cx, |state, _| {
+            let layout = state.last_layout.as_ref().expect("a frame was drawn");
+            state.input_bounds.size.width - layout.line_number_width - RIGHT_MARGIN
+        })
+    }
+
+    /// An editor with no room for its text has no width to wrap at, and its
+    /// rows stay as they are: in a frame that is `narrow` wide, they are not
+    /// laid out for it.
+    fn an_editor_without_room_keeps_its_rows(
+        narrow: Pixels,
+        wrap_at: WrapAt,
+        cx: &mut TestAppContext,
+    ) {
         let text = long_and_short();
         let (frame, input, cx) = open_framed(
-            |state| state.code_editor("text").soft_wrap(true),
+            |state| state.code_editor("text").soft_wrap(true).wrap_at(wrap_at),
             &text,
-            Some(px(0.)),
+            Some(narrow),
             cx,
         );
-        input.read_with(cx, |state, _| {
-            assert!(state.last_layout.is_some(), "a frame was drawn");
-            assert_eq!(state.input_bounds.size.width, px(0.));
-            assert_eq!(state.text_wrapper.wrap_width, None);
-            assert_eq!(state.text_wrapper.rebuilds, 1);
-        });
+        let without_room = |cx: &mut VisualTestContext| {
+            let room = room_for_text(&input, cx);
+            assert!(room <= px(0.), "{room:?} for the text");
+            input.read_with(cx, |state, _| {
+                let editor = state.input_bounds.size.width;
+                assert_eq!(editor > px(0.), narrow > px(0.), "{editor:?}");
+                (state.text_wrapper.wrap_width, state.text_wrapper.rebuilds)
+            })
+        };
+        assert_eq!(without_room(cx), (None, 1));
 
         // It gets a width, and the rows are wrapped for it.
         frame.update(cx, |frame, cx| {
@@ -2986,20 +3266,119 @@ mod tests {
 
         // It loses the width again, and the rows wait for the next.
         frame.update(cx, |frame, cx| {
-            frame.width = Some(px(0.));
+            frame.width = Some(narrow);
             cx.notify();
         });
         cx.run_until_parked();
-        input.read_with(cx, |state, _| {
-            assert_eq!(state.input_bounds.size.width, px(0.));
-            assert_eq!(state.text_wrapper.wrap_width, Some(wide.width));
-            assert_eq!(state.text_wrapper.rebuilds, 2);
-        });
+        assert_eq!(without_room(cx), (Some(wide.width), 2));
         frame.update(cx, |frame, cx| {
             frame.width = None;
             cx.notify();
         });
         assert_eq!(wrapped_frame(&input, cx).rebuilds, 2);
+    }
+
+    /// An editor that is nothing wide has no width to wrap at, and its rows
+    /// stay as they are: a pane that grows in from nothing is drawn so once,
+    /// and a row for every letter is the most a layout can come to.
+    #[gpui::test]
+    fn an_editor_that_is_nothing_wide_keeps_its_rows(cx: &mut TestAppContext) {
+        an_editor_without_room_keeps_its_rows(px(0.), WrapAt::EditorWidth, cx);
+    }
+
+    /// Nor has one that is no wider than its gutter and the room kept right
+    /// of the caret: the pane that grows in is drawn so in the frame after,
+    /// and what is left of it for the text is less than nothing. (Every row
+    /// was laid out for that, a letter to a line.)
+    #[gpui::test]
+    fn an_editor_no_wider_than_its_gutter_keeps_its_rows(cx: &mut TestAppContext) {
+        an_editor_without_room_keeps_its_rows(px(100.), WrapAt::EditorWidth, cx);
+    }
+
+    /// The same for rows that a column bounds: in an editor without room it
+    /// is the editor they would wrap at.
+    #[gpui::test]
+    fn rows_bounded_by_an_editor_no_wider_than_its_gutter_are_kept(cx: &mut TestAppContext) {
+        // More columns than the window has room for.
+        an_editor_without_room_keeps_its_rows(px(100.), WrapAt::Bounded(10_000), cx);
+    }
+
+    /// Rows that wrap at a column do not ask what is left of the editor.
+    /// They wrap at their column in one that is no wider than its gutter,
+    /// as they did.
+    #[gpui::test]
+    fn rows_at_a_column_wrap_in_an_editor_no_wider_than_its_gutter(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (_, input, cx) = open_framed(
+            |state| {
+                state
+                    .code_editor("text")
+                    .soft_wrap(true)
+                    .wrap_at(WrapAt::Column(40))
+            },
+            &text,
+            Some(px(100.)),
+            cx,
+        );
+        assert!(room_for_text(&input, cx) <= px(0.));
+        input.read_with(cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            let wrapper = &state.text_wrapper;
+            assert!(layout.wrap_width.is_some_and(|width| width > px(0.)));
+            assert_eq!(wrapper.wrap_width, layout.wrap_width);
+            assert_eq!(wrapper.rebuilds, 2, "for the text, and for the column");
+            let lines = wrapper.lines[0].lines_len();
+            assert!(lines > 200, "forty columns of ten thousand: {lines}");
+        });
+    }
+
+    /// In an editor that is nothing wide they wait, as they did: the frame
+    /// does not hand the column over, and soft wrap turned on after it does
+    /// not take it from that frame. One with a width brings it.
+    #[gpui::test]
+    fn rows_at_a_column_wait_in_an_editor_that_is_nothing_wide(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (frame, input, cx) = open_framed(
+            |state| {
+                state
+                    .code_editor("text")
+                    .soft_wrap(true)
+                    .wrap_at(WrapAt::Column(40))
+            },
+            &text,
+            Some(px(0.)),
+            cx,
+        );
+        let laid_out = |state: &InputState| {
+            let wrapper = &state.text_wrapper;
+            (wrapper.wrap_width, wrapper.rebuilds)
+        };
+        let column = input.update_in(cx, |state, window, cx| {
+            assert_eq!(state.input_bounds.size.width, px(0.));
+            let layout = state.last_layout.as_ref().expect("a frame was drawn");
+            let column = layout.wrap_width;
+            assert!(column.is_some_and(|width| width > px(0.)));
+            assert_eq!(laid_out(state), (None, 1));
+
+            state.set_soft_wrap(true, window, cx);
+            assert_eq!(laid_out(state), (None, 1), "no width yet");
+            column
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| {
+            assert_eq!(laid_out(state), (None, 1), "nor in that frame");
+        });
+
+        frame.update(cx, |frame, cx| {
+            frame.width = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| {
+            assert_eq!(laid_out(state), (column, 2));
+            let lines = state.text_wrapper.lines[0].lines_len();
+            assert!(lines > 200, "forty columns of ten thousand: {lines}");
+        });
     }
 
     /// When the gutter moves in the same breath -- a view of a diff turns its
@@ -3037,23 +3416,25 @@ mod tests {
         assert!(wrapped.rows[0].2 > 1, "the long row wraps");
     }
 
-    /// A frame that was nothing wide left no width to wrap at either: soft
-    /// wrap turned on after it waits for one that has a width, as it does
-    /// before the first.
-    #[gpui::test]
-    fn soft_wrap_turned_on_in_an_editor_that_is_nothing_wide_waits_for_a_width(
+    /// A frame without room for the text left no width to wrap at either:
+    /// soft wrap turned on after it, in an editor that is `narrow` wide,
+    /// waits for a frame that has one, as it does before the first.
+    fn soft_wrap_turned_on_in_an_editor_without_room_waits_for_a_width(
+        narrow: Pixels,
         cx: &mut TestAppContext,
     ) {
         let text = long_and_short();
         let (frame, input, cx) = open_framed(
             |state| state.code_editor("text").soft_wrap(false),
             &text,
-            Some(px(0.)),
+            Some(narrow),
             cx,
         );
+        let room = room_for_text(&input, cx);
+        assert!(room <= px(0.), "{room:?} for the text");
         input.update_in(cx, |state, window, cx| {
-            assert!(state.last_layout.is_some(), "a frame was drawn");
-            assert_eq!(state.input_bounds.size.width, px(0.));
+            let editor = state.input_bounds.size.width;
+            assert_eq!(editor > px(0.), narrow > px(0.), "{editor:?}");
 
             state.set_soft_wrap(true, window, cx);
             assert_eq!(state.text_wrapper.wrap_width, None, "no width yet");
@@ -3072,6 +3453,26 @@ mod tests {
         let wrapped = wrapped_frame(&input, cx);
         assert!(wrapped.rows[0].2 > 1, "the long row wraps");
         assert_eq!(wrapped.rebuilds, 2);
+    }
+
+    /// A frame that was nothing wide left no width to wrap at either: soft
+    /// wrap turned on after it waits for one that has a width, as it does
+    /// before the first.
+    #[gpui::test]
+    fn soft_wrap_turned_on_in_an_editor_that_is_nothing_wide_waits_for_a_width(
+        cx: &mut TestAppContext,
+    ) {
+        soft_wrap_turned_on_in_an_editor_without_room_waits_for_a_width(px(0.), cx);
+    }
+
+    /// Nor did a frame that was no wider than its gutter: what it left of
+    /// the editor is less than nothing. (Soft wrap turned on after it laid
+    /// every row out for that, a letter to a line.)
+    #[gpui::test]
+    fn soft_wrap_turned_on_in_an_editor_no_wider_than_its_gutter_waits_for_a_width(
+        cx: &mut TestAppContext,
+    ) {
+        soft_wrap_turned_on_in_an_editor_without_room_waits_for_a_width(px(100.), cx);
     }
 
     /// An input that grows with its text is as many rows high as its text

@@ -1059,6 +1059,42 @@ impl TextElement {
         (visible_range, visible_top)
     }
 
+    /// How far past the last line the view may scroll (#252). `Half` is
+    /// what this was before it became a setting.
+    fn empty_bottom_height(
+        state: &InputState,
+        input_height: Pixels,
+        line_height: Pixels,
+    ) -> Pixels {
+        if !state.mode.is_code_editor() {
+            return px(0.);
+        }
+
+        match state.mode.scroll_beyond_last_line() {
+            super::mode::ScrollBeyondLastLine::Off => px(0.),
+            super::mode::ScrollBeyondLastLine::Half => {
+                input_height.half().max(BOTTOM_MARGIN_ROWS * line_height)
+            }
+            super::mode::ScrollBeyondLastLine::Page => input_height,
+            super::mode::ScrollBeyondLastLine::Rows(n) => f32::from(n) * line_height,
+        }
+    }
+
+    /// How high everything the view scrolls over is, in an input that is
+    /// `input_height` high.
+    ///
+    /// **One truth for the height**: the wrapper counts the text rows and
+    /// everything inserted under them, so the ghost lines must not be added
+    /// a second time here.
+    fn content_height(state: &InputState, input_height: Pixels, line_height: Pixels) -> Pixels {
+        state.text_wrapper.total_height(line_height)
+            + Self::empty_bottom_height(state, input_height, line_height)
+            // Without these the last row cannot be scrolled to, and the
+            // pad below it would never come into view (#255 / ADR-0090).
+            + state.mode.padding_top()
+            + state.mode.padding_bottom()
+    }
+
     /// Return (line_number_width, line_number_len)
     fn layout_line_numbers(
         state: &InputState,
@@ -1724,19 +1760,22 @@ impl Element for TextElement {
         // rows was drawn from the old ones: what asked for the next frame
         // was a `cx.notify()` from the paint, which gpui does not take for a
         // reason to draw while it is drawing.
-        let (line_number_width, line_number_len, wrap_width) = {
+        let (line_number_width, line_number_len, wrap_width, has_width) = {
             let state = self.state.read(cx);
             let (line_number_width, line_number_len) =
                 Self::layout_line_numbers(state, &state.text, text_size, &style, window);
 
+            // What the gutter and the room kept right of the caret leave of
+            // the editor.
+            let viewport = bounds.size.width - line_number_width - RIGHT_MARGIN;
+            let wrap_at = state.mode.wrap_at();
             let wrap_width = if state.mode.is_multi_line() && state.soft_wrap {
-                let viewport = bounds.size.width - line_number_width - RIGHT_MARGIN;
                 // A fixed column has to be measured the same way the rulers are,
                 // or the text would not break on the line that marks it.
                 let column = |n: usize| {
                     crate::input::rulers::column_advance(&style, text_size, window) * n as f32
                 };
-                Some(match state.mode.wrap_at() {
+                Some(match wrap_at {
                     WrapAt::EditorWidth => viewport,
                     WrapAt::Column(n) => column(n),
                     WrapAt::Bounded(n) => column(n).min(viewport),
@@ -1745,18 +1784,30 @@ impl Element for TextElement {
                 None
             };
 
-            (line_number_width, line_number_len, wrap_width)
+            // **No room for the text is no width to wrap at.** A pane that
+            // grows in from nothing is drawn nothing wide once, and no wider
+            // than its gutter and the room right of the caret for a frame or
+            // two after: what is left of it is nothing, or less. Wrapping for
+            // that puts every letter on a line of its own -- the most a
+            // layout can come to -- so the rows keep the width they have.
+            //
+            // For the frame that is nothing wide, that is what came of it
+            // before as well: the paint looked for a width other than the
+            // last, and an input starts from none. The frames after it did
+            // lay every row out a letter to a line.
+            let has_width = match wrap_at {
+                WrapAt::EditorWidth | WrapAt::Bounded(_) => viewport > px(0.),
+                // A column does not ask what is left of the editor. It waits
+                // for one that is anything wide, as it did.
+                WrapAt::Column(_) => bounds.size.width > px(0.),
+            };
+
+            (line_number_width, line_number_len, wrap_width, has_width)
         };
 
-        // **Nothing wide is no width to wrap at.** A pane that grows in from
-        // nothing is drawn so once, and wrapping for it puts every letter on
-        // a line of its own -- the most a layout can come to. The rows keep
-        // the width they have, which is what came of it before as well: the
-        // paint looked for a width other than the last, and an input starts
-        // from none.
-        let has_width = bounds.size.width > px(0.);
+        let line_height = window.line_height();
 
-        self.state.update(cx, |state, cx| {
+        let content_height = self.state.update(cx, |state, cx| {
             if wrap_width.is_some() && !has_width {
                 state.text_wrapper.set_font(font, text_size, cx);
             } else {
@@ -1790,10 +1841,36 @@ impl Element for TextElement {
                 }
             }
             state.text_wrapper.set_extra_rows(extra);
+
+            // **Before anything asks where the text is scrolled to.** A view
+            // near the end of the text can be past its end by now: the rows
+            // were wrapped for more room a moment ago -- the line numbers
+            // went -- or the editor got higher, or a host put it there
+            // (`set_scroll_offset_y`). The offset used to be cut once the
+            // frame was painted (`update_scroll_offset`), which is after the
+            // frame was laid out for the old one: with the view further past
+            // the end than the editor is high, no row of the text was in it.
+            // And nothing drew the next frame -- what asked for it was a
+            // `cx.notify()` from the paint (dopamine #894).
+            //
+            // The same cut, to the same height, a frame sooner. The
+            // scrollbar is laid out after this, and shows it as it shows a
+            // scroll. Not while a scroll is waiting to be made
+            // (`deferred_scroll_offset`): the frame is laid out for that one,
+            // and the paint cuts it as it did.
+            let content_height = Self::content_height(state, bounds.size.height, line_height);
+            if state.mode.is_multi_line() && state.deferred_scroll_offset.is_none() {
+                let least = (bounds.size.height - content_height).min(px(0.));
+                let mut offset = state.scroll_handle.offset();
+                if offset.y < least {
+                    offset.y = least;
+                    state.scroll_handle.set_offset(offset);
+                }
+            }
+            content_height
         });
 
         let state = self.state.read(cx);
-        let line_height = window.line_height();
 
         let (visible_range, visible_top) =
             self.calculate_visible_range(&state, line_height, bounds.size.height);
@@ -1993,23 +2070,6 @@ impl Element for TextElement {
         let ghost_line_count = ghost_lines.len();
         let ghost_lines_height = ghost_line_count as f32 * line_height;
 
-        // How far past the last line the view may scroll (#252). `Half` is
-        // what this was before it became a setting.
-        let empty_bottom_height = if state.mode.is_code_editor() {
-            match state.mode.scroll_beyond_last_line() {
-                super::mode::ScrollBeyondLastLine::Off => px(0.),
-                super::mode::ScrollBeyondLastLine::Half => bounds
-                    .size
-                    .height
-                    .half()
-                    .max(BOTTOM_MARGIN_ROWS * line_height),
-                super::mode::ScrollBeyondLastLine::Page => bounds.size.height,
-                super::mode::ScrollBeyondLastLine::Rows(n) => f32::from(n) * line_height,
-            }
-        } else {
-            px(0.)
-        };
-
         // Columns past the longest line (#252, `scrollBeyondLastColumn`).
         let beyond_column = {
             let n = state.mode.scroll_margins().0;
@@ -2026,16 +2086,9 @@ impl Element for TextElement {
                 } else {
                     longest_line_width
                 },
-            // **One truth for the height**: the wrapper counts the text rows
-            // and everything inserted under them, so the ghost lines must not
-            // be added a second time here.
-            (state.text_wrapper.total_height(line_height)
-                + empty_bottom_height
-                // Without these the last row cannot be scrolled to, and the
-                // pad below it would never come into view (#255 / ADR-0090).
-                + state.mode.padding_top()
-                + state.mode.padding_bottom())
-            .max(bounds.size.height),
+            // The height the offset was cut to above, so that the paint cuts
+            // it to the same.
+            content_height.max(bounds.size.height),
         );
 
         // `position_for_index` for example

@@ -2385,11 +2385,7 @@ impl InputState {
             // font, before the first frame brought the width (dopamine #878).
             // The frame is what brings it, as it does for an input made with
             // soft wrap on (`TextElement::prepaint`).
-            let drawn = self
-                .last_layout
-                .as_ref()
-                .filter(|_| self.input_bounds.size.width > px(0.));
-            if let Some(last_layout) = drawn {
+            if let Some(last_layout) = self.last_layout.as_ref() {
                 // What that frame wrapped at -- or, when it did not wrap,
                 // what its gutter left of the editor. The next frame hands
                 // over the width it finds, whatever is put here; this is the
@@ -2402,7 +2398,13 @@ impl InputState {
                     self.input_bounds.size.width - last_layout.line_number_width - RIGHT_MARGIN,
                 );
 
-                self.text_wrapper.set_wrap_width(Some(wrap_width), cx);
+                // A frame that was nothing wide, or no wider than its gutter,
+                // left none either: nothing of the editor, or less, and every
+                // row laid out for that is a letter to a line. It waits for a
+                // frame that has one, as before the first.
+                if self.input_bounds.size.width > px(0.) && wrap_width > px(0.) {
+                    self.text_wrapper.set_wrap_width(Some(wrap_width), cx);
+                }
             }
 
             // Reset scroll to left 0
