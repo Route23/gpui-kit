@@ -194,7 +194,6 @@ impl TextElement {
         let mut offset_y = last_layout.visible_top;
         let mut last_indents: Vec<(usize, Pixels)> = vec![];
         for ix in visible_range {
-            let line = state.text.slice_line(ix);
             let Some(line_layout) = last_layout.line(ix) else {
                 continue;
             };
@@ -203,6 +202,7 @@ impl TextElement {
             if line_layout.wrapped_lines.is_empty() {
                 continue;
             }
+            let line = state.text.slice_line(ix);
 
             let mut current_indents = vec![];
             if line.len() > 0 {

@@ -646,6 +646,17 @@ impl TextElement {
 
         let mut chevrons = vec![];
         for (ix, row) in last_layout.visible_range.clone().enumerate() {
+            // Hidden by a fold: no height, so nowhere to draw. It used to get
+            // a chevron anyway -- painted where the first row below the fold
+            // is, one glyph per foldable row of the body on top of each other,
+            // every frame. That is the chevron that showed on a row that
+            // cannot be folded (dopamine #876).
+            if last_layout
+                .line(row)
+                .is_some_and(|line| line.wrapped_lines.is_empty())
+            {
+                continue;
+            }
             if !state.is_foldable(row) {
                 continue;
             }
@@ -700,6 +711,13 @@ impl TextElement {
         let mut markers = vec![];
         for (ix, row) in last_layout.visible_range.clone().enumerate() {
             if !state.is_folded(row) {
+                continue;
+            }
+            // A folded header inside another fold is hidden itself.
+            if last_layout
+                .line(row)
+                .is_some_and(|line| line.wrapped_lines.is_empty())
+            {
                 continue;
             }
             let line = window.text_system().shape_line(

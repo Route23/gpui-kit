@@ -448,7 +448,12 @@ pub(crate) struct LineLayout {
     /// Total bytes length of this line.
     len: usize,
     /// The soft wrapped lines of this line (Include the first line).
-    pub(crate) wrapped_lines: SmallVec<[ShapedLine; 1]>,
+    ///
+    /// **On the heap, not inline.** A `ShapedLine` is 3 KB (it carries 32
+    /// decoration runs inline), and a row hidden by a fold has none -- but
+    /// still has a `LineLayout`, one per row of the fold, every frame. Inline
+    /// storage made a 3,700-row fold cost 12 MB a frame (dopamine #876).
+    pub(crate) wrapped_lines: Vec<ShapedLine>,
     pub(crate) longest_width: Pixels,
 }
 
@@ -464,7 +469,7 @@ impl LineLayout {
         Self {
             len,
             longest_width: px(0.),
-            wrapped_lines: SmallVec::new(),
+            wrapped_lines: Vec::new(),
         }
     }
 
@@ -472,7 +477,7 @@ impl LineLayout {
         Self {
             len: 0,
             longest_width: px(0.),
-            wrapped_lines: SmallVec::new(),
+            wrapped_lines: Vec::new(),
         }
     }
 
@@ -489,7 +494,7 @@ impl LineLayout {
             .max()
             .unwrap_or_default();
         self.longest_width = width;
-        self.wrapped_lines = wrapped_lines;
+        self.wrapped_lines = wrapped_lines.into_vec();
     }
 
     #[inline]

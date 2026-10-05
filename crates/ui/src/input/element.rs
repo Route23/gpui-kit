@@ -1301,27 +1301,59 @@ impl TextElement {
         };
         let highlighter = highlighter.as_ref()?;
 
-        let mut offset = visible_byte_range.start;
-        let mut styles = vec![];
-
-        for line in text
-            .iter_lines()
-            .skip(visible_range.start)
-            .take(visible_range.len())
-        {
-            let line_len = if is_multi_line {
-                // +1 for `\n`
-                line.len() + 1
-            } else {
-                line.len()
+        // One entry per row on screen, and one per run of rows a fold hides.
+        //
+        // A fold keeps its body inside `visible_range` (one `LineLayout` per
+        // row, see `layout_lines`), so a folded block used to be styled row by
+        // row as if it were on screen. It gets one unstyled span instead: the
+        // runs are counted by position, so the bytes still have to be there.
+        let lines = &state.text_wrapper.lines;
+        let hidden_at = |row: usize| lines.get(row).is_some_and(|line| line.hidden);
+        let mut rows: Vec<(Range<usize>, bool)> = Vec::with_capacity(visible_range.len());
+        if is_multi_line {
+            let lines_len = text.lines_len();
+            // Where `row` starts. `+ 1` is for the `\n`; the last row has
+            // none, and has always been counted as if it did.
+            let row_start = |row: usize| {
+                if row >= lines_len {
+                    text.len() + 1
+                } else {
+                    text.line_start_offset(row)
+                }
             };
-
-            let range = offset..offset + line_len;
-            let line_styles = highlighter.styles(&range, &cx.theme().highlight_theme);
-            styles = gpui::combine_highlights(styles, line_styles).collect();
-
-            offset = range.end;
+            let end_row = visible_range.end.min(lines_len);
+            let mut row = visible_range.start;
+            let mut start = visible_byte_range.start;
+            while row < end_row {
+                let hidden = hidden_at(row);
+                let mut next = row + 1;
+                while hidden && next < end_row && hidden_at(next) {
+                    next += 1;
+                }
+                let end = row_start(next);
+                rows.push((start..end, hidden));
+                start = end;
+                row = next;
+            }
+        } else {
+            let mut offset = visible_byte_range.start;
+            for line in text
+                .iter_lines()
+                .skip(visible_range.start)
+                .take(visible_range.len())
+            {
+                let range = offset..offset + line.len();
+                offset = range.end;
+                rows.push((range, false));
+            }
         }
+        let hidden_spans: Vec<Range<usize>> = rows
+            .iter()
+            .filter(|(_, hidden)| *hidden)
+            .map(|(range, _)| range.clone())
+            .collect();
+
+        let mut styles = highlighter.styles_for_rows(rows, &cx.theme().highlight_theme);
 
         let diagnostic_styles = diagnostics.styles_for_range(
             &visible_byte_range,
@@ -1364,6 +1396,7 @@ impl TextElement {
                     Some((span.range.clone(), color))
                 })
                 .collect();
+            let colors = outside_spans(colors, &hidden_spans);
             styles = overwrite_colors(styles, &colors);
         }
 
@@ -1393,11 +1426,62 @@ impl TextElement {
             .into_iter()
             .map(|(range, depth)| (range, brackets::depth_color(base, depth)))
             .collect();
+            // The brackets a fold hides still count towards the depth of the
+            // ones below it; they just are not painted.
+            let colors = outside_spans(colors, &hidden_spans);
             styles = overwrite_colors(styles, &colors);
         }
 
         Some(styles)
     }
+}
+
+/// `overlay` without the entries that lie inside one of `spans`.
+///
+/// `spans` is sorted and its entries never overlap (the runs of rows a fold
+/// hides). Nothing in there is painted, and every entry left in would split
+/// the one unstyled span those rows share into a run of its own.
+///
+/// An entry that starts inside a span and **ends past it** stays: the part
+/// past it is on a row that shows. (A bracket is one character and a server's
+/// token one row, so that takes spans that are stale -- which they are between
+/// a keystroke and the server's answer.)
+fn outside_spans(
+    overlay: Vec<(Range<usize>, Hsla)>,
+    spans: &[Range<usize>],
+) -> Vec<(Range<usize>, Hsla)> {
+    if spans.is_empty() {
+        return overlay;
+    }
+    overlay
+        .into_iter()
+        .filter(|(range, _)| {
+            let at = spans.partition_point(|span| span.end <= range.start);
+            spans
+                .get(at)
+                .is_none_or(|span| span.start > range.start || range.end > span.end)
+        })
+        .collect()
+}
+
+/// `styles` cut at both ends of `marked`, so that what lies inside `marked` is
+/// made of ranges of its own. Nothing is added, dropped or restyled.
+fn split_at(
+    styles: Vec<(Range<usize>, HighlightStyle)>,
+    marked: &Range<usize>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut out = Vec::with_capacity(styles.len() + 2);
+    for (range, style) in styles {
+        let mut at = range.start;
+        for cut in [marked.start, marked.end] {
+            if cut > at && cut < range.end {
+                out.push((at..cut, style));
+                at = cut;
+            }
+        }
+        out.push((at..range.end, style));
+    }
+    out
 }
 
 /// Force `color` onto the styles covering each range in `overlay`.
@@ -1412,12 +1496,25 @@ fn overwrite_colors(
     if overlay.is_empty() {
         return styles;
     }
+    // Sorted and never overlapping is what the doc above promises. When it
+    // holds, the entries that touch a style are a binary search away; walking
+    // the whole overlay for every style is what made a screenful of brackets
+    // cost styles x brackets (dopamine #876). When it does not hold, walk.
+    let ordered = overlay.iter().all(|(r, _)| r.start <= r.end)
+        && overlay.windows(2).all(|w| w[0].0.end <= w[1].0.start);
     let mut out = Vec::with_capacity(styles.len() + overlay.len() * 2);
     for (range, style) in styles {
         let mut at = range.start;
-        for (hit, color) in overlay.iter().filter(|(r, _)| {
-            r.start < range.end && r.end > range.start
-        }) {
+        let first = if ordered {
+            overlay.partition_point(|(r, _)| r.end <= range.start)
+        } else {
+            0
+        };
+        for (hit, color) in overlay[first..]
+            .iter()
+            .take_while(|(r, _)| !ordered || r.start < range.end)
+            .filter(|(r, _)| r.start < range.end && r.end > range.start)
+        {
             if hit.start > at {
                 out.push((at..hit.start, style));
             }
@@ -1439,7 +1536,7 @@ pub(super) struct PrepaintState {
     /// The lines only contains the visible lines in the viewport, based on `visible_range`.
     ///
     /// The child is the soft lines.
-    line_numbers: Option<Vec<SmallVec<[ShapedLine; 1]>>>,
+    line_numbers: Option<Vec<Vec<ShapedLine>>>,
     /// Size of the scrollable area by entire lines.
     scroll_size: Size<Pixels>,
     cursor_bounds: Option<Bounds<Pixels>>,
@@ -1740,6 +1837,19 @@ impl Element for TextElement {
             if let Some(highlight_styles) = highlight_styles {
                 let mut runs = vec![];
 
+                // The text being composed is underlined below only where a
+                // style range lies inside it, so it has to be a range of its
+                // own. It used to be one by accident, and only sometimes: a
+                // row inside an injected region was cut wherever a later
+                // capture of that region started. Those cuts are gone
+                // (dopamine #876); this is the one that was meant.
+                let highlight_styles = match &state.ime_marked_range {
+                    Some(marked) if marked.start < marked.end => {
+                        split_at(highlight_styles, &(marked.start..marked.end))
+                    }
+                    _ => highlight_styles,
+                };
+
                 runs.extend(highlight_styles.iter().map(|(range, style)| {
                     let mut run = text_style.clone().highlight(*style).to_run(range.len());
                     if let Some(ime_marked_range) = &state.ime_marked_range {
@@ -1993,7 +2103,10 @@ impl Element for TextElement {
                 // matching the row. (An empty *buffer* line still has one
                 // wrapped line, so this only ever means "hidden".)
                 if line.wrapped_lines.is_empty() {
-                    line_numbers.push(SmallVec::new());
+                    // On the heap for the same reason as
+                    // `LineLayout::wrapped_lines`: an inline `ShapedLine` is
+                    // 3 KB, and this is one entry per row of the fold.
+                    line_numbers.push(Vec::new());
                     continue;
                 }
                 // `Relative` / `Interval` do not simply count up, and may leave a
@@ -2019,7 +2132,7 @@ impl Element for TextElement {
                     &other_line_runs
                 };
 
-                let mut sub_lines: SmallVec<[ShapedLine; 1]> = SmallVec::new();
+                let mut sub_lines: Vec<ShapedLine> = Vec::with_capacity(line.wrapped_lines.len());
                 sub_lines.push(
                     window
                         .text_system()
@@ -3072,5 +3185,175 @@ mod tests {
         assert_eq!(result[4].color, gpui::black());
         assert_eq!(result[5].color, gpui::blue());
     }
-}
 
+    /// `overwrite_colors` as it was: every overlay entry tried against every
+    /// style. Kept to check the search against (dopamine #876).
+    fn overwrite_colors_by_walking(
+        styles: Vec<(Range<usize>, HighlightStyle)>,
+        overlay: &[(Range<usize>, Hsla)],
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        if overlay.is_empty() {
+            return styles;
+        }
+        let mut out = Vec::with_capacity(styles.len() + overlay.len() * 2);
+        for (range, style) in styles {
+            let mut at = range.start;
+            for (hit, color) in overlay
+                .iter()
+                .filter(|(r, _)| r.start < range.end && r.end > range.start)
+            {
+                if hit.start > at {
+                    out.push((at..hit.start, style));
+                }
+                let mut colored = style;
+                colored.color = Some(*color);
+                out.push((hit.start.max(range.start)..hit.end.min(range.end), colored));
+                at = hit.end.min(range.end);
+            }
+            if at < range.end {
+                out.push((at..range.end, style));
+            }
+        }
+        out
+    }
+
+    /// Numbers that look random and are the same on every run.
+    struct Dice(u64);
+
+    impl Dice {
+        fn roll(&mut self, below: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % below.max(1)
+        }
+    }
+
+    /// The brackets and the server's tokens arrive sorted and apart, and are
+    /// found by a search then; anything else is still walked. Either way the
+    /// colours land where they always did.
+    #[test]
+    fn the_overlay_search_gives_what_the_walk_gave() {
+        let colors = [gpui::red(), gpui::green(), gpui::blue()];
+        let mut dice = Dice(876);
+        for round in 0..3000 {
+            // The styles of some rows: one after another, a gap now and then.
+            let mut styles = vec![];
+            let mut at = dice.roll(5);
+            for _ in 0..dice.roll(12) {
+                let end = at + 1 + dice.roll(9);
+                let mut style = HighlightStyle::default();
+                if dice.roll(3) != 0 {
+                    style.color = Some(colors[dice.roll(3)]);
+                }
+                styles.push((at..end, style));
+                at = end + if dice.roll(5) == 0 { dice.roll(4) } else { 0 };
+            }
+
+            let mut overlay = vec![];
+            let mut at = dice.roll(6);
+            for _ in 0..dice.roll(10) {
+                let end = at + dice.roll(4);
+                overlay.push((at..end, colors[dice.roll(3)]));
+                at = end + dice.roll(7);
+            }
+            // One round in four out of order, to take the walk.
+            if dice.roll(4) == 0 && overlay.len() > 1 {
+                let last = overlay.len() - 1;
+                overlay.swap(0, last);
+            }
+
+            assert_eq!(
+                overwrite_colors(styles.clone(), &overlay),
+                overwrite_colors_by_walking(styles.clone(), &overlay),
+                "round {round}: {overlay:?} over {styles:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_a_fold_hides_is_left_out_of_the_overlay() {
+        let red = gpui::red();
+        let overlay = vec![
+            (2..3, red),
+            (10..11, red),
+            (19..20, red),
+            (20..21, red),
+            (30..31, red),
+            (39..40, red),
+            (40..41, red),
+        ];
+        assert_eq!(outside_spans(overlay.clone(), &[]), overlay);
+        assert_eq!(
+            outside_spans(overlay, &[10..20, 30..40]),
+            vec![(2..3, red), (20..21, red), (40..41, red)]
+        );
+
+        // One that starts in what is hidden and ends on the row below stays:
+        // that row shows.
+        let straddling = vec![(12..14, red), (18..22, red), (30..40, red), (38..41, red)];
+        assert_eq!(
+            outside_spans(straddling, &[10..20, 30..40]),
+            vec![(18..22, red), (38..41, red)]
+        );
+    }
+
+    /// The text being composed is underlined where a style range lies inside
+    /// it; cutting the ranges at its ends is what makes that all of it.
+    #[test]
+    fn the_marked_text_becomes_ranges_of_its_own() {
+        let plain = HighlightStyle::default();
+        let mut red = HighlightStyle::default();
+        red.color = Some(gpui::red());
+
+        // Inside one range, across two, and exactly on the ends.
+        let styles = vec![(0..10, plain), (10..20, red), (20..30, plain)];
+        assert_eq!(
+            split_at(styles.clone(), &(3..6)),
+            vec![(0..3, plain), (3..6, plain), (6..10, plain), (10..20, red), (20..30, plain)]
+        );
+        assert_eq!(
+            split_at(styles.clone(), &(8..14)),
+            vec![(0..8, plain), (8..10, plain), (10..14, red), (14..20, red), (20..30, plain)]
+        );
+        assert_eq!(split_at(styles.clone(), &(10..20)), styles);
+        assert_eq!(split_at(styles.clone(), &(40..50)), styles);
+
+        // Nothing is added or dropped: the lengths still add up, in order.
+        let mut dice = Dice(923);
+        for _ in 0..2000 {
+            let mut styles = vec![];
+            let mut at = dice.roll(4);
+            let start = at;
+            for _ in 0..dice.roll(8) {
+                let end = at + dice.roll(7);
+                styles.push((at..end, if dice.roll(2) == 0 { plain } else { red }));
+                at = end;
+            }
+            let from = dice.roll(at + 3);
+            let marked = from..from + 1 + dice.roll(9);
+            let cut = split_at(styles.clone(), &marked);
+            let mut pos = start;
+            for (range, _) in &cut {
+                assert_eq!(range.start, pos);
+                pos = range.end;
+            }
+            assert_eq!(pos, at);
+            // Every piece is inside the marked text or outside it, never across.
+            for (range, _) in cut.iter().filter(|(r, _)| !r.is_empty()) {
+                let inside = range.start >= marked.start && range.end <= marked.end;
+                let outside = range.end <= marked.start || range.start >= marked.end;
+                assert!(inside || outside, "{range:?} straddles {marked:?}");
+            }
+            // And each keeps the style of the range it was cut from.
+            for (range, style) in cut.iter().filter(|(r, _)| !r.is_empty()) {
+                let from = styles
+                    .iter()
+                    .find(|(r, _)| r.start <= range.start && range.end <= r.end)
+                    .expect("cut from one of the ranges");
+                assert_eq!(*style, from.1);
+            }
+        }
+    }
+}

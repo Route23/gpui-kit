@@ -289,11 +289,14 @@ pub fn match_at(
 
 /// Whether `offset` falls inside a string or a comment.
 ///
-/// `skip` is sorted and merged (see `SyntaxHighlighter::skipped_ranges`), so a
-/// binary search would do; the list is a handful of entries per screen, and a
-/// scan keeps the caller free to pass anything sorted.
+/// `skip` is sorted and merged (see `SyntaxHighlighter::skipped_ranges`), so
+/// the one span that could hold `offset` is a binary search away. It used to
+/// be a scan, on the grounds that a screen has a handful of spans -- but a fold
+/// keeps its body inside the visible range, and the scan runs once per
+/// character of it (dopamine #876).
 fn is_skipped(offset: usize, skip: &[Range<usize>]) -> bool {
-    skip.iter().any(|r| r.contains(&offset))
+    let at = skip.partition_point(|r| r.end <= offset);
+    skip.get(at).is_some_and(|r| r.start <= offset)
 }
 
 /// The pair `ch` at `at` belongs to, scanning in the direction it opens.
@@ -329,8 +332,7 @@ pub(super) fn enclosing(
     let start = bounds.start.min(offset);
     let mut depth = vec![0usize; pairs.len()];
     let mut at = offset;
-    while at > start {
-        let ch = prev_char_from(text, at)?;
+    for ch in chars_before(text, offset, start)? {
         at -= ch.len_utf8();
         if is_skipped(at, skip) {
             continue;
@@ -358,10 +360,22 @@ fn scan_forward(
     skip: &[Range<usize>],
 ) -> Option<usize> {
     let end = bounds.end.min(text.len());
+    if from >= end {
+        return None;
+    }
+    // Not on a char boundary means no char starts here; `chars_at` would
+    // panic, and this runs while painting.
+    if !text.is_char_boundary(from) {
+        return None;
+    }
+    // One pass, not one rope lookup per character: the partner of a folded
+    // block's opener is the whole body away (dopamine #876).
     let mut depth = 0usize;
     let mut at = from;
-    while at < end {
-        let ch = text.char_at(at)?;
+    for ch in text.chars_at(from) {
+        if at >= end {
+            break;
+        }
         if is_skipped(at, skip) {
             at += ch.len_utf8();
             continue;
@@ -390,8 +404,7 @@ fn scan_backward(
     let start = bounds.start.min(from);
     let mut depth = 0usize;
     let mut at = from;
-    while at > start {
-        let ch = prev_char_from(text, at)?;
+    for ch in chars_before(text, from, start)? {
         at -= ch.len_utf8();
         if is_skipped(at, skip) {
             continue;
@@ -408,14 +421,28 @@ fn scan_backward(
     None
 }
 
-/// The character ending at `at`.
-fn prev_char_from(text: &Rope, at: usize) -> Option<char> {
-    // Not on a char boundary means no char ends here; `chars_at` would
-    // panic, and this runs while painting.
-    if at == 0 || !text.is_char_boundary(at) {
+/// The characters that end at `from` or before it, backwards, down to the one
+/// that ends just after `start`.
+///
+/// `None` when no character ends at `from` (it is not on a char boundary) and
+/// there was something to read -- the scans give up there, as they did when
+/// they read one character at a time.
+fn chars_before(
+    text: &Rope,
+    from: usize,
+    start: usize,
+) -> Option<impl Iterator<Item = char> + '_> {
+    // Nothing to read is not a failure.
+    let from = if from > start { from } else { 0 };
+    if from != 0 && !text.is_char_boundary(from) {
         return None;
     }
-    text.chars_at(at).reversed().next()
+    let mut at = from;
+    Some(text.chars_at(from).reversed().take_while(move |ch| {
+        let more = at > start;
+        at = at.saturating_sub(ch.len_utf8());
+        more
+    }))
 }
 
 /// Every bracket in `range`, with the nesting depth it sits at.
@@ -442,11 +469,25 @@ pub fn depths_in(
     // One counter shared by every kind, or one per kind when the colours are
     // pooled separately (VS Code's `independentColorPoolPerBracketType`).
     let mut depth = vec![0usize; if per_type { pairs.len() } else { 1 }];
+    // Not on a char boundary means no char starts here; `chars_at` would
+    // panic, and this runs while painting.
+    if range.start >= end || !text.is_char_boundary(range.start) {
+        return out;
+    }
+    // One pass over the text and one over `skip`, side by side. Reading each
+    // character by its offset is a walk down the rope every time, and a fold
+    // keeps its whole body inside `range` (dopamine #876).
+    let mut skip_at = skip.partition_point(|r| r.end <= range.start);
     let mut at = range.start;
-    while at < end {
-        let Some(ch) = text.char_at(at) else { break };
+    for ch in text.chars_at(range.start) {
+        if at >= end {
+            break;
+        }
         let len = ch.len_utf8();
-        if is_skipped(at, skip) {
+        while skip.get(skip_at).is_some_and(|r| r.end <= at) {
+            skip_at += 1;
+        }
+        if skip.get(skip_at).is_some_and(|r| r.start <= at) {
             at += len;
             continue;
         }
@@ -519,11 +560,21 @@ pub fn pairs_in(
     let end = range.end.min(text.len());
     let mut open: Vec<(Range<usize>, char, usize)> = Vec::new();
     let mut out = Vec::new();
+    // The same single pass as `depths_in`, for the same reason.
+    if range.start >= end || !text.is_char_boundary(range.start) {
+        return out;
+    }
+    let mut skip_at = skip.partition_point(|r| r.end <= range.start);
     let mut at = range.start;
-    while at < end {
-        let Some(ch) = text.char_at(at) else { break };
+    for ch in text.chars_at(range.start) {
+        if at >= end {
+            break;
+        }
         let len = ch.len_utf8();
-        if is_skipped(at, skip) {
+        while skip.get(skip_at).is_some_and(|r| r.end <= at) {
+            skip_at += 1;
+        }
+        if skip.get(skip_at).is_some_and(|r| r.start <= at) {
             at += len;
             continue;
         }
@@ -836,6 +887,346 @@ mod tests {
                 MatchBrackets::Always,
                 0..rope.len(),
                 &[],
+            );
+        }
+    }
+
+    /// `is_skipped` as it was before it became a binary search.
+    fn is_skipped_by_scanning(offset: usize, skip: &[Range<usize>]) -> bool {
+        skip.iter().any(|r| r.contains(&offset))
+    }
+
+    /// `depths_in` as it was: one rope lookup per character, one scan of
+    /// `skip` per character. Kept to check the single pass against (dopamine
+    /// #876).
+    fn depths_in_by_offset(
+        text: &Rope,
+        range: Range<usize>,
+        language: &str,
+        skip: &[Range<usize>],
+        per_type: bool,
+    ) -> Vec<(Range<usize>, usize)> {
+        let pairs: Vec<Pair> = pairs_for(language)
+            .into_iter()
+            .filter(|p| p.open != p.close)
+            .collect();
+        let end = range.end.min(text.len());
+        let mut out = Vec::new();
+        let mut depth = vec![0usize; if per_type { pairs.len() } else { 1 }];
+        let mut at = range.start;
+        while at < end {
+            let Some(ch) = text.char_at(at) else { break };
+            let len = ch.len_utf8();
+            if is_skipped_by_scanning(at, skip) {
+                at += len;
+                continue;
+            }
+            if let Some(i) = pairs.iter().position(|p| p.open == ch) {
+                let slot = if per_type { i } else { 0 };
+                out.push((at..at + len, depth[slot]));
+                depth[slot] += 1;
+            } else if let Some(i) = pairs.iter().position(|p| p.close == ch) {
+                let slot = if per_type { i } else { 0 };
+                if depth[slot] > 0 {
+                    depth[slot] -= 1;
+                    out.push((at..at + len, depth[slot]));
+                }
+            }
+            at += len;
+        }
+        out
+    }
+
+    /// Numbers that look random and are the same on every run.
+    struct Dice(u64);
+
+    impl Dice {
+        fn roll(&mut self, below: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % below.max(1)
+        }
+    }
+
+    /// Sorted, merged spans, the way `SyntaxHighlighter::skipped_ranges` hands
+    /// them over -- some of them empty, some ending past `len`.
+    fn spans(dice: &mut Dice, len: usize) -> Vec<Range<usize>> {
+        let mut out = vec![];
+        let mut at = dice.roll(6);
+        while at < len + 4 && dice.roll(6) != 0 {
+            let end = at + dice.roll(7);
+            out.push(at..end);
+            at = end + 1 + dice.roll(8);
+        }
+        out
+    }
+
+    #[test]
+    fn the_binary_search_finds_what_the_scan_found() {
+        let mut dice = Dice(876);
+        for round in 0..2000 {
+            let skip = spans(&mut dice, 60);
+            for offset in 0..70 {
+                assert_eq!(
+                    is_skipped(offset, &skip),
+                    is_skipped_by_scanning(offset, &skip),
+                    "round {round}: {offset} in {skip:?}"
+                );
+            }
+        }
+    }
+
+    /// The depth of a bracket below a fold counts the brackets the fold hides,
+    /// so the scan still reads all of them -- in one pass now. Same brackets,
+    /// same depths, wherever the range starts and whatever is skipped.
+    #[test]
+    fn one_pass_gives_the_depths_the_lookups_gave() {
+        let alphabet = ['(', ')', '[', ']', '{', '}', 'a', ' ', '\n', '"', '日', 'é', '<', '>'];
+        let mut dice = Dice(707);
+        for round in 0..1500 {
+            let text: String = (0..dice.roll(80))
+                .map(|_| alphabet[dice.roll(alphabet.len())])
+                .collect();
+            let rope = Rope::from(text.as_str());
+            let skip = spans(&mut dice, text.len());
+            // Starts in the middle of a character and past the end included.
+            let start = dice.roll(text.len() + 3);
+            let range = start..start + dice.roll(text.len() + 3);
+            for per_type in [false, true] {
+                assert_eq!(
+                    depths_in(&rope, range.clone(), "rust", &skip, per_type),
+                    depths_in_by_offset(&rope, range.clone(), "rust", &skip, per_type),
+                    "round {round}: {range:?} of {text:?}, skipping {skip:?}, per type {per_type}"
+                );
+            }
+        }
+    }
+
+    /// The scans as they were: one rope lookup per character. Kept to check the
+    /// single pass against (dopamine #876).
+    mod by_offset {
+        use super::super::*;
+
+        fn is_skipped(offset: usize, skip: &[Range<usize>]) -> bool {
+            skip.iter().any(|r| r.contains(&offset))
+        }
+
+        fn prev_char_from(text: &Rope, at: usize) -> Option<char> {
+            if at == 0 || !text.is_char_boundary(at) {
+                return None;
+            }
+            text.chars_at(at).reversed().next()
+        }
+
+        fn scan_forward(
+            text: &Rope,
+            from: usize,
+            p: Pair,
+            bounds: &Range<usize>,
+            skip: &[Range<usize>],
+        ) -> Option<usize> {
+            let end = bounds.end.min(text.len());
+            let mut depth = 0usize;
+            let mut at = from;
+            while at < end {
+                let ch = text.char_at(at)?;
+                if is_skipped(at, skip) {
+                    at += ch.len_utf8();
+                    continue;
+                }
+                if ch == p.open {
+                    depth += 1;
+                } else if ch == p.close {
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                    depth -= 1;
+                }
+                at += ch.len_utf8();
+            }
+            None
+        }
+
+        fn scan_backward(
+            text: &Rope,
+            from: usize,
+            p: Pair,
+            bounds: &Range<usize>,
+            skip: &[Range<usize>],
+        ) -> Option<usize> {
+            let start = bounds.start.min(from);
+            let mut depth = 0usize;
+            let mut at = from;
+            while at > start {
+                let ch = prev_char_from(text, at)?;
+                at -= ch.len_utf8();
+                if is_skipped(at, skip) {
+                    continue;
+                }
+                if ch == p.close {
+                    depth += 1;
+                } else if ch == p.open {
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                    depth -= 1;
+                }
+            }
+            None
+        }
+
+        fn partner_of(
+            text: &Rope,
+            at: usize,
+            ch: char,
+            pairs: &[Pair],
+            bounds: &Range<usize>,
+            skip: &[Range<usize>],
+        ) -> Option<(Range<usize>, Range<usize>)> {
+            if let Some(p) = pairs.iter().find(|p| p.open == ch) {
+                let close = scan_forward(text, at + ch.len_utf8(), *p, bounds, skip)?;
+                return Some((at..at + ch.len_utf8(), close..close + p.close.len_utf8()));
+            }
+            if let Some(p) = pairs.iter().find(|p| p.close == ch) {
+                let open = scan_backward(text, at, *p, bounds, skip)?;
+                return Some((open..open + p.open.len_utf8(), at..at + ch.len_utf8()));
+            }
+            None
+        }
+
+        fn enclosing(
+            text: &Rope,
+            offset: usize,
+            pairs: &[Pair],
+            bounds: &Range<usize>,
+            skip: &[Range<usize>],
+        ) -> Option<(Range<usize>, Range<usize>)> {
+            let start = bounds.start.min(offset);
+            let mut depth = vec![0usize; pairs.len()];
+            let mut at = offset;
+            while at > start {
+                let ch = prev_char_from(text, at)?;
+                at -= ch.len_utf8();
+                if is_skipped(at, skip) {
+                    continue;
+                }
+                if let Some(i) = pairs.iter().position(|p| p.close == ch) {
+                    depth[i] += 1;
+                } else if let Some(i) = pairs.iter().position(|p| p.open == ch) {
+                    if depth[i] == 0 {
+                        let p = pairs[i];
+                        let close = scan_forward(text, at + ch.len_utf8(), p, bounds, skip)?;
+                        return Some((at..at + ch.len_utf8(), close..close + p.close.len_utf8()));
+                    }
+                    depth[i] -= 1;
+                }
+            }
+            None
+        }
+
+        pub(super) fn match_at(
+            text: &Rope,
+            offset: usize,
+            language: &str,
+            mode: MatchBrackets,
+            bounds: Range<usize>,
+            skip: &[Range<usize>],
+        ) -> Option<(Range<usize>, Range<usize>)> {
+            if matches!(mode, MatchBrackets::Never) {
+                return None;
+            }
+            let pairs: Vec<Pair> = pairs_for(language)
+                .into_iter()
+                .filter(|p| p.open != p.close)
+                .collect();
+            if let Some(next) = text.char_at(offset) {
+                if !is_skipped(offset, skip) {
+                    if let Some(found) = partner_of(text, offset, next, &pairs, &bounds, skip) {
+                        return Some(found);
+                    }
+                }
+            }
+            if let Some(prev) = prev_char(text, offset) {
+                let start = offset - prev.len_utf8();
+                if !is_skipped(start, skip) {
+                    if let Some(found) = partner_of(text, start, prev, &pairs, &bounds, skip) {
+                        return Some(found);
+                    }
+                }
+            }
+            if matches!(mode, MatchBrackets::Near) {
+                return None;
+            }
+            enclosing(text, offset, &pairs, &bounds, skip)
+        }
+
+        pub(super) fn pairs_in(
+            text: &Rope,
+            range: Range<usize>,
+            language: &str,
+            skip: &[Range<usize>],
+        ) -> Vec<(Range<usize>, Range<usize>, usize)> {
+            let pairs: Vec<Pair> = pairs_for(language)
+                .into_iter()
+                .filter(|p| p.open != p.close)
+                .collect();
+            let end = range.end.min(text.len());
+            let mut open: Vec<(Range<usize>, char, usize)> = Vec::new();
+            let mut out = Vec::new();
+            let mut at = range.start;
+            while at < end {
+                let Some(ch) = text.char_at(at) else { break };
+                let len = ch.len_utf8();
+                if is_skipped(at, skip) {
+                    at += len;
+                    continue;
+                }
+                if pairs.iter().any(|p| p.open == ch) {
+                    let depth = open.len();
+                    open.push((at..at + len, ch, depth));
+                } else if let Some(p) = pairs.iter().find(|p| p.close == ch) {
+                    if let Some(ix) = open.iter().rposition(|(_, c, _)| *c == p.open) {
+                        let (opener, _, depth) = open.remove(ix);
+                        out.push((opener, at..at + len, depth));
+                    }
+                }
+                at += len;
+            }
+            out.sort_by_key(|(o, _, _)| o.start);
+            out
+        }
+    }
+
+    /// The partner of a folded block's opener is the whole body away, so the
+    /// scans read the text in one pass now. Same pair, wherever the caret is --
+    /// in the middle of a character and outside the bounds included.
+    #[test]
+    fn one_pass_finds_the_partner_the_lookups_found() {
+        let alphabet = ['(', ')', '[', ']', '{', '}', 'a', ' ', '\n', '"', '日', 'é'];
+        let mut dice = Dice(881);
+        for round in 0..2500 {
+            let text: String = (0..dice.roll(60))
+                .map(|_| alphabet[dice.roll(alphabet.len())])
+                .collect();
+            let rope = Rope::from(text.as_str());
+            let skip = spans(&mut dice, text.len());
+            let start = dice.roll(text.len() + 2);
+            let bounds = start..start + dice.roll(text.len() + 3);
+            // The caret is never past the end of the text.
+            let offset = dice.roll(text.len() + 1);
+            for mode in [MatchBrackets::Always, MatchBrackets::Near, MatchBrackets::Never] {
+                assert_eq!(
+                    match_at(&rope, offset, "rust", mode, bounds.clone(), &skip),
+                    by_offset::match_at(&rope, offset, "rust", mode, bounds.clone(), &skip),
+                    "round {round}: caret {offset} in {text:?}, bounds {bounds:?}, skipping {skip:?}, {mode:?}"
+                );
+            }
+            assert_eq!(
+                pairs_in(&rope, bounds.clone(), "rust", &skip),
+                by_offset::pairs_in(&rope, bounds.clone(), "rust", &skip),
+                "round {round}: pairs in {bounds:?} of {text:?}, skipping {skip:?}"
             );
         }
     }
