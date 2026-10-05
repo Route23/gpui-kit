@@ -4466,6 +4466,15 @@ impl EntityInputHandler for InputState {
             return;
         }
 
+        // Text that is being composed moves the caret as typing does, and no
+        // key goes down for it: an input method takes the keys before the
+        // input sees them. A fade is paused here instead, or it would go on
+        // being stepped behind the text for as long as it is composed
+        // (dopamine #902). `Blink` is left as it was: it blinks through.
+        if self.mode.cursor_blinking().needs_animation() {
+            self.pause_blink_cursor(cx);
+        }
+
         self.lsp.reset();
 
         let range = range_utf16

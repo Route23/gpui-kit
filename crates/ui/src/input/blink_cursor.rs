@@ -8,6 +8,12 @@ use super::caret::{self, CursorBlinking};
 
 static INTERVAL: Duration = Duration::from_millis(500);
 static PAUSE_DELAY: Duration = Duration::from_millis(300);
+/// How long a cursor that the element started goes on running after the caret
+/// was last painted: see [`BlinkCursor::request_frame`].
+///
+/// A caret that is still showing is painted more often than this -- a step of
+/// a fade is a thirtieth of a second, the pause after a key 300ms.
+static PAINTED_FOR: Duration = Duration::from_secs(1);
 
 /// Wait for `duration`, on the timer the blink has always run on.
 #[cfg(not(test))]
@@ -28,6 +34,43 @@ fn now(cx: &App) -> Instant {
     cx.background_executor().now()
 }
 
+/// Wait until `due`, a time on that clock.
+async fn sleep_until(due: Instant, cx: &AsyncApp) {
+    sleep(
+        due.saturating_duration_since(cx.background_executor().now()),
+        cx,
+    )
+    .await;
+}
+
+/// How long the frame that asks for a step still takes to draw and present,
+/// as a test plays it. See [`BlinkCursor::wait_for_step`].
+///
+/// With a display behind the window, the task that waits for the step is not
+/// polled before that. A test polls it the moment it is spawned -- its clock
+/// only moves once every task has had its turn -- so the time is put in by
+/// hand.
+#[cfg(test)]
+mod rest_of_frame {
+    use std::{cell::Cell, time::Duration};
+
+    thread_local! {
+        static REST: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    pub(super) fn get() -> Duration {
+        REST.with(Cell::get)
+    }
+
+    /// `ask`, in a frame that takes `rest` more.
+    pub(super) fn of<R>(rest: Duration, ask: impl FnOnce() -> R) -> R {
+        REST.with(|cell| cell.set(rest));
+        let asked = ask();
+        REST.with(|cell| cell.set(Duration::ZERO));
+        asked
+    }
+}
+
 /// To manage the Input cursor blinking.
 ///
 /// [`CursorBlinking::Blink`] toggles `visible` on a 500ms timer and notifies
@@ -44,8 +87,14 @@ pub(crate) struct BlinkCursor {
     paused: bool,
     epoch: usize,
     /// Started and not stopped since: the input has the focus, so there is a
-    /// caret on screen to blink. See [`Self::pause`].
+    /// caret on screen to blink. See [`Self::running`].
     active: bool,
+    /// Started by the element painting a fade, with nothing said through
+    /// [`Self::start`] -- and nothing will say that it has stopped either.
+    /// See [`Self::request_frame`].
+    by_paint: bool,
+    /// When the element last painted a fade that can be seen.
+    painted: Instant,
     /// The style the last [`Self::start`] was given, so [`Self::pause`] knows
     /// whether to resume the timer.
     style: CursorBlinking,
@@ -66,6 +115,8 @@ impl BlinkCursor {
             paused: false,
             epoch: 0,
             active: false,
+            by_paint: false,
+            painted: Instant::now(),
             style: CursorBlinking::default(),
             cycle_start: Instant::now(),
             frame: None,
@@ -81,6 +132,7 @@ impl BlinkCursor {
     /// ([`Self::request_frame`]).
     pub fn start(&mut self, style: CursorBlinking, cx: &mut Context<Self>) {
         self.active = true;
+        self.by_paint = false;
         self.style = style;
         self.cycle_start = now(cx);
         // The cycle starts over: a step of the last one is no longer due.
@@ -98,12 +150,13 @@ impl BlinkCursor {
             // there does not get the window drawn again: left to that frame,
             // a caret that comes back with the window or the focus would stay
             // solid until something else drew it.
-            self.request_frame(cx);
+            self.wait_for_step(cx);
         }
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.active = false;
+        self.by_paint = false;
         self.epoch = 0;
         self.frame = None;
         cx.notify();
@@ -127,25 +180,79 @@ impl BlinkCursor {
     /// How long the cycle has been going. `None` while there is none: the
     /// cursor is paused, or not running at all -- the caret is solid then.
     fn elapsed(&self, cx: &App) -> Option<Duration> {
-        (self.active && !self.paused).then(|| now(cx).saturating_duration_since(self.cycle_start))
+        (self.running(cx) && !self.paused)
+            .then(|| now(cx).saturating_duration_since(self.cycle_start))
+    }
+
+    /// Whether there is a caret on screen to blink: started, and not stopped
+    /// since.
+    ///
+    /// A cursor that the element started ([`Self::request_frame`]) has nobody
+    /// to stop it. It is running for as long as its caret keeps being
+    /// painted, and no longer.
+    fn running(&self, cx: &App) -> bool {
+        self.active
+            && (!self.by_paint || now(cx).saturating_duration_since(self.painted) < PAINTED_FOR)
     }
 
     /// Have the caret painted again when the next step of its fade is due.
     ///
     /// The element calls this each time it paints a caret that can be seen,
-    /// and the notify the timer ends in gets it painted again -- a loop for
-    /// exactly as long as there is a fade to watch. Not while the blink is
-    /// paused (typing: the caret is solid, and resuming notifies by itself),
-    /// not after the input lost the focus, and not for a caret that is
-    /// scrolled out of view: for those, the step already on its timer is the
-    /// last.
+    /// with the style it painted it in, and the notify the timer ends in gets
+    /// it painted again -- a loop for exactly as long as there is a fade to
+    /// watch. The element does not ask for a caret it does not paint (the
+    /// input lost the focus, the window went to the back) or that is scrolled
+    /// out of view, and nothing is waited for while the blink is paused
+    /// (typing: the caret is solid, and resuming notifies by itself): for
+    /// those, the step already on its timer is the last.
+    ///
+    /// **A fade that is painted runs, whether the cursor was started or
+    /// not.** [`Self::start`] and [`Self::stop`] come from the state's focus
+    /// listeners, and those are on the window the state was made with. A host
+    /// that makes it with another window in hand than the one it draws it in
+    /// (a settings window that rebuilds the editors of the main one, in
+    /// dopamine) gets a state that hears of the focus in neither -- and a
+    /// cursor that is not running has no phase and waits for no step, so that
+    /// caret stayed solid for good. The element only paints a caret for the
+    /// input that has the focus in the window it is drawing, so being asked
+    /// from there is as good as being started: a cursor that is not running
+    /// starts here. Nobody is going to stop that one, so it runs for as long
+    /// as it keeps being asked, and [`PAINTED_FOR`] after the last time.
+    ///
+    /// Only a fade, which is stepped by the paints it brings about and ends
+    /// with them. `Blink` is switched by a timer that runs whether anything is
+    /// painted or not, and with nothing to stop it that would be dopamine
+    /// #930 again: it is left to [`Self::start`].
     ///
     /// The element used to ask for an animation frame on every frame it drew
     /// instead. That notifies the view being drawn at the rate of the
     /// display: in an application that caches none of its views, the whole
     /// window 60 to 144 times a second for as long as the editor had the
     /// focus, typing or not (dopamine #902).
-    pub fn request_frame(&mut self, cx: &mut Context<Self>) {
+    pub fn request_frame(&mut self, style: CursorBlinking, cx: &mut Context<Self>) {
+        if !style.needs_animation() {
+            return;
+        }
+        if !self.running(cx) {
+            // The frame being painted shows it solid (`phase`), and the cycle
+            // begins from there.
+            self.start(style, cx);
+            self.by_paint = true;
+        }
+        self.painted = now(cx);
+        self.wait_for_step(cx);
+    }
+
+    /// Wait for the next step of the fade, unless one is being waited for.
+    ///
+    /// When the step is due is settled here, while the caret is painted, and
+    /// the wait is for what is left of that when the task is first polled --
+    /// which is not before the frame that asked has been drawn and presented.
+    /// Counted from there, every step would come that much late, by a few
+    /// milliseconds that are not the same twice: on a display whose refresh
+    /// the steps fall just ahead of, some would make that refresh and some
+    /// the one after.
+    fn wait_for_step(&mut self, cx: &mut Context<Self>) {
         if self.frame.is_some() || !self.style.needs_animation() {
             return;
         }
@@ -153,9 +260,14 @@ impl BlinkCursor {
             return;
         };
 
-        let wait = caret::next_fade_frame(elapsed);
+        let due = self.cycle_start + elapsed + caret::next_fade_frame(elapsed);
+        #[cfg(test)]
+        let rest = rest_of_frame::get();
         self.frame = Some(cx.spawn(async move |this, cx| {
-            sleep(wait, cx).await;
+            // Where a window would still be drawing the frame that asked.
+            #[cfg(test)]
+            sleep(rest, cx).await;
+            sleep_until(due, cx).await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
                     this.frame = None;
@@ -207,7 +319,7 @@ impl BlinkCursor {
     /// (dopamine #930). With "reduce motion" on as well: the style it resumed
     /// in is the one the last `start` was given, and there had been none.
     pub fn pause(&mut self, cx: &mut Context<Self>) {
-        if !self.active {
+        if !self.running(cx) {
             return;
         }
         self.paused = true;
@@ -345,7 +457,7 @@ mod tests {
 
         // It never waits for a step of a fade.
         cursor.update(cx, |cursor, cx| {
-            cursor.request_frame(cx);
+            cursor.request_frame(CursorBlinking::Blink, cx);
             assert!(cursor.frame.is_none());
         });
     }
@@ -404,7 +516,7 @@ mod tests {
             notified.set(0);
 
             for _ in 0..5 {
-                cursor.update(cx, |cursor, cx| cursor.request_frame(cx));
+                cursor.update(cx, |cursor, cx| cursor.request_frame(blinking, cx));
             }
             cx.executor().advance_clock(caret::FADE_TICK - ns(1));
             assert_eq!(notified.get(), 0, "{blinking:?}");
@@ -415,7 +527,7 @@ mod tests {
             // tick after it -- not a tick after the paint.
             let late = Duration::from_millis(10);
             cx.executor().advance_clock(late);
-            cursor.update(cx, |cursor, cx| cursor.request_frame(cx));
+            cursor.update(cx, |cursor, cx| cursor.request_frame(blinking, cx));
             cx.executor().advance_clock(caret::FADE_TICK - late - ns(1));
             assert_eq!(notified.get(), 1, "{blinking:?}");
             cx.executor().advance_clock(ns(1));
@@ -427,6 +539,49 @@ mod tests {
         }
     }
 
+    /// The wait for a step counts from the paint that asked for it, not from
+    /// when the task that waits is first polled -- which is not before the
+    /// frame that asked is drawn and presented. The step is on the grid
+    /// however long that takes; and when it takes longer than there was left
+    /// to wait, the step comes as soon as the frame is out of the way.
+    #[gpui::test]
+    fn a_step_does_not_wait_for_the_rest_of_its_frame_as_well(cx: &mut TestAppContext) {
+        let (ms, ns) = (Duration::from_millis, Duration::from_nanos);
+        for blinking in FADES {
+            let (cursor, notified, _watch) = cursor(cx);
+            // Painted 2ms after a step, in a frame that takes `rest` more.
+            let paint = |rest: Duration, cx: &mut TestAppContext| {
+                cx.executor().advance_clock(ms(2));
+                rest_of_frame::of(rest, || {
+                    cursor.update(cx, |cursor, cx| cursor.request_frame(blinking, cx))
+                });
+            };
+
+            cursor.update(cx, |cursor, cx| cursor.start(blinking, cx));
+            cx.run_until_parked();
+            notified.set(0);
+            cx.executor().advance_clock(caret::FADE_TICK);
+            assert_eq!(notified.get(), 1, "{blinking:?}");
+
+            for (step, rest) in [ms(0), ms(3), ms(7), ms(20)].into_iter().enumerate() {
+                paint(rest, cx);
+                cx.executor()
+                    .advance_clock(caret::FADE_TICK - ms(2) - ns(1));
+                assert_eq!(notified.get(), 1 + step, "{blinking:?}, {rest:?}: early");
+                cx.executor().advance_clock(ns(1));
+                assert_eq!(notified.get(), 2 + step, "{blinking:?}, {rest:?}: late");
+            }
+
+            // 40ms is longer than a tick: the step was due before the frame
+            // was over.
+            paint(ms(40), cx);
+            cx.executor().advance_clock(ms(40) - ns(1));
+            assert_eq!(notified.get(), 5, "{blinking:?}: before its frame was over");
+            cx.executor().advance_clock(ns(1));
+            assert_eq!(notified.get(), 6, "{blinking:?}: waited again");
+        }
+    }
+
     /// Painted every time it notifies -- which is what the element does -- a
     /// fade is 30 frames a second. That is the whole of what it costs.
     #[gpui::test]
@@ -435,8 +590,8 @@ mod tests {
             let (cursor, notified, _watch) = cursor(cx);
             // The element: paint, and ask for the next step.
             let _element = cx.update(|cx| {
-                cx.observe(&cursor, |cursor, cx| {
-                    cursor.update(cx, |cursor, cx| cursor.request_frame(cx))
+                cx.observe(&cursor, move |cursor, cx| {
+                    cursor.update(cx, |cursor, cx| cursor.request_frame(blinking, cx))
                 })
             });
             cursor.update(cx, |cursor, cx| cursor.start(blinking, cx));
@@ -458,7 +613,7 @@ mod tests {
             let (cursor, notified, _watch) = cursor(cx);
             cursor.update(cx, |cursor, cx| {
                 cursor.start(blinking, cx);
-                cursor.request_frame(cx);
+                cursor.request_frame(blinking, cx);
                 assert!(cursor.frame.is_some());
 
                 cursor.pause(cx);
@@ -466,7 +621,7 @@ mod tests {
                     cursor.frame.is_none(),
                     "{blinking:?}: still waiting for a step"
                 );
-                cursor.request_frame(cx);
+                cursor.request_frame(blinking, cx);
                 assert!(
                     cursor.frame.is_none(),
                     "{blinking:?}: took a step while paused"
@@ -482,38 +637,41 @@ mod tests {
             cx.executor().advance_clock(Duration::from_millis(1));
             assert_eq!(notified.get(), 1, "{blinking:?}");
             cursor.update(cx, |cursor, cx| {
-                cursor.request_frame(cx);
+                cursor.request_frame(blinking, cx);
                 assert!(cursor.frame.is_some(), "{blinking:?}");
             });
         }
     }
 
-    /// No step for a cursor that is not running, nor for one that has
-    /// stopped, nor for the styles that do not fade.
+    /// No step for the styles that do not fade, and being painted does not
+    /// start them: `Blink` is switched by a timer that runs whether the caret
+    /// is painted or not, and only `start` sets it going. A fade that has
+    /// stopped waits for no step either.
     #[gpui::test]
-    fn only_a_running_fade_waits_for_a_step(cx: &mut TestAppContext) {
+    fn only_a_fade_waits_for_a_step(cx: &mut TestAppContext) {
         let (cursor, notified, _watch) = cursor(cx);
         cursor.update(cx, |cursor, cx| {
-            // Never started.
-            cursor.request_frame(cx);
-            assert!(cursor.frame.is_none());
-
             for blinking in [CursorBlinking::Blink, CursorBlinking::Solid] {
+                // Never started, or stopped.
+                cursor.request_frame(blinking, cx);
+                assert!(!cursor.active, "{blinking:?}: started");
+                assert!(cursor.frame.is_none(), "{blinking:?}");
+                assert_eq!(cursor.epoch, 0, "{blinking:?}: a timer");
+
                 cursor.start(blinking, cx);
                 let epoch = cursor.epoch;
-                cursor.request_frame(cx);
+                cursor.request_frame(blinking, cx);
                 assert!(cursor.frame.is_none(), "{blinking:?}");
                 assert_eq!(cursor.epoch, epoch, "{blinking:?}");
+                cursor.stop(cx);
             }
 
             for blinking in FADES {
                 cursor.start(blinking, cx);
-                cursor.request_frame(cx);
+                cursor.request_frame(blinking, cx);
                 assert!(cursor.frame.is_some(), "{blinking:?}");
                 // Lost the focus: the step it was waiting for goes with it.
                 cursor.stop(cx);
-                assert!(cursor.frame.is_none(), "{blinking:?}");
-                cursor.request_frame(cx);
                 assert!(cursor.frame.is_none(), "{blinking:?}");
             }
         });
@@ -521,6 +679,95 @@ mod tests {
         notified.set(0);
         cx.executor().advance_clock(SECOND);
         assert_eq!(notified.get(), 0);
+    }
+
+    /// A fade that is painted runs, whether the cursor was started or not.
+    ///
+    /// A state hears of the focus on the window it was made with. Made with
+    /// another one than it is drawn in, it hears nothing, nobody starts its
+    /// cursor -- and that caret used to be painted solid for good.
+    #[gpui::test]
+    fn painting_a_fade_starts_a_cursor_nobody_started(cx: &mut TestAppContext) {
+        let ms = Duration::from_millis;
+        for blinking in FADES {
+            let (cursor, notified, _watch) = cursor(cx);
+            let phase =
+                |cx: &mut TestAppContext| cursor.read_with(cx, |cursor, cx| cursor.phase(cx));
+            // The element: paint -- which reads the phase -- and ask.
+            let element = cx.update(|cx| {
+                cx.observe(&cursor, move |cursor, cx| {
+                    cursor.update(cx, |cursor, cx| cursor.request_frame(blinking, cx))
+                })
+            });
+
+            // The frame it is first painted in is solid, whenever that is...
+            cx.executor().advance_clock(ms(1234));
+            assert_eq!(phase(cx), 0., "{blinking:?}");
+            cursor.update(cx, |cursor, cx| {
+                cursor.request_frame(blinking, cx);
+                assert!(cursor.by_paint, "{blinking:?}");
+                assert!(cursor.frame.is_some(), "{blinking:?}: no first step");
+            });
+            cx.run_until_parked();
+            notified.set(0);
+            // ...and the cycle begins there, at 30 frames a second.
+            cx.executor().advance_clock(ms(250));
+            assert_eq!(phase(cx), 0.25, "{blinking:?}");
+            cx.executor().advance_clock(ms(750));
+            assert_eq!(notified.get(), 30, "{blinking:?}");
+
+            // A key pauses it like any other cursor: solid, and no step.
+            cx.executor().advance_clock(ms(120));
+            cursor.update(cx, |cursor, cx| {
+                cursor.pause(cx);
+                assert!(cursor.paused, "{blinking:?}");
+                assert!(cursor.frame.is_none(), "{blinking:?}");
+            });
+            cx.run_until_parked();
+            notified.set(0);
+            cx.executor().advance_clock(PAUSE_DELAY - ms(1));
+            assert_eq!(phase(cx), 0., "{blinking:?}");
+            assert_eq!(notified.get(), 0, "{blinking:?}, paused");
+            cx.executor().advance_clock(ms(1) + SECOND);
+            assert_eq!(notified.get(), 1 + 30, "{blinking:?}, resumed");
+
+            // Nobody tells it that the focus has gone either: the caret is
+            // not painted any more, and that is all. It is running for a
+            // while yet, and then it is not.
+            drop(element);
+            cx.executor().advance_clock(PAINTED_FOR / 2);
+            assert_ne!(phase(cx), 0., "{blinking:?}: stopped at once");
+            cx.executor().advance_clock(PAINTED_FOR / 2 + ms(50));
+            assert_eq!(phase(cx), 0., "{blinking:?}");
+            notified.set(0);
+            // Moving the caret schedules nothing then (dopamine #930).
+            cursor.update(cx, |cursor, cx| {
+                let epoch = cursor.epoch;
+                cursor.pause(cx);
+                assert!(!cursor.paused, "{blinking:?}");
+                assert_eq!(cursor.epoch, epoch, "{blinking:?}: a resume was scheduled");
+            });
+            cx.executor().advance_clock(SECOND * 5);
+            assert_eq!(notified.get(), 0, "{blinking:?}, not painted");
+
+            // Painted again, it starts over: solid, and from there.
+            cursor.update(cx, |cursor, cx| cursor.request_frame(blinking, cx));
+            assert_eq!(phase(cx), 0., "{blinking:?}");
+            cx.executor().advance_clock(ms(100));
+            assert_eq!(phase(cx), 0.1, "{blinking:?}");
+
+            // Told after all -- an input is drawn with the focus before it
+            // hears of it -- it runs until it is told to stop, painted or
+            // not.
+            cursor.update(cx, |cursor, cx| {
+                cursor.start(blinking, cx);
+                assert!(!cursor.by_paint, "{blinking:?}");
+            });
+            cx.executor().advance_clock(PAINTED_FOR * 3 + ms(125));
+            assert_eq!(phase(cx), 0.125, "{blinking:?}");
+            cursor.update(cx, |cursor, cx| cursor.stop(cx));
+            assert_eq!(phase(cx), 0., "{blinking:?}");
+        }
     }
 
     /// 30 steps a second is a step of a tenth at the most: of the opacity for
@@ -555,8 +802,8 @@ mod tests {
             scroll::ScrollbarShow,
         };
         use gpui::{
-            IntoElement, ParentElement as _, Render, Styled as _, VisualTestContext, Window, div,
-            px, size,
+            AnyWindowHandle, EntityInputHandler as _, IntoElement, Modifiers, ParentElement as _,
+            Render, Styled as _, VisualTestContext, Window, div, point, px, size,
         };
         use std::cell::RefCell;
 
@@ -582,6 +829,16 @@ mod tests {
             }
         }
 
+        /// A window with nothing in it, for a state to be made in that is drawn
+        /// in another: see [`Editor::open_made_elsewhere`].
+        struct Elsewhere;
+
+        impl Render for Elsewhere {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
         /// An editor with the focus, in the window in front, on a display that
         /// refreshes `hz` times a second.
         struct Editor<'a> {
@@ -593,6 +850,9 @@ mod tests {
             /// one was.
             refreshes: u32,
             at: Duration,
+            /// The window the state was made in, when it is not the one it is
+            /// drawn in.
+            elsewhere: Option<AnyWindowHandle>,
         }
 
         impl<'a> Editor<'a> {
@@ -606,9 +866,73 @@ mod tests {
                 hz: u32,
                 cx: &'a mut TestAppContext,
             ) -> Self {
+                Self::init(cx);
+                Self::show(hz, None, cx, move |window, cx| {
+                    cx.new(|cx| Self::state(blinking, slide, window, cx))
+                })
+            }
+
+            /// An editor whose state was made with another window in hand
+            /// than the one it is drawn in.
+            ///
+            /// The state listens for the focus and for the window coming to
+            /// the front on the window it is made with, so this one hears of
+            /// neither: nothing starts its cursor and nothing stops it. A host
+            /// does it without noticing -- a click in the settings window of
+            /// dopamine rebuilds the editors of its main window, with the
+            /// window the click came in. The focus comes the way a click gives
+            /// it: to the handle, and nothing is said to the state.
+            fn open_made_elsewhere(
+                blinking: CursorBlinking,
+                hz: u32,
+                cx: &'a mut TestAppContext,
+            ) -> Self {
+                Self::init(cx);
+                let elsewhere = cx.add_window(|_, _| Elsewhere);
+                let input = elsewhere
+                    .update(cx, |_, window, cx| {
+                        window.activate_window();
+                        cx.new(|cx| Self::state(blinking, CaretAnimation::Off, window, cx))
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                Self::show(hz, Some(elsewhere.into()), cx, move |_, _| input)
+            }
+
+            fn init(cx: &mut TestAppContext) {
                 if !cx.has_global::<crate::Theme>() {
                     cx.update(crate::init);
                 }
+            }
+
+            /// A dozen rows of 120: a frame is cheap, and the caret can be
+            /// scrolled out of view.
+            fn state(
+                blinking: CursorBlinking,
+                slide: CaretAnimation,
+                window: &mut Window,
+                cx: &mut Context<InputState>,
+            ) -> InputState {
+                InputState::new(window, cx)
+                    .code_editor("text")
+                    .cursor_blinking(blinking)
+                    .caret_animation(slide)
+                    // Its fade after a scroll is a timer of its own, on the
+                    // wall clock: not counted here.
+                    .scrollbar_style(Some(ScrollbarShow::Always), true, true, 0, false, false)
+                    .default_value("let caret = blink();\n".repeat(120))
+            }
+
+            /// A window in front on the editor `make` hands over, with the
+            /// focus in it. Made `elsewhere`, the focus is only given to the
+            /// handle; otherwise the state is asked to take it, which starts
+            /// the blink there and then.
+            fn show(
+                hz: u32,
+                elsewhere: Option<AnyWindowHandle>,
+                cx: &'a mut TestAppContext,
+                make: impl FnOnce(&mut Window, &mut App) -> Entity<InputState> + 'static,
+            ) -> Self {
                 // Whatever the window before this one still had asked for.
                 display_frames::take();
 
@@ -617,23 +941,7 @@ mod tests {
                 let (_, cx) = cx.add_window_view({
                     let (frames, slot) = (frames.clone(), slot.clone());
                     move |window, cx| {
-                        let input = cx.new(|cx| {
-                            InputState::new(window, cx)
-                                .code_editor("text")
-                                .cursor_blinking(blinking)
-                                .caret_animation(slide)
-                                // Its fade after a scroll is a timer of its
-                                // own, on the wall clock: not counted here.
-                                .scrollbar_style(
-                                    Some(ScrollbarShow::Always),
-                                    true,
-                                    true,
-                                    0,
-                                    false,
-                                    false,
-                                )
-                                .default_value("let caret = blink();\n".repeat(120))
-                        });
+                        let input = make(window, cx);
                         *slot.borrow_mut() = Some(input.clone());
                         let host = cx.new(|_| Host { input, frames });
                         Root::new(host, window, cx)
@@ -641,22 +949,47 @@ mod tests {
                 });
                 let input = slot.take().unwrap();
 
-                // A dozen rows: a frame is cheap, and the caret can be
-                // scrolled out of view.
                 cx.simulate_resize(size(px(640.), px(280.)));
                 cx.update(|window, _| window.activate_window());
                 cx.run_until_parked();
-                input.update_in(cx, |input, window, cx| input.focus(window, cx));
-                cx.run_until_parked();
-
-                Self {
+                let mut editor = Self {
                     cx,
                     input,
                     frames,
                     hz,
                     refreshes: 0,
                     at: Duration::ZERO,
+                    elsewhere,
+                };
+                editor.focus();
+                editor
+            }
+
+            /// Give the editor the focus: see [`Self::show`].
+            fn focus(&mut self) {
+                if self.elsewhere.is_some() {
+                    let handle = self
+                        .input
+                        .read_with(self.cx, |input, _| input.focus_handle.clone());
+                    self.cx.update(|window, _| handle.focus(window));
+                } else {
+                    self.input
+                        .clone()
+                        .update_in(self.cx, |input, window, cx| input.focus(window, cx));
                 }
+                self.cx.run_until_parked();
+            }
+
+            /// Take the focus away from the editor.
+            fn blur(&mut self) {
+                self.cx.update(|window, _| window.blur());
+                self.cx.run_until_parked();
+            }
+
+            /// Click into the text: the focus, the way it usually comes.
+            fn click(&mut self) {
+                self.cx
+                    .simulate_click(point(px(200.), px(100.)), Modifiers::none());
             }
 
             /// Let `duration` go by, one frame of the display after another,
@@ -706,6 +1039,11 @@ mod tests {
                 // A test that failed is already on its way out.
                 if !std::thread::panicking() {
                     self.cx.update(|window, _| window.remove_window());
+                    if let Some(elsewhere) = self.elsewhere.take() {
+                        elsewhere
+                            .update(self.cx, |_, window, _| window.remove_window())
+                            .ok();
+                    }
                     self.cx.run_until_parked();
                 }
             }
@@ -946,6 +1284,105 @@ mod tests {
                 editor.key("a");
                 assert!(display_frames::take().is_empty(), "{blinking:?}, typing");
             }
+        }
+        /// Text that is being composed moves the caret as typing does, but no
+        /// key goes down for it: an input method takes the keys. A fade is
+        /// paused for it all the same -- composing costs it what it costs a
+        /// solid caret. The default blinks through it, as it always did.
+        #[gpui::test]
+        fn composing_draws_no_frame_for_a_fade(cx: &mut TestAppContext) {
+            /// A second of composing, the marked text a character longer
+            /// every 100ms: how many frames.
+            fn compose_for_a_second(editor: &mut Editor) -> usize {
+                let before = editor.frames.get();
+                let mut marked = String::new();
+                for _ in 0..10 {
+                    marked.push('\u{3042}');
+                    editor
+                        .input
+                        .clone()
+                        .update_in(editor.cx, |input, window, cx| {
+                            input.replace_and_mark_text_in_range(None, &marked, None, window, cx)
+                        });
+                    editor.pass(Duration::from_millis(100));
+                }
+                editor.frames.get() - before
+            }
+
+            let solid = compose_for_a_second(&mut Editor::open(CursorBlinking::Solid, 60, cx));
+            assert!(solid >= 10, "a frame a change at least: {solid}");
+            for blinking in FADES {
+                let mut editor = Editor::open(blinking, 60, cx);
+                assert_eq!(compose_for_a_second(&mut editor), solid, "{blinking:?}");
+                // The last change was 100ms ago: the fade picks up when the
+                // pause after it is over.
+                editor.pass(PAUSE_DELAY - Duration::from_millis(100));
+                assert_eq!(editor.pass(SECOND), 30, "{blinking:?}, after the pause");
+            }
+
+            let blink = compose_for_a_second(&mut Editor::open(CursorBlinking::Blink, 60, cx));
+            assert_eq!(blink, solid + 2, "the default, two frames a second on top");
+        }
+
+        /// A state that was made with another window in hand than the one it
+        /// is drawn in hears nothing of the focus, and nobody starts its
+        /// cursor. A fade runs all the same, for as long as its caret is
+        /// painted -- it used to be painted solid for good -- and costs what
+        /// it costs any editor: nothing while typing, nothing without a caret.
+        #[gpui::test]
+        fn a_fade_runs_in_an_editor_that_was_made_elsewhere(cx: &mut TestAppContext) {
+            let solid =
+                Editor::open_made_elsewhere(CursorBlinking::Solid, 60, cx).type_for_a_second();
+            assert!(solid >= 10, "a frame a key at least: {solid}");
+
+            for blinking in FADES {
+                let mut editor = Editor::open_made_elsewhere(blinking, 60, cx);
+                assert_eq!(editor.pass(SECOND), 30, "{blinking:?}");
+                assert_eq!(editor.pass(SECOND), 30, "{blinking:?}");
+
+                assert_eq!(editor.type_for_a_second(), solid, "{blinking:?}, typing");
+                // The last key was 100ms ago.
+                editor.pass(PAUSE_DELAY - Duration::from_millis(100));
+                assert_eq!(editor.pass(SECOND), 30, "{blinking:?}, after the pause");
+
+                // Nothing tells it that the focus went, either.
+                editor.blur();
+                // Whatever was already on its way (half a second covers it).
+                editor.pass(SECOND / 2);
+                assert_eq!(
+                    editor.pass(SECOND * 3),
+                    0,
+                    "{blinking:?}, without the focus"
+                );
+                // Back with a click, which is how it comes.
+                editor.click();
+                assert_eq!(editor.pass(SECOND), 30, "{blinking:?}, clicked");
+
+                editor.cx.deactivate_window();
+                editor.pass(SECOND / 2);
+                assert_eq!(editor.pass(SECOND * 3), 0, "{blinking:?}, in the back");
+                editor.cx.update(|window, _| window.activate_window());
+                editor.cx.run_until_parked();
+                assert_eq!(editor.pass(SECOND), 30, "{blinking:?}, back in front");
+                assert_eq!(editor.pass(SECOND), 30, "{blinking:?}, back in front");
+            }
+        }
+
+        /// The default is not started by being painted. A fade ends when its
+        /// caret is not painted any more; the 500ms timer of `Blink` runs
+        /// whether it is or not, and nothing would stop it in an editor that
+        /// hears of no blur: two frames a second for a caret nobody sees
+        /// (dopamine #930). So there is no timer -- and with the default
+        /// blink, such an editor has no caret to show. That one is the host's
+        /// to put right: a state has to be made with the window it is drawn
+        /// in.
+        #[gpui::test]
+        fn the_default_blink_is_not_started_by_being_painted(cx: &mut TestAppContext) {
+            let mut editor = Editor::open_made_elsewhere(CursorBlinking::Blink, 60, cx);
+            assert_eq!(editor.pass(SECOND * 2), 0);
+            editor.blur();
+            editor.pass(SECOND / 2);
+            assert_eq!(editor.pass(SECOND * 2), 0, "without the focus");
         }
     }
 }

@@ -122,6 +122,11 @@ pub const FADE_TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// past a refresh every time and waits for the one after: 20 frames a second
 /// on a 60Hz display, not 30. On the grid, one frame being late does not push
 /// the next one back.
+///
+/// `elapsed` is taken while the caret is painted, and that is where the wait
+/// counts from: the frame it is painted in still has to be drawn and
+/// presented before anything can wait, and what that takes comes off the
+/// wait (`BlinkCursor::wait_for_step`).
 pub fn next_fade_frame(elapsed: Duration) -> Duration {
     // Never wait for less than this. A frame drawn so late that the next
     // step is all but due -- or a timer that fired a hair early -- skips that
@@ -486,21 +491,26 @@ mod tests {
     /// A fade as a display shows it, as the refreshes its frames are drawn on.
     ///
     /// The timer wakes it, the window is drawn on the next refresh of the
-    /// display, the caret is painted `into_frame` after that refresh began,
-    /// and asks for its next step from there: `next`, given how far into its
-    /// cycle it is. The cycle began `before` the first refresh.
+    /// display, and the caret is painted `into_frame` after that refresh
+    /// began: that is where it asks for its next step. The frame is drawn and
+    /// presented `rest(n)` after that, the nth of them, and only then does
+    /// the wait start. `wait` is how long it is, given how far into its cycle
+    /// the caret was painted and how long ago that is by then. The cycle
+    /// began `before` the first refresh.
     fn refreshes_drawn(
         hz: u64,
         before: Duration,
         into_frame: Duration,
-        next: impl Fn(Duration) -> Duration,
+        rest: impl Fn(usize) -> Duration,
+        wait: impl Fn(Duration, Duration) -> Duration,
     ) -> Vec<u64> {
         const SECONDS: u64 = 10;
         let refresh = |n: u64| Duration::from_nanos(n * 1_000_000_000 / hz);
         let mut drawn = vec![];
         let mut painted = into_frame;
         loop {
-            let wake = painted + next(before + painted);
+            let rest = rest(drawn.len());
+            let wake = painted + rest + wait(before + painted, rest);
             let mut n = (wake.as_nanos() * u128::from(hz) / 1_000_000_000) as u64;
             while refresh(n) < wake {
                 n += 1;
@@ -513,35 +523,67 @@ mod tests {
         }
     }
 
+    /// What the cursor does: when the step is due is settled while the caret
+    /// is painted, and the wait is for what is left of that.
+    fn from_the_paint(painted: Duration, rest: Duration) -> Duration {
+        next_fade_frame(painted).saturating_sub(rest)
+    }
+
+    /// A frame that is out of the way the moment its caret is painted.
+    fn at_once(_: usize) -> Duration {
+        Duration::ZERO
+    }
+
     fn gaps(drawn: &[u64]) -> Vec<u64> {
         drawn.windows(2).map(|pair| pair[1] - pair[0]).collect()
     }
 
     /// 30 frames a second on the displays there are, and evenly: every other
     /// refresh at 60Hz, every fourth at 120Hz -- wherever between two
-    /// refreshes the cycle began, and however far into its frame the caret is
-    /// painted.
+    /// refreshes the cycle began, however far into its frame the caret is
+    /// painted, and however long the rest of that frame takes, the same every
+    /// time or not.
     #[test]
     fn a_fade_is_thirty_frames_a_second_on_a_display() {
         let ms = Duration::from_millis;
         let befores = [ms(0), ms(3), ms(8), ms(15), ms(21), ms(30)];
-        for before in befores {
+        let rests: [(&str, fn(usize) -> Duration); 4] = [
+            ("no time", at_once),
+            ("3ms", |_| Duration::from_millis(3)),
+            ("9ms", |_| Duration::from_millis(9)),
+            ("1 to 8ms", |frame| {
+                Duration::from_millis([2, 6, 1, 8, 4][frame % 5])
+            }),
+        ];
+        for (before, (rest_is, rest)) in befores
+            .into_iter()
+            .flat_map(|before| rests.map(|rest| (before, rest)))
+        {
             for into_frame in [ms(0), ms(1), ms(4), ms(9), ms(12)] {
-                let drawn = refreshes_drawn(60, before, into_frame, next_fade_frame);
-                let at = format!("60Hz, began {before:?} before, painted {into_frame:?} in");
+                let drawn = refreshes_drawn(60, before, into_frame, rest, from_the_paint);
+                let at = format!(
+                    "60Hz, began {before:?} before, painted {into_frame:?} in, \
+                     {rest_is} for the rest"
+                );
                 assert!((299..=300).contains(&drawn.len()), "{at}: {}", drawn.len());
                 assert!(gaps(&drawn).iter().all(|gap| *gap == 2), "{at}");
             }
             for into_frame in [ms(0), ms(1), ms(4), ms(7)] {
-                let drawn = refreshes_drawn(120, before, into_frame, next_fade_frame);
-                let at = format!("120Hz, began {before:?} before, painted {into_frame:?} in");
+                let drawn = refreshes_drawn(120, before, into_frame, rest, from_the_paint);
+                let at = format!(
+                    "120Hz, began {before:?} before, painted {into_frame:?} in, \
+                     {rest_is} for the rest"
+                );
                 assert!((299..=300).contains(&drawn.len()), "{at}: {}", drawn.len());
                 assert!(gaps(&drawn).iter().all(|gap| *gap == 4), "{at}");
             }
             // 144 is not a multiple of 30: four or five refreshes apart.
             for into_frame in [ms(0), ms(1), ms(4)] {
-                let drawn = refreshes_drawn(144, before, into_frame, next_fade_frame);
-                let at = format!("144Hz, began {before:?} before, painted {into_frame:?} in");
+                let drawn = refreshes_drawn(144, before, into_frame, rest, from_the_paint);
+                let at = format!(
+                    "144Hz, began {before:?} before, painted {into_frame:?} in, \
+                     {rest_is} for the rest"
+                );
                 assert!((299..=300).contains(&drawn.len()), "{at}: {}", drawn.len());
                 assert!(gaps(&drawn).iter().all(|gap| (4..=5).contains(gap)), "{at}");
             }
@@ -554,20 +596,54 @@ mod tests {
     fn a_tick_after_each_frame_would_be_twenty_a_second() {
         let ms = Duration::from_millis;
         for into_frame in [ms(1), ms(4), ms(9)] {
-            let drawn = refreshes_drawn(60, ms(0), into_frame, |_| FADE_TICK);
+            let drawn = refreshes_drawn(60, ms(0), into_frame, at_once, |_, _| FADE_TICK);
             assert_eq!(drawn.len(), 200, "{into_frame:?} into the frame");
             assert!(gaps(&drawn).iter().all(|gap| *gap == 3), "{into_frame:?}");
         }
     }
 
-    /// A window that takes longer to draw than a tick is not drawn back to
-    /// back for the caret: the steps it is too late for are skipped.
+    /// Why the wait counts from the paint, and not from when it starts: the
+    /// rest of the frame comes in between, and does not take the same time
+    /// twice. With the steps 3ms ahead of the display and a frame that needs
+    /// 2ms one time and 6ms the next, a step that is that much late makes its
+    /// refresh one time and misses it the next.
+    #[test]
+    fn a_wait_counted_from_the_end_of_the_frame_would_wobble() {
+        let ms = Duration::from_millis;
+        let rest = |frame: usize| if frame % 2 == 0 { ms(2) } else { ms(6) };
+
+        let late = refreshes_drawn(60, ms(3), ms(1), rest, |painted, _| {
+            next_fade_frame(painted)
+        });
+        // 30 a second still -- one refresh apart, then three.
+        assert!((299..=300).contains(&late.len()), "{}", late.len());
+        let late = gaps(&late);
+        assert!(late.contains(&1) && late.contains(&3), "{late:?}");
+        assert!(!late.contains(&2), "{late:?}");
+
+        let drawn = refreshes_drawn(60, ms(3), ms(1), rest, from_the_paint);
+        assert!((299..=300).contains(&drawn.len()), "{}", drawn.len());
+        assert!(gaps(&drawn).iter().all(|gap| *gap == 2));
+    }
+
+    /// A window that takes longer to draw than a tick skips the steps it is
+    /// too late for: it is not asked for two frames where it had the time for
+    /// one. Whether the time goes before the caret is painted or after.
     #[test]
     fn a_slow_window_skips_steps() {
-        let slow = Duration::from_millis(40);
-        let drawn = refreshes_drawn(60, Duration::ZERO, slow, next_fade_frame);
-        assert!(drawn.len() <= 200, "{}", drawn.len());
-        assert!(gaps(&drawn).iter().all(|gap| *gap >= 3));
+        let ms = Duration::from_millis;
+        for (into_frame, rest) in [(ms(40), ms(0)), (ms(15), ms(25)), (ms(2), ms(38))] {
+            let drawn = refreshes_drawn(
+                60,
+                Duration::ZERO,
+                into_frame,
+                move |_| rest,
+                from_the_paint,
+            );
+            let at = format!("painted {into_frame:?} in, {rest:?} for the rest");
+            assert!(drawn.len() <= 200, "{at}: {}", drawn.len());
+            assert!(gaps(&drawn).iter().all(|gap| *gap >= 3), "{at}");
+        }
     }
 
     #[test]

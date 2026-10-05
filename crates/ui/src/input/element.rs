@@ -2720,11 +2720,13 @@ impl Element for TextElement {
                 }
                 // A fade is stepped by a timer instead, and only where it can
                 // be seen: there are bounds for a caret that is scrolled out
-                // of view too. See `BlinkCursor::request_frame`.
+                // of view too. It is told the style as well: this paint is
+                // all a cursor hears of the focus when its state was made in
+                // another window. See `BlinkCursor::request_frame`.
                 if blinking.needs_animation()
                     && window.content_mask().bounds.intersects(&cursor_bounds)
                 {
-                    blink_cursor.update(cx, |cursor, cx| cursor.request_frame(cx));
+                    blink_cursor.update(cx, |cursor, cx| cursor.request_frame(blinking, cx));
                 }
             }
         }
