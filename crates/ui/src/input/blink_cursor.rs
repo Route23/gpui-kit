@@ -138,6 +138,15 @@ impl BlinkCursor {
         // The cycle starts over: a step of the last one is no longer due.
         self.frame = None;
         if style == CursorBlinking::Blink {
+            // A blink starts lit. `blink` flips `visible`, and a cursor that has
+            // run before is left with it true (a pause, or the half it was
+            // stopped in) -- so an input that got the focus back showed its
+            // caret for one frame and then hid it for the first 500ms. Moving
+            // the caret used to cover for this: a click moves it before the
+            // input hears that it has the focus, and the pause that came with
+            // the move showed it. A pause no longer takes on a cursor that is
+            // not running (dopamine #930), so the start has to do it itself.
+            self.visible = false;
             self.blink(self.epoch, cx);
         } else {
             // Kill any timer left over from a previous style.
@@ -460,6 +469,64 @@ mod tests {
             cursor.request_frame(CursorBlinking::Blink, cx);
             assert!(cursor.frame.is_none());
         });
+    }
+
+    /// A blink starts lit, however the cursor was left: stopped in a lit half,
+    /// stopped in a dark one, or started twice (an input that is focused by
+    /// hand hears of the focus as well). Left to the flip alone, a click back
+    /// into an input hid its caret for the first 500ms.
+    #[gpui::test]
+    fn a_blink_starts_lit_whatever_it_was_left_as(cx: &mut TestAppContext) {
+        let (cursor, _notified, _watch) = cursor(cx);
+        let visible = |cx: &mut TestAppContext| cursor.read_with(cx, |cursor, _| cursor.visible());
+        let ms = Duration::from_millis;
+        let start = |cx: &mut TestAppContext| {
+            cursor.update(cx, |cursor, cx| cursor.start(CursorBlinking::Blink, cx));
+            cx.run_until_parked();
+        };
+        let stop = |cx: &mut TestAppContext| {
+            cursor.update(cx, |cursor, cx| cursor.stop(cx));
+            cx.run_until_parked();
+        };
+
+        // Stopped in a lit half (the usual blur: the caret was showing).
+        start(cx);
+        assert!(visible(cx));
+        cx.executor().advance_clock(ms(200));
+        stop(cx);
+        start(cx);
+        assert!(visible(cx), "hidden for the first half after the focus came back");
+        // ...and the first half is a whole one: 500ms lit, then dark.
+        cx.executor().advance_clock(ms(499));
+        assert!(visible(cx));
+        cx.executor().advance_clock(ms(1));
+        assert!(!visible(cx));
+
+        // Stopped in a dark half.
+        stop(cx);
+        start(cx);
+        assert!(visible(cx));
+
+        // Started twice running: lit, not flipped back to dark.
+        stop(cx);
+        start(cx);
+        start(cx);
+        assert!(visible(cx));
+        cx.executor().advance_clock(ms(499));
+        assert!(visible(cx), "a timer of the first start cut the half short");
+        cx.executor().advance_clock(ms(1));
+        assert!(!visible(cx));
+
+        // A caret moved before the input heard of the focus (a click): the
+        // pause does nothing, and the start still shows it -- for the whole of
+        // its first half, not until a resume the pause would have set up.
+        start(cx); // lit when it stops, as an input that lost the focus is
+        stop(cx);
+        cursor.update(cx, |cursor, cx| cursor.pause(cx));
+        start(cx);
+        assert!(visible(cx));
+        cx.executor().advance_clock(ms(499));
+        assert!(visible(cx));
     }
 
     /// The fades read their place in the cycle off the clock: one second
