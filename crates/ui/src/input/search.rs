@@ -158,6 +158,10 @@ pub struct SearchMatcher {
     /// `update_matches` lowers it. It used to be lowered in the branch that
     /// only runs when it is not raised, so one "Replace" kept the place across
     /// every edit and every new query from then on (dopamine #927).
+    ///
+    /// A replacement that changes nothing causes no update. Whoever raised it
+    /// lowers it again once the editor has been asked (`replace_next`,
+    /// `replace_all`), or it would wait for an edit that is not a replacement.
     replacing: bool,
     /// The reader typed a regular expression that does not parse.
     ///
@@ -250,21 +254,6 @@ impl SearchMatcher {
         if self.wrap { 0 } else { len.saturating_sub(1) }
     }
 
-    /// The match the panel will be on once the current one has been replaced,
-    /// and which way it lies from here.
-    ///
-    /// The one after it, as a rule. From the last match it is whichever of
-    /// the others [`Self::past_the_end`] picks, back up the text. `None` when
-    /// the current match is the only one.
-    fn after_replacing(&self) -> Option<(Range<usize>, MoveDirection)> {
-        if let Some(next) = self.peek() {
-            return Some((next, MoveDirection::Down));
-        }
-        let others = self.matched_ranges.len().checked_sub(1)?;
-        let landing = self.matched_ranges[..others].get(self.past_the_end(others))?;
-        Some((landing.clone(), MoveDirection::Up))
-    }
-
     /// Update the search query and reset the current match index.
     ///
     /// **An unchanged query is waved through.** Rebuilding it would put
@@ -330,10 +319,6 @@ impl SearchMatcher {
     /// The match the panel is on right now, without stepping.
     fn current(&self) -> Option<Range<usize>> {
         self.matched_ranges.get(self.current_match_ix).cloned()
-    }
-
-    fn peek(&self) -> Option<Range<usize>> {
-        self.matched_ranges.get(self.current_match_ix + 1).cloned()
     }
 
     fn label(&self) -> String {
@@ -747,27 +732,54 @@ impl SearchPanel {
         {
             let text_state = self.editor.clone();
 
-            // Raised only when something is replaced: it is the update this
-            // causes that lowers it.
+            // Raised only when there is something to replace: it is the
+            // update this causes that lowers it.
             self.matcher.replacing = true;
-            // The match the panel moves on to is brought into view before the
-            // next press replaces *it*. From the last match that is one
-            // further up, which `Down` would not scroll to.
-            let (next_range, direction) = self
-                .matcher
-                .after_replacing()
-                .unwrap_or((range.clone(), MoveDirection::Down));
-            cx.spawn_in(window, async move |_, cx| {
+            cx.spawn_in(window, async move |this, cx| {
                 cx.update(|window, cx| {
                     text_state.update(cx, |state, cx| {
                         let range_utf16 = state.range_to_utf16(&range);
-                        state.scroll_to(next_range.end, Some(direction), cx);
                         state.replace_text_in_range_silent(
                             Some(range_utf16),
                             new_text.as_str(),
                             window,
                             cx,
                         );
+                    });
+                    // Where the panel is now is asked once the text has been
+                    // replaced. It used to be worked out beforehand, on the
+                    // guess that the match would be gone -- and it is not
+                    // always: the new text can match as well, and a read-only
+                    // editor replaces nothing. The panel stays on the match
+                    // then, and the screen had gone on to the next one, or
+                    // from the last all the way back to the first.
+                    //
+                    // The flag comes down here as well: a replacement that
+                    // leaves the text as it was causes no update to lower it.
+                    let landing = this
+                        .update(cx, |this, _| {
+                            this.matcher.replacing = false;
+                            this.matcher.current()
+                        })
+                        .ok()
+                        .flatten();
+                    // That match is brought into view before the next press
+                    // replaces *it*. It lies below as a rule: the one after
+                    // has moved into the place. From the last match it is
+                    // further up, where `Down` would not scroll to.
+                    //
+                    // With no match left the screen stays where the
+                    // replacement was made, and that takes a `scroll_to` too:
+                    // without one the next frame follows the caret by a row.
+                    let (offset, direction) = match landing {
+                        Some(landing) if landing.start < range.start => {
+                            (landing.end, MoveDirection::Up)
+                        }
+                        Some(landing) => (landing.end, MoveDirection::Down),
+                        None => (range.start, MoveDirection::Down),
+                    };
+                    text_state.update(cx, |state, cx| {
+                        state.scroll_to(offset, Some(direction), cx);
                     });
                 })
             })
@@ -784,7 +796,7 @@ impl SearchPanel {
         self.matcher.replacing = true;
 
         let editor = self.editor.clone();
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             cx.update(|window, cx| {
                 editor.update(cx, |state, cx| {
                     // Replace from the end to avoid messing up the ranges.
@@ -800,6 +812,10 @@ impl SearchPanel {
                     );
                     state.scroll_to(0, Some(MoveDirection::Down), cx);
                 });
+                // As in `replace_next`: nothing may have changed, and then no
+                // update has lowered the flag.
+                this.update(cx, |this, _| this.matcher.replacing = false)
+                    .ok();
             })
         })
         .detach();
@@ -1147,6 +1163,7 @@ mod tests {
     /// A view that draws an editor a few rows high.
     struct Drawn {
         editor: Entity<InputState>,
+        read_only: bool,
     }
 
     impl Render for Drawn {
@@ -1154,21 +1171,31 @@ mod tests {
             div()
                 .w(gpui::px(400.))
                 .h(gpui::px(200.))
-                .child(Input::new(&self.editor).h_full())
+                .child(Input::new(&self.editor).read_only(self.read_only).h_full())
         }
     }
 
-    /// After the last match the panel moves on to the first, and the editor
-    /// shows it: the next press replaces that one, and must not do it off
-    /// screen. It is further *up*, where a scroll "down" does not go.
-    #[gpui::test]
-    fn replacing_the_last_match_brings_the_first_into_view(cx: &mut TestAppContext) {
+    /// A hundred rows, drawn a few at a time, with `foo` on every row in `on`.
+    /// ⌘F is open on `foo` with `with` to replace it, and the panel is on the
+    /// first match.
+    fn drawn<'a>(
+        on: &[usize],
+        with: &str,
+        read_only: bool,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<InputState>,
+        Entity<SearchPanel>,
+        &'a mut VisualTestContext,
+    ) {
         cx.update(crate::init);
-        // A hundred rows, `foo` on the first and on the last.
         let rows: Vec<String> = (0..100)
-            .map(|row| match row {
-                0 | 99 => format!("row {row} foo"),
-                _ => format!("row {row}"),
+            .map(|row| {
+                if on.contains(&row) {
+                    format!("row {row} foo")
+                } else {
+                    format!("row {row}")
+                }
             })
             .collect();
         let body = rows.join("\n");
@@ -1184,42 +1211,212 @@ mod tests {
                         .default_value(body)
                 });
                 *editor.borrow_mut() = Some(state.clone());
-                let drawn = cx.new(|_| Drawn { editor: state });
+                let drawn = cx.new(|_| Drawn {
+                    editor: state,
+                    read_only,
+                });
                 crate::Root::new(drawn, window, cx)
             }
         });
         let editor: Entity<InputState> = editor.borrow().clone().unwrap();
-        let scrolled = |cx: &mut VisualTestContext| {
-            editor.read_with(cx, |editor, _| editor.scroll_handle.offset().y)
-        };
 
         editor.update_in(cx, |editor, window, cx| {
             editor.on_action_search(&Search, window, cx)
         });
         cx.run_until_parked();
         let panel = editor.read_with(cx, |editor, _| editor.search_panel.clone().unwrap());
+        let with = with.to_string();
         panel.update_in(cx, |panel, window, cx| {
             panel
                 .search_input
                 .update(cx, |input, cx| input.set_value("foo", window, cx));
             panel
                 .replace_input
-                .update(cx, |input, cx| input.set_value("x", window, cx));
+                .update(cx, |input, cx| input.set_value(with, window, cx));
         });
         cx.run_until_parked();
+        (editor, panel, cx)
+    }
+
+    /// How far the editor is scrolled: zero at the top, negative below it.
+    fn scrolled(editor: &Entity<InputState>, cx: &mut VisualTestContext) -> Pixels {
+        editor.read_with(cx, |editor, _| editor.scroll_handle.offset().y)
+    }
+
+    /// Is all of `row` inside what the editor shows?
+    fn on_screen(editor: &Entity<InputState>, row: usize, cx: &mut VisualTestContext) -> bool {
+        editor.read_with(cx, |editor, _| {
+            let line_height = editor.last_layout.as_ref().unwrap().line_height;
+            let shown = -editor.scroll_handle.offset().y;
+            let height = editor.last_bounds.unwrap().size.height;
+            let top = row * line_height;
+            shown <= top && top + line_height <= shown + height
+        })
+    }
+
+    /// Enter in the search field: on to the next match.
+    fn step(panel: &Entity<SearchPanel>, cx: &mut VisualTestContext) {
         panel.update_in(cx, |panel, window, cx| panel.next(window, cx));
         cx.run_until_parked();
-        assert_eq!(label(&panel, cx), "2/2");
-        assert!(scrolled(cx) < gpui::px(-200.), "the last row is on screen");
+    }
 
+    /// A press on "Replace".
+    fn replace(panel: &Entity<SearchPanel>, cx: &mut VisualTestContext) {
         panel.update_in(cx, |panel, window, cx| panel.replace_next(window, cx));
         cx.run_until_parked();
+    }
+
+    /// After the last match the panel moves on to the first, and the editor
+    /// shows it: the next press replaces that one, and must not do it off
+    /// screen. It is further *up*, where a scroll "down" does not go.
+    #[gpui::test]
+    fn replacing_the_last_match_brings_the_first_into_view(cx: &mut TestAppContext) {
+        let (editor, panel, cx) = drawn(&[0, 99], "x", false, cx);
+        step(&panel, cx);
+        assert_eq!(label(&panel, cx), "2/2");
+        assert!(on_screen(&editor, 99, cx));
+
+        replace(&panel, cx);
         assert_eq!(label(&panel, cx), "1/1");
         assert_eq!(
-            scrolled(cx),
+            scrolled(&editor, cx),
             gpui::px(0.),
             "back at the top, on the match that is left"
         );
+    }
+
+    /// With `wrap_around` off the panel stays at the end, on the last match
+    /// that is left. That one is further up as well.
+    #[gpui::test]
+    fn replacing_the_last_match_without_wrap_brings_the_one_before_into_view(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, panel, cx) = drawn(&[0, 50, 99], "x", false, cx);
+        panel.update(cx, |panel, _| panel.matcher.set_wrap(false));
+        step(&panel, cx);
+        step(&panel, cx);
+        assert_eq!(label(&panel, cx), "3/3");
+        assert!(!on_screen(&editor, 50, cx));
+
+        replace(&panel, cx);
+        assert_eq!(label(&panel, cx), "2/2");
+        assert!(on_screen(&editor, 50, cx), "{:?}", scrolled(&editor, cx));
+    }
+
+    /// The usual press: the match is gone, the one after it has moved into its
+    /// place, and the editor shows that one.
+    #[gpui::test]
+    fn replacing_a_match_brings_the_next_into_view(cx: &mut TestAppContext) {
+        let (editor, panel, cx) = drawn(&[0, 50, 99], "x", false, cx);
+        assert_eq!(label(&panel, cx), "1/3");
+        assert!(!on_screen(&editor, 50, cx));
+
+        replace(&panel, cx);
+        assert!(text(&editor, cx).starts_with("row 0 x\n"));
+        assert_eq!(label(&panel, cx), "1/2");
+        assert!(on_screen(&editor, 50, cx), "{:?}", scrolled(&editor, cx));
+    }
+
+    /// The match that is shown is looked up in the text as it is after the
+    /// replacement. One that takes rows away has pulled the next match up,
+    /// away from where it was.
+    #[gpui::test]
+    fn a_replacement_that_takes_rows_away_brings_the_next_into_view(cx: &mut TestAppContext) {
+        let (editor, panel, cx) = drawn(&[0, 50], "x", false, cx);
+        // Each `foo` and the thirty rows below it.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.options.regex = true;
+            panel.search_input.update(cx, |input, cx| {
+                input.set_value(r"foo(\n.*){30}", window, cx)
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(label(&panel, cx), "1/2");
+
+        replace(&panel, cx);
+        assert!(text(&editor, cx).starts_with("row 0 x\nrow 31\n"));
+        assert_eq!(label(&panel, cx), "1/1");
+        // It ended on row 80, and ends on row 50 now.
+        assert!(on_screen(&editor, 50, cx), "{:?}", scrolled(&editor, cx));
+    }
+
+    /// A replacement that still matches is still the current match: the panel
+    /// stays on it, and so does the screen.
+    ///
+    /// Where to go used to be decided before replacing, as if the match were
+    /// sure to be gone. From the last match the screen went off to the first
+    /// while the panel -- and the next press -- stayed here, out of sight.
+    #[gpui::test]
+    fn a_replacement_that_still_matches_leaves_the_screen_on_it(cx: &mut TestAppContext) {
+        let (editor, panel, cx) = drawn(&[0, 99], "foobar", false, cx);
+        step(&panel, cx);
+        assert_eq!(label(&panel, cx), "2/2");
+        assert!(on_screen(&editor, 99, cx));
+        let at = scrolled(&editor, cx);
+
+        replace(&panel, cx);
+        assert!(text(&editor, cx).ends_with("\nrow 99 foobar"));
+        assert_eq!(label(&panel, cx), "2/2");
+        assert_eq!(scrolled(&editor, cx), at, "away from the current match");
+
+        // The next press is made where the reader is looking.
+        replace(&panel, cx);
+        assert!(text(&editor, cx).ends_with("\nrow 99 foobarbar"));
+        assert_eq!(scrolled(&editor, cx), at);
+    }
+
+    /// "Replace" in a read-only editor replaces nothing, and so it goes
+    /// nowhere: the panel is still on the match it was on.
+    #[gpui::test]
+    fn replace_in_a_read_only_editor_moves_nothing(cx: &mut TestAppContext) {
+        let (editor, panel, cx) = drawn(&[0, 50, 99], "x", true, cx);
+        let body = text(&editor, cx);
+
+        // From the last match the screen used to go back to the first ...
+        step(&panel, cx);
+        step(&panel, cx);
+        assert_eq!(label(&panel, cx), "3/3");
+        assert!(on_screen(&editor, 99, cx));
+        let at = scrolled(&editor, cx);
+        replace(&panel, cx);
+        assert_eq!(label(&panel, cx), "3/3");
+        assert_eq!(scrolled(&editor, cx), at);
+
+        // ... and from any other, on to the one after it.
+        panel.update_in(cx, |panel, window, cx| panel.prev(window, cx));
+        cx.run_until_parked();
+        assert_eq!(label(&panel, cx), "2/3");
+        assert!(on_screen(&editor, 50, cx));
+        let at = scrolled(&editor, cx);
+        replace(&panel, cx);
+        assert_eq!(label(&panel, cx), "2/3");
+        assert_eq!(scrolled(&editor, cx), at);
+
+        assert_eq!(text(&editor, cx), body);
+    }
+
+    /// No match is left to go to, and the screen stays where the replacement
+    /// was made -- as it did when that was decided beforehand. Left to follow
+    /// the caret it would move by a row: the caret is on the top one here.
+    #[gpui::test]
+    fn replacing_the_only_match_leaves_the_screen_where_it_is(cx: &mut TestAppContext) {
+        let (editor, panel, cx) = drawn(&[50], "x", false, cx);
+        // Scrolled past the match and stepped back to it: it is on the top row.
+        editor.update(cx, |editor, cx| {
+            editor.update_scroll_offset(Some(gpui::point(gpui::px(0.), gpui::px(-1500.))), cx)
+        });
+        cx.run_until_parked();
+        assert!(!on_screen(&editor, 50, cx));
+        panel.update_in(cx, |panel, window, cx| panel.prev(window, cx));
+        cx.run_until_parked();
+        assert_eq!(label(&panel, cx), "1/1");
+        assert!(on_screen(&editor, 50, cx) && !on_screen(&editor, 49, cx));
+        let at = scrolled(&editor, cx);
+
+        replace(&panel, cx);
+        assert!(text(&editor, cx).contains("\nrow 50 x\n"));
+        assert_eq!(label(&panel, cx), "0/0");
+        assert_eq!(scrolled(&editor, cx), at);
     }
 
     /// The place is kept across the replacement and not across what comes
@@ -1255,6 +1452,55 @@ mod tests {
         });
     }
 
+    /// A replacement that changes nothing keeps no place either: the next
+    /// edit starts from the first match, as any edit does.
+    ///
+    /// Nothing changes when the text comes out the same, or the editor is
+    /// read-only. No update follows then, and the flag raised for one stayed
+    /// up until some later edit spent it.
+    #[gpui::test]
+    fn a_replacement_that_changes_nothing_keeps_no_place(cx: &mut TestAppContext) {
+        let (editor, panel, cx) = searching("foo foo foo", "foo", cx);
+
+        for (with, read_only) in [("foo", false), ("x", true)] {
+            for all in [false, true] {
+                let pressed = format!("{with:?}, read-only {read_only}, all {all}");
+                editor.update(cx, |editor, _| editor.disabled = read_only);
+                panel.update_in(cx, |panel, window, cx| {
+                    panel
+                        .replace_input
+                        .update(cx, |input, cx| input.set_value(with, window, cx));
+                    panel.next(window, cx);
+                });
+                assert_eq!(label(&panel, cx), "2/3", "{pressed}");
+                let body = text(&editor, cx);
+
+                panel.update_in(cx, |panel, window, cx| {
+                    if all {
+                        panel.replace_all(window, cx)
+                    } else {
+                        panel.replace_next(window, cx)
+                    }
+                });
+                cx.run_until_parked();
+                assert_eq!(text(&editor, cx), body, "{pressed}");
+                assert_eq!(label(&panel, cx), "2/3", "{pressed}");
+                assert!(
+                    !panel.read_with(cx, |panel, _| panel.matcher.replacing),
+                    "{pressed}"
+                );
+
+                // An edit somewhere else, later on.
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.disabled = false;
+                    editor.selected_range = (0..0).into();
+                    editor.insert("!", window, cx);
+                });
+                assert_eq!(label(&panel, cx), "1/3", "{pressed}");
+            }
+        }
+    }
+
     /// Three `foo`s, the panel on the `nth` (from one).
     fn on_the_nth_of_three(nth: usize) -> SearchMatcher {
         let mut m = SearchMatcher::new();
@@ -1272,8 +1518,6 @@ mod tests {
     #[test]
     fn replacing_a_match_moves_on_to_the_one_after_it() {
         let mut m = on_the_nth_of_three(2);
-        assert!(m.after_replacing() == Some((8..11, MoveDirection::Down)));
-
         m.replacing = true;
         m.update(&Rope::from("foo x foo"));
         assert_eq!(m.label(), "2/2");
@@ -1285,9 +1529,6 @@ mod tests {
     #[test]
     fn replacing_the_last_match_goes_round_to_the_first() {
         let mut m = on_the_nth_of_three(3);
-        // It is further up the text, which is the way to scroll.
-        assert!(m.after_replacing() == Some((0..3, MoveDirection::Up)));
-
         m.replacing = true;
         m.update(&Rope::from("foo foo x"));
         assert_eq!(m.label(), "1/2");
@@ -1299,12 +1540,26 @@ mod tests {
     fn replacing_the_last_match_stays_at_the_end_without_wrap() {
         let mut m = on_the_nth_of_three(3);
         m.set_wrap(false);
-        assert!(m.after_replacing() == Some((4..7, MoveDirection::Up)));
-
         m.replacing = true;
         m.update(&Rope::from("foo foo x"));
         assert_eq!(m.label(), "2/2");
         assert_eq!(m.current(), Some(4..7));
+    }
+
+    /// The replaced match is not always gone: what took its place can match
+    /// as well, and then the panel has not moved on. Which is why nobody can
+    /// say beforehand where a replacement leaves it -- `replace_next` asks
+    /// afterwards.
+    #[test]
+    fn a_replacement_that_still_matches_stays_the_current_match() {
+        for wrap in [true, false] {
+            let mut m = on_the_nth_of_three(3);
+            m.set_wrap(wrap);
+            m.replacing = true;
+            m.update(&Rope::from("foo foo foobar"));
+            assert_eq!(m.label(), "3/3");
+            assert_eq!(m.current(), Some(8..11));
+        }
     }
 
     #[test]
@@ -1314,7 +1569,6 @@ mod tests {
             m.set_wrap(wrap);
             m.update(&Rope::from("a foo b"));
             m.update_query("foo", insensitive());
-            assert!(m.after_replacing().is_none());
 
             m.replacing = true;
             m.update(&Rope::from("a x b"));
