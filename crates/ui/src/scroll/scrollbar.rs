@@ -11,8 +11,8 @@ use gpui::{
     App, Axis, BorderStyle, Bounds, ContentMask, Corner, CursorStyle, Edges, Element, ElementId,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, IsZero,
     LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    Position, ScrollHandle, ScrollWheelEvent, Size, Style, Timer, UniformListScrollHandle, Window,
-    fill, point, px, relative, size,
+    Position, ScrollHandle, ScrollWheelEvent, Size, Style, UniformListScrollHandle, Window, fill,
+    point, px, relative, size,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,15 @@ fn next_fade_frame(elapsed: f32) -> Option<f32> {
         return None;
     };
     Some(wait.max(MIN))
+}
+
+/// The time, by the clock the timers run on.
+///
+/// The executor's rather than `Instant::now()`: they are the same clock
+/// everywhere but in a test, where gpui's can be moved by hand -- which is how
+/// the tests below follow a fade without waiting three seconds for it.
+fn clock(cx: &App) -> Instant {
+    cx.background_executor().now()
 }
 
 /// Scrollbar show mode.
@@ -174,6 +183,10 @@ struct ScrollbarStateInner {
     // Last update offset
     last_update: Instant,
     idle_timer_scheduled: bool,
+    /// The bar on screen is behind the content: the offset moved after the
+    /// frame had laid the thumb out (an editor scrolls to follow its caret
+    /// while it paints). The next frame catches up.
+    behind: bool,
 }
 
 impl Default for ScrollbarState {
@@ -187,6 +200,7 @@ impl Default for ScrollbarState {
             last_scroll_time: None,
             last_update: Instant::now(),
             idle_timer_scheduled: false,
+            behind: false,
         })))
     }
 }
@@ -196,6 +210,45 @@ impl Deref for ScrollbarState {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl ScrollbarState {
+    /// Draw the view again in `wait` seconds, unless a frame is already on
+    /// its way: one timer at a time, for the next moment the thumb has to
+    /// look different. See [`next_fade_frame`].
+    ///
+    /// Called while the view is being drawn, where a `notify` asks for
+    /// nothing: gpui does not take a frame from inside a draw. The timer's
+    /// does. A timer that goes off with nothing to draw sleeps on instead;
+    /// see [`ScrollbarStateInner::fade_put_off`].
+    fn schedule_frame(&self, wait: f32, window: &mut Window, cx: &mut App) {
+        if self.get().idle_timer_scheduled {
+            return;
+        }
+        self.set(self.get().with_idle_timer_scheduled(true));
+
+        let state = self.clone();
+        let current_view = window.current_view();
+        let mut timer = cx
+            .background_executor()
+            .timer(Duration::from_secs_f32(wait));
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    timer.await;
+                    let now = cx.background_executor().now();
+                    let Some(wait) = state.get().fade_put_off(now) else {
+                        break;
+                    };
+                    timer = cx
+                        .background_executor()
+                        .timer(Duration::from_secs_f32(wait));
+                }
+                state.set(state.get().with_idle_timer_scheduled(false));
+                cx.update(|_, cx| cx.notify(current_view)).ok();
+            })
+            .detach();
     }
 }
 
@@ -218,21 +271,21 @@ impl ScrollbarStateInner {
         state
     }
 
-    fn with_hovered(&self, axis: Option<Axis>) -> Self {
+    fn with_hovered(&self, axis: Option<Axis>, now: Instant) -> Self {
         let mut state = *self;
         state.hovered_axis = axis;
         if axis.is_some() {
-            state.last_scroll_time = Some(std::time::Instant::now());
+            state.last_scroll_time = Some(now);
         }
         state
     }
 
-    fn with_hovered_on_thumb(&self, axis: Option<Axis>) -> Self {
+    fn with_hovered_on_thumb(&self, axis: Option<Axis>, now: Instant) -> Self {
         let mut state = *self;
         state.hovered_on_thumb = axis;
-        if self.is_scrollbar_visible() {
+        if self.is_scrollbar_visible(now) {
             if axis.is_some() {
-                state.last_scroll_time = Some(std::time::Instant::now());
+                state.last_scroll_time = Some(now);
             }
         }
         state
@@ -267,14 +320,45 @@ impl ScrollbarStateInner {
         state
     }
 
-    fn is_scrollbar_visible(&self) -> bool {
+    fn with_behind(&self, behind: bool) -> Self {
+        let mut state = *self;
+        state.behind = behind;
+        state
+    }
+
+    /// How much longer a timer that has just gone off has to sleep, when the
+    /// frame it was set for has nothing to draw.
+    ///
+    /// The timer is set by the first scroll and the reader scrolls on: every
+    /// one of those frames drew the thumb opaque, and it stays that way until
+    /// the delay after the *last* of them is over. Waking the view at the
+    /// first one's time would draw the same thumb again -- the whole window,
+    /// once for every gesture -- so the timer goes back to sleep instead.
+    ///
+    /// Only when what is on screen is what a frame would draw. It is not
+    /// while the bar is [behind](ScrollbarStateInner::behind), nor with the
+    /// pointer on a bar: coming onto one asks for no frame of its own, and
+    /// this is the frame that draws the bar as hovered.
+    fn fade_put_off(&self, now: Instant) -> Option<f32> {
+        if self.behind || self.hovered_axis.is_some() {
+            return None;
+        }
+        let elapsed = now.duration_since(self.last_scroll_time?).as_secs_f32();
+        if elapsed < FADE_OUT_DELAY {
+            next_fade_frame(elapsed)
+        } else {
+            None
+        }
+    }
+
+    fn is_scrollbar_visible(&self, now: Instant) -> bool {
         // On drag
         if self.dragged_axis.is_some() {
             return true;
         }
 
         if let Some(last_time) = self.last_scroll_time {
-            let elapsed = Instant::now().duration_since(last_time).as_secs_f32();
+            let elapsed = now.duration_since(last_time).as_secs_f32();
             elapsed < FADE_OUT_DURATION
         } else {
             false
@@ -568,6 +652,10 @@ pub struct PrepaintState {
     hitbox: Hitbox,
     scrollbar_state: ScrollbarState,
     states: Vec<AxisPrepaintState>,
+    /// When this frame is drawn, by [`clock`].
+    now: Instant,
+    /// The offset the thumbs are laid out for.
+    offset: Point<Pixels>,
 }
 
 #[doc(hidden)]
@@ -582,6 +670,8 @@ pub struct AxisPrepaintState {
     // Bounds of thumb to be rendered.
     thumb_fill_bounds: Bounds<Pixels>,
     thumb_bg: Hsla,
+    /// On its way out: drawn by how long ago the last scroll was.
+    is_fading: bool,
     scroll_size: Pixels,
     container_size: Pixels,
     thumb_size: Pixels,
@@ -634,8 +724,19 @@ impl Element for Scrollbar {
             .use_state(cx, |_, _| ScrollbarState::default())
             .read(cx)
             .clone();
+        let now = clock(cx);
+        let offset = self.scroll_handle.offset();
+        // This frame is laid out for where the content is now.
+        if state.get().behind {
+            state.set(state.get().with_behind(false));
+        }
 
         let mut states = vec![];
+        // The pointer is at rest on one of the bars, which keeps that bar --
+        // and, as the two share a clock, the other one too -- from fading.
+        let mut held_by_pointer = false;
+        // How long until a thumb that is on its way out has to be drawn again.
+        let mut fade_wait = None;
         let mut has_both = self.axis.is_both();
         let scroll_size = self
             .scroll_size
@@ -699,6 +800,7 @@ impl Element for Scrollbar {
             let is_hovered_on_bar = state.get().hovered_axis == Some(axis);
             let is_hovered_on_thumb = state.get().hovered_on_thumb == Some(axis);
             let is_offset_changed = state.get().last_scroll_offset != self.scroll_handle.offset();
+            let mut is_fading = false;
 
             let (thumb_bg, bar_bg, bar_border, thumb_width, inset, radius) =
                 if state.get().dragged_axis == Some(axis) {
@@ -710,6 +812,19 @@ impl Element for Scrollbar {
                         Self::style_for_hovered_bar(cx)
                     }
                 } else if is_offset_changed {
+                    // The thumb this draws has to go away again, and this is
+                    // the frame that has to see to it. The timer used to be
+                    // set only by a frame that scrolled nothing, and one was
+                    // expected to follow: paint notes the scroll and calls
+                    // `notify`. But a `notify` from inside a draw asks for no
+                    // frame, so after a single notch of a wheel, in a view
+                    // nothing else redraws, none came and the thumb stayed
+                    // (dopamine #927). A timer rather than a frame of its
+                    // own: that would be one more for every notch, of the
+                    // whole window.
+                    if !is_always_to_show {
+                        fade_wait = next_fade_frame(0.);
+                    }
                     self.style_for_normal(cx)
                 } else if is_always_to_show {
                     if is_hovered_on_thumb {
@@ -721,39 +836,24 @@ impl Element for Scrollbar {
                     let mut idle_state = self.style_for_idle(cx);
                     // Delay 2s to fade out the scrollbar thumb (in 1s)
                     if let Some(last_time) = state.get().last_scroll_time {
-                        let elapsed = Instant::now().duration_since(last_time).as_secs_f32();
+                        let elapsed = now.duration_since(last_time).as_secs_f32();
                         if is_hovered_on_bar {
-                            state.set(state.get().with_last_scroll_time(Some(Instant::now())));
+                            held_by_pointer = true;
+                            state.set(state.get().with_last_scroll_time(Some(now)));
                             idle_state = if is_hovered_on_thumb {
                                 Self::style_for_hovered_thumb(cx)
                             } else {
                                 Self::style_for_hovered_bar(cx)
                             };
                         } else {
+                            is_fading = true;
                             if elapsed < FADE_OUT_DELAY {
                                 idle_state.0 = cx.theme().scrollbar_thumb;
                             } else if elapsed < FADE_OUT_DURATION {
                                 let opacity = 1.0 - (elapsed - FADE_OUT_DELAY).powi(10);
                                 idle_state.0 = cx.theme().scrollbar_thumb.opacity(opacity);
                             }
-
-                            // One timer at a time, for the next moment the
-                            // thumb has to look different. See `next_fade_frame`.
-                            if let Some(next_delay) = next_fade_frame(elapsed) {
-                                if !state.get().idle_timer_scheduled {
-                                    let state = state.clone();
-                                    state.set(state.get().with_idle_timer_scheduled(true));
-                                    let current_view = window.current_view();
-                                    let next_delay = Duration::from_secs_f32(next_delay);
-                                    window
-                                        .spawn(cx, async move |cx| {
-                                            Timer::after(next_delay).await;
-                                            state.set(state.get().with_idle_timer_scheduled(false));
-                                            cx.update(|_, cx| cx.notify(current_view)).ok();
-                                        })
-                                        .detach();
-                                }
-                            }
+                            fade_wait = fade_wait.or(next_fade_frame(elapsed));
                         }
                     }
 
@@ -805,6 +905,7 @@ impl Element for Scrollbar {
                 thumb_bounds,
                 thumb_fill_bounds,
                 thumb_bg,
+                is_fading,
                 scroll_size: scroll_area_size,
                 container_size,
                 thumb_size: thumb_length,
@@ -812,10 +913,27 @@ impl Element for Scrollbar {
             })
         }
 
+        if held_by_pointer {
+            // The bar under the pointer has just put the clock back to "now",
+            // and does so in every frame, so by that clock the other bar never
+            // gets to fade: it set a timer, was drawn, and set the next one --
+            // a frame or two every two seconds for as long as the pointer
+            // stayed (dopamine #927). It is kept as that left it, lit, and
+            // nothing is set: the move that takes the pointer off the bar
+            // draws the frame that starts the fade.
+            for axis in states.iter_mut().filter(|axis| axis.is_fading) {
+                axis.thumb_bg = cx.theme().scrollbar_thumb;
+            }
+        } else if let Some(wait) = fade_wait {
+            state.schedule_frame(wait, window, cx);
+        }
+
         PrepaintState {
             hitbox,
             states,
             scrollbar_state: state,
+            now,
+            offset,
         }
     }
 
@@ -833,16 +951,31 @@ impl Element for Scrollbar {
         let scrollbar_show = self.scrollbar_show.unwrap_or(cx.theme().scrollbar_show);
         let view_id = window.current_view();
         let hitbox_bounds = prepaint.hitbox.bounds;
-        let is_visible = scrollbar_state.get().is_scrollbar_visible() || scrollbar_show.is_always();
+        let now = prepaint.now;
+        // A thumb laid out for a scroll is on screen before the scroll is
+        // noted (below). Without this the listeners of that frame took it for
+        // hidden, and a press on the bar went to whatever is under it until
+        // some other frame replaced them.
+        let is_scrolled = prepaint.offset != scrollbar_state.get().last_scroll_offset;
+        let is_visible = is_scrolled
+            || scrollbar_state.get().is_scrollbar_visible(now)
+            || scrollbar_show.is_always();
         let is_hover_to_show = scrollbar_show.is_hover();
+        // Two bars, of which the one under the pointer keeps the other lit
+        // (see prepaint).
+        let holds_the_other = prepaint.states.len() > 1 && !is_hover_to_show;
 
         // Update last_scroll_time when offset is changed.
-        if self.scroll_handle.offset() != scrollbar_state.get().last_scroll_offset {
+        let offset = self.scroll_handle.offset();
+        if offset != scrollbar_state.get().last_scroll_offset {
             scrollbar_state.set(
                 scrollbar_state
                     .get()
-                    .with_last_scroll(self.scroll_handle.offset(), Some(Instant::now())),
+                    .with_last_scroll(offset, Some(now))
+                    .with_behind(offset != prepaint.offset),
             );
+            // Marks the view for the next frame, whenever that is. It does not
+            // ask for one: this is a paint.
             cx.notify(view_id);
         }
 
@@ -941,10 +1074,12 @@ impl Element for Scrollbar {
                         move |event: &ScrollWheelEvent, phase, _, cx| {
                             if phase.bubble() && hitbox_bounds.contains(&event.position) {
                                 if scroll_handle.offset() != state.get().last_scroll_offset {
-                                    state.set(state.get().with_last_scroll(
-                                        scroll_handle.offset(),
-                                        Some(Instant::now()),
-                                    ));
+                                    state.set(
+                                        state.get().with_last_scroll(
+                                            scroll_handle.offset(),
+                                            Some(clock(cx)),
+                                        ),
+                                    );
                                     cx.notify(view_id);
                                 }
                             }
@@ -1040,7 +1175,7 @@ impl Element for Scrollbar {
                             let need_hover_to_update = is_hover_to_show || is_visible;
                             // Update hovered state for scrollbar
                             if bounds.contains(&event.position) && need_hover_to_update {
-                                state.set(state.get().with_hovered(Some(axis)));
+                                state.set(state.get().with_hovered(Some(axis), clock(cx)));
 
                                 if state.get().hovered_axis != Some(axis) {
                                     notify = true;
@@ -1048,7 +1183,20 @@ impl Element for Scrollbar {
                             } else {
                                 if state.get().hovered_axis == Some(axis) {
                                     if state.get().hovered_axis.is_some() {
-                                        state.set(state.get().with_hovered(None));
+                                        let now = clock(cx);
+                                        let mut left = state.get().with_hovered(None, now);
+                                        // The other bar was lit for as long as
+                                        // the pointer was here, and fades from
+                                        // the moment it goes. The clock is
+                                        // otherwise as old as the last frame,
+                                        // and there may have been none for a
+                                        // minute: both bars would vanish, which
+                                        // they did not while a timer kept
+                                        // drawing them (dopamine #927).
+                                        if holds_the_other {
+                                            left = left.with_last_scroll_time(Some(now));
+                                        }
+                                        state.set(left);
                                         notify = true;
                                     }
                                 }
@@ -1057,12 +1205,14 @@ impl Element for Scrollbar {
                             // Update hovered state for scrollbar thumb
                             if thumb_bounds.contains(&event.position) {
                                 if state.get().hovered_on_thumb != Some(axis) {
-                                    state.set(state.get().with_hovered_on_thumb(Some(axis)));
+                                    state.set(
+                                        state.get().with_hovered_on_thumb(Some(axis), clock(cx)),
+                                    );
                                     notify = true;
                                 }
                             } else {
                                 if state.get().hovered_on_thumb == Some(axis) {
-                                    state.set(state.get().with_hovered_on_thumb(None));
+                                    state.set(state.get().with_hovered_on_thumb(None, clock(cx)));
                                     notify = true;
                                 }
                             }
@@ -1171,6 +1321,36 @@ mod fade_tests {
         assert!(last < FADE_OUT_DURATION + 0.05, "{last}");
     }
 
+    /// A timer that goes off while the thumb is still inside its delay --
+    /// there was another scroll after the one that set it -- sleeps out the
+    /// rest instead of drawing.
+    #[test]
+    fn a_timer_overtaken_by_a_scroll_sleeps_on() {
+        let scrolled = Instant::now();
+        let state = ScrollbarState::default()
+            .get()
+            .with_last_scroll(point(px(0.), px(-10.)), Some(scrolled));
+        let after = |secs: f32| scrolled + Duration::from_secs_f32(secs);
+
+        let wait = state.fade_put_off(after(0.5)).expect("half a second in");
+        assert!((wait - 1.5).abs() < 0.001, "{wait}");
+        // On time, or late: this is the frame.
+        assert_eq!(state.fade_put_off(after(FADE_OUT_DELAY)), None);
+        assert_eq!(state.fade_put_off(after(2.3)), None);
+        assert_eq!(state.fade_put_off(after(10.)), None);
+
+        // The pointer has come onto a bar: nothing else draws it as hovered.
+        let hovered = state.with_hovered(Some(Axis::Vertical), after(0.5));
+        assert_eq!(hovered.fade_put_off(after(0.6)), None);
+        // The bar on screen is not where the content is: that is a frame.
+        assert_eq!(state.with_behind(true).fade_put_off(after(0.5)), None);
+        // Never scrolled: there is nothing to wait for.
+        assert_eq!(
+            ScrollbarState::default().get().fade_put_off(after(0.)),
+            None
+        );
+    }
+
     /// Until the first step, the thumb is within a hundredth of opaque.
     #[test]
     fn nothing_visible_is_skipped() {
@@ -1197,5 +1377,465 @@ mod fade_tests {
         // Once it is over there is nothing left to draw.
         assert_eq!(next_fade_frame(FADE_OUT_DURATION), None);
         assert_eq!(next_fade_frame(10.), None);
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    //! What a scroll costs in frames, on gpui's test clock.
+    //!
+    //! Nothing but the scrollbar asks for a frame in here: no caret blinks,
+    //! and the pointer only moves when a test moves it. That is an editor
+    //! without the focus, or one with a solid caret.
+
+    use super::*;
+    use gpui::{
+        Context, Entity, InteractiveElement as _, Modifiers, MouseButton, ParentElement as _,
+        Render, ScrollDelta, StatefulInteractiveElement as _, Styled as _, TestAppContext,
+        VisualTestContext, canvas, div,
+    };
+    use std::cell::RefCell;
+
+    const VIEW_W: f32 = 400.;
+    const VIEW_H: f32 = 300.;
+
+    /// The scrollbar, leaving the colour of each thumb it has just laid out
+    /// where a test can read it.
+    struct Watched {
+        scrollbar: Scrollbar,
+        thumbs: Rc<RefCell<Vec<(Axis, Hsla)>>>,
+    }
+
+    impl IntoElement for Watched {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for Watched {
+        type RequestLayoutState = ();
+        type PrepaintState = PrepaintState;
+
+        fn id(&self) -> Option<ElementId> {
+            Element::id(&self.scrollbar)
+        }
+
+        fn source_location(&self) -> Option<&'static Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            self.scrollbar.request_layout(id, inspector_id, window, cx)
+        }
+
+        fn prepaint(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector_id: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            request_layout: &mut Self::RequestLayoutState,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Self::PrepaintState {
+            let prepaint =
+                self.scrollbar
+                    .prepaint(id, inspector_id, bounds, request_layout, window, cx);
+            *self.thumbs.borrow_mut() = prepaint
+                .states
+                .iter()
+                .map(|axis| (axis.axis, axis.thumb_bg))
+                .collect();
+            prepaint
+        }
+
+        fn paint(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector_id: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            request_layout: &mut Self::RequestLayoutState,
+            prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            self.scrollbar.paint(
+                id,
+                inspector_id,
+                bounds,
+                request_layout,
+                prepaint,
+                window,
+                cx,
+            )
+        }
+    }
+
+    /// A scroll area five times its own size with a scrollbar over it, that
+    /// notes when each of its frames is drawn.
+    struct Scroller {
+        handle: ScrollHandle,
+        show: ScrollbarShow,
+        frames: Vec<Instant>,
+        /// The thumbs as the last frame drew them.
+        thumbs: Rc<RefCell<Vec<(Axis, Hsla)>>>,
+        /// Where to scroll to while the next frame is being painted.
+        scroll_while_painting: Rc<Cell<Option<Point<Pixels>>>>,
+    }
+
+    impl Render for Scroller {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.frames.push(cx.background_executor().now());
+            div()
+                .relative()
+                .w(px(VIEW_W))
+                .h(px(VIEW_H))
+                .child(
+                    div()
+                        .id("area")
+                        .size_full()
+                        .overflow_scroll()
+                        .track_scroll(&self.handle)
+                        .child(div().flex_none().w(px(VIEW_W * 5.)).h(px(VIEW_H * 5.))),
+                )
+                // Painted before the scrollbar, like the text of an editor.
+                .child({
+                    let handle = self.handle.clone();
+                    let scroll_to = self.scroll_while_painting.clone();
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, _, _| {
+                            if let Some(offset) = scroll_to.take() {
+                                handle.set_offset(offset);
+                            }
+                        },
+                    )
+                    .absolute()
+                    .size_0()
+                })
+                // Laid over the area, the way `Scrollable` and the editor do it.
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(Watched {
+                            scrollbar: Scrollbar::new(&self.handle).scrollbar_show(self.show),
+                            thumbs: self.thumbs.clone(),
+                        }),
+                )
+        }
+    }
+
+    fn scroller(
+        show: ScrollbarShow,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Scroller>, &mut VisualTestContext) {
+        cx.update(crate::theme::init);
+        cx.add_window_view(|_, _| Scroller {
+            handle: ScrollHandle::new(),
+            show,
+            frames: vec![],
+            thumbs: Rc::default(),
+            scroll_while_painting: Rc::default(),
+        })
+    }
+
+    /// How opaque the last frame drew the thumb of `axis`: 1 is the thumb as
+    /// the theme has it, 0 is no thumb.
+    fn thumb(axis: Axis, view: &Entity<Scroller>, cx: &mut VisualTestContext) -> f32 {
+        let lit = cx.update(|_, cx| cx.theme().scrollbar_thumb);
+        view.read_with(cx, |view, _| {
+            let thumbs = view.thumbs.borrow();
+            let (_, color) = thumbs.iter().find(|(drawn, _)| *drawn == axis).unwrap();
+            color.a / lit.a
+        })
+    }
+
+    /// How many frames have been drawn so far.
+    fn frames(view: &Entity<Scroller>, cx: &mut VisualTestContext) -> usize {
+        view.read_with(cx, |view, _| view.frames.len())
+    }
+
+    /// When the frames after the first `skip` were drawn, in seconds after `since`.
+    fn frames_after(
+        skip: usize,
+        since: Instant,
+        view: &Entity<Scroller>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<f32> {
+        view.read_with(cx, |view, _| {
+            view.frames[skip..]
+                .iter()
+                .map(|at| at.duration_since(since).as_secs_f32())
+                .collect()
+        })
+    }
+
+    /// A frame that scrolls while it is being painted, after the scrollbar
+    /// has been laid out. An editor does this when it follows its caret.
+    fn scroll_while_painting(view: &Entity<Scroller>, cx: &mut VisualTestContext) {
+        view.update(cx, |view, cx| {
+            let y = view.handle.offset().y - px(100.);
+            view.scroll_while_painting.set(Some(point(px(0.), y)));
+            cx.notify();
+        });
+    }
+
+    /// One notch of a wheel mouse: a single event, and nothing after it.
+    fn wheel(cx: &mut VisualTestContext) {
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(100.), px(100.)),
+            delta: ScrollDelta::Lines(point(0., -1.)),
+            ..Default::default()
+        });
+    }
+
+    /// A notch of the wheel shows the thumb, and the thumb goes away again
+    /// without anything else drawing the view (dopamine #927).
+    ///
+    /// It used not to: the frame that draws the scroll is the one frame that
+    /// started no timer, and the `notify` in its paint asks for no frame --
+    /// gpui does not take one from inside a draw. A trackpad hides this (its
+    /// gesture ends in events that move nothing but still redraw an editor),
+    /// and so does a blinking caret.
+    fn one_notch_fades_by_itself(show: ScrollbarShow, cx: &mut TestAppContext) {
+        let (view, cx) = scroller(show, cx);
+        let before = frames(&view, cx);
+
+        wheel(cx);
+        let scrolled_at = cx.executor().now();
+        let after_the_notch = frames(&view, cx);
+        // The fix is a timer, not a second frame behind every scroll.
+        assert_eq!(after_the_notch - before, 1, "a notch is one frame");
+        assert!(view.read_with(cx, |view, _| view.handle.offset().y) < px(0.));
+        assert_eq!(thumb(Axis::Vertical, &view, cx), 1., "the scroll shows it");
+
+        cx.executor().advance_clock(Duration::from_secs(10));
+        let fade = frames_after(after_the_notch, scrolled_at, &view, cx);
+        assert!(
+            !fade.is_empty(),
+            "nothing drew the thumb again: it stays on screen"
+        );
+        // Nothing is drawn while the thumb is opaque...
+        assert!((fade[0] - FADE_OUT_DELAY).abs() < 0.01, "{fade:?}");
+        // ...the last frame is past the end of the fade, so it is drawn gone...
+        let last = *fade.last().unwrap();
+        assert!(last >= FADE_OUT_DURATION, "{fade:?}");
+        assert!(last < FADE_OUT_DURATION + 0.05, "{fade:?}");
+        // ...and that takes the handful of frames a fade takes.
+        assert!(fade.len() <= 16, "{} frames: {fade:?}", fade.len());
+        assert_eq!(thumb(Axis::Vertical, &view, cx), 0., "the thumb is gone");
+
+        // Then it is over: an idle view is not drawn.
+        let settled = frames(&view, cx);
+        cx.executor().advance_clock(Duration::from_secs(60));
+        assert_eq!(frames(&view, cx), settled, "still drawing after the fade");
+    }
+
+    #[gpui::test]
+    fn one_notch_of_the_wheel_fades_by_itself(cx: &mut TestAppContext) {
+        one_notch_fades_by_itself(ScrollbarShow::Scrolling, cx);
+    }
+
+    /// The mode `Theme::sync_scrollbar_appearance` picks when the system does
+    /// not hide its scroll bars -- as macOS does not while a mouse is plugged
+    /// in, which is when a wheel sends single notches.
+    #[gpui::test]
+    fn one_notch_of_the_wheel_fades_by_itself_when_shown_on_hover(cx: &mut TestAppContext) {
+        one_notch_fades_by_itself(ScrollbarShow::Hover, cx);
+    }
+
+    /// Scrolling on puts the fade off, and costs no frame to do it: the timer
+    /// the first notch set does not draw at *its* two seconds, when the last
+    /// notch is a second old and the thumb as opaque as it was drawn.
+    #[gpui::test]
+    fn scrolling_on_puts_the_fade_off_without_a_frame(cx: &mut TestAppContext) {
+        let (view, cx) = scroller(ScrollbarShow::Scrolling, cx);
+        let before = frames(&view, cx);
+
+        let mut last_notch = cx.executor().now();
+        for _ in 0..10 {
+            last_notch = cx.executor().now();
+            wheel(cx);
+            cx.executor().advance_clock(Duration::from_millis(100));
+        }
+        let scrolled = frames(&view, cx);
+        assert_eq!(scrolled - before, 10, "a notch is one frame");
+
+        cx.executor().advance_clock(Duration::from_secs(10));
+        let fade = frames_after(scrolled, last_notch, &view, cx);
+        assert!((fade[0] - FADE_OUT_DELAY).abs() < 0.01, "{fade:?}");
+        assert!(*fade.last().unwrap() >= FADE_OUT_DURATION, "{fade:?}");
+        assert!(fade.len() <= 16, "{} frames: {fade:?}", fade.len());
+    }
+
+    /// A scroll made while the frame is painted is one the frame drew no thumb
+    /// for. It is noted and left to the next frame, as it always was -- what
+    /// must not come of it is a timer, and the thumb turning up two seconds
+    /// after the caret moved.
+    #[gpui::test]
+    fn a_scroll_made_while_painting_shows_no_thumb_two_seconds_late(cx: &mut TestAppContext) {
+        let (view, cx) = scroller(ScrollbarShow::Scrolling, cx);
+        scroll_while_painting(&view, cx);
+        let (drawn, at) = (frames(&view, cx), cx.executor().now());
+        assert!(view.read_with(cx, |view, _| view.handle.offset().y) < px(0.));
+        assert_eq!(thumb(Axis::Vertical, &view, cx), 0., "laid out before it");
+
+        cx.executor().advance_clock(Duration::from_secs(10));
+        let later = frames_after(drawn, at, &view, cx);
+        assert!(later.first().is_none_or(|first| *first < 0.1), "{later:?}");
+    }
+
+    /// ...and when a fade is running, its next step still draws on time: the
+    /// bar on screen is behind the content, so there is something to draw.
+    #[gpui::test]
+    fn a_scroll_made_while_painting_is_caught_up_by_a_running_fade(cx: &mut TestAppContext) {
+        let (view, cx) = scroller(ScrollbarShow::Scrolling, cx);
+        wheel(cx);
+        // Into the fade, where the timer steps.
+        cx.executor().advance_clock(Duration::from_secs_f32(
+            FADE_OUT_DELAY + FADE_OUT_FLAT + 0.1,
+        ));
+
+        scroll_while_painting(&view, cx);
+        let (drawn, at) = (frames(&view, cx), cx.executor().now());
+        cx.executor().advance_clock(Duration::from_secs(10));
+        let later = frames_after(drawn, at, &view, cx);
+        assert!(
+            later[0] <= FADE_OUT_TICK + 0.001,
+            "the bar stayed behind: {later:?}"
+        );
+        // From there it is an ordinary fade, counted from the scroll.
+        assert!(*later.last().unwrap() >= FADE_OUT_DURATION, "{later:?}");
+        assert!(later.len() <= 17, "{} frames: {later:?}", later.len());
+        assert_eq!(thumb(Axis::Vertical, &view, cx), 0.);
+    }
+
+    /// A bar that does not fade has nothing to wake up for.
+    #[gpui::test]
+    fn a_notch_starts_no_timer_when_nothing_fades(cx: &mut TestAppContext) {
+        for show in [ScrollbarShow::Always, ScrollbarShow::Hidden] {
+            let (view, cx) = scroller(show, cx);
+            wheel(cx);
+            let after_the_notch = frames(&view, cx);
+            cx.executor().advance_clock(Duration::from_secs(10));
+            assert_eq!(frames(&view, cx), after_the_notch, "{show:?}");
+        }
+    }
+
+    /// The frame that shows the thumb also makes it usable: a press on the
+    /// track right after a notch is the scrollbar's, not whatever is under it.
+    ///
+    /// The listeners were handed "is it showing" as it was before the scroll
+    /// was noted, and left to the next frame to be told otherwise.
+    #[gpui::test]
+    fn the_bar_takes_a_press_in_the_frame_that_shows_it(cx: &mut TestAppContext) {
+        let (view, cx) = scroller(ScrollbarShow::Scrolling, cx);
+        wheel(cx);
+        let before = view.read_with(cx, |view, _| view.handle.offset().y);
+
+        // Low on the vertical track, well clear of the thumb.
+        cx.simulate_mouse_down(
+            point(px(VIEW_W - 4.), px(VIEW_H - 40.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        let after = view.read_with(cx, |view, _| view.handle.offset().y);
+        assert!(
+            after < before - px(VIEW_H),
+            "the press went through the bar: {after:?}"
+        );
+    }
+
+    /// With both bars showing, the pointer at rest on one of them keeps both
+    /// in place without drawing anything (dopamine #927).
+    ///
+    /// The bar under the pointer stays by putting the clock back to "now" in
+    /// every frame, and the two bars share that clock: the other one read it
+    /// as "scrolled a moment ago" and set a timer to fade -- for ever, a
+    /// frame or two every two seconds until the pointer left.
+    #[gpui::test]
+    fn the_pointer_at_rest_on_one_of_two_bars_draws_nothing(cx: &mut TestAppContext) {
+        let vertical = point(px(VIEW_W - 4.), px(VIEW_H / 2.));
+        let horizontal = point(px(VIEW_W / 2.), px(VIEW_H - 4.));
+        for on_the_bar in [vertical, horizontal] {
+            let (view, cx) = scroller(ScrollbarShow::Scrolling, cx);
+            wheel(cx);
+            // One more frame, as every scroll but a single notch has.
+            view.update(cx, |_, cx| cx.notify());
+
+            cx.simulate_mouse_move(on_the_bar, None, Modifiers::default());
+            let resting = frames(&view, cx);
+            cx.executor().advance_clock(Duration::from_secs(60));
+            let drawn = frames(&view, cx) - resting;
+            // The timer that was already running goes off once, finds the
+            // pointer there, and nothing takes its place.
+            assert!(
+                drawn <= 1,
+                "{drawn} frames in a minute with the pointer at rest"
+            );
+
+            // Whatever else draws the window finds both bars where the pointer
+            // keeps them, as they were before, and sets nothing off.
+            view.update(cx, |_, cx| cx.notify());
+            assert_eq!(thumb(Axis::Vertical, &view, cx), 1.);
+            assert_eq!(thumb(Axis::Horizontal, &view, cx), 1.);
+            let redrawn = frames(&view, cx);
+            cx.executor().advance_clock(Duration::from_secs(60));
+            assert_eq!(frames(&view, cx), redrawn, "a redraw started it again");
+
+            // Moving off -- in one go, with no move inside the bar first --
+            // lets both fade from there, as they did, and like any other fade.
+            let left = frames(&view, cx);
+            let left_at = cx.executor().now();
+            cx.simulate_mouse_move(point(px(100.), px(100.)), None, Modifiers::default());
+            assert_eq!(thumb(Axis::Vertical, &view, cx), 1.);
+            assert_eq!(thumb(Axis::Horizontal, &view, cx), 1.);
+            cx.executor().advance_clock(Duration::from_secs(10));
+            let fade = frames_after(left, left_at, &view, cx);
+            assert_eq!(fade[0], 0., "leaving the bar is drawn at once: {fade:?}");
+            assert!((fade[1] - FADE_OUT_DELAY).abs() < 0.01, "{fade:?}");
+            let last = *fade.last().unwrap();
+            assert!(last >= FADE_OUT_DURATION, "{fade:?}");
+            assert!(fade.len() <= 17, "{} frames: {fade:?}", fade.len());
+            assert_eq!(thumb(Axis::Vertical, &view, cx), 0.);
+            assert_eq!(thumb(Axis::Horizontal, &view, cx), 0.);
+
+            let settled = frames(&view, cx);
+            cx.executor().advance_clock(Duration::from_secs(60));
+            assert_eq!(frames(&view, cx), settled, "still drawing after the fade");
+        }
+    }
+
+    /// Shown on hover, the bar under the pointer does not hold the clock: the
+    /// other one fades as it always did, once, and that is all.
+    #[gpui::test]
+    fn shown_on_hover_the_other_bar_still_fades(cx: &mut TestAppContext) {
+        let (view, cx) = scroller(ScrollbarShow::Hover, cx);
+        wheel(cx);
+        view.update(cx, |_, cx| cx.notify());
+
+        cx.simulate_mouse_move(
+            point(px(VIEW_W - 4.), px(VIEW_H / 2.)),
+            None,
+            Modifiers::default(),
+        );
+        let (resting, at) = (frames(&view, cx), cx.executor().now());
+        cx.executor().advance_clock(Duration::from_secs(60));
+        let fade = frames_after(resting, at, &view, cx);
+        assert!(!fade.is_empty() && fade.len() <= 16, "{fade:?}");
+        assert!(*fade.last().unwrap() < FADE_OUT_DURATION + 0.05, "{fade:?}");
+        assert_eq!(thumb(Axis::Vertical, &view, cx), 1., "under the pointer");
+        assert_eq!(thumb(Axis::Horizontal, &view, cx), 0.);
     }
 }

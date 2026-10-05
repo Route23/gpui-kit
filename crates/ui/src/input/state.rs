@@ -4523,6 +4523,13 @@ impl EntityInputHandler for InputState {
         // The check is deliberately structural rather than `old_text != self.text`:
         // comparing two ropes is O(n) and this runs on every keystroke.
         if !range.is_empty() || !new_text.is_empty() {
+            // And the open search has to hear of it, as it does on the other
+            // path. The text being composed is in the buffer: without this the
+            // matches were those of the text before it, and every one after
+            // the caret was boxed that many bytes too early until the
+            // composition was committed (dopamine #927). A closed panel does
+            // nothing with it.
+            self.update_search(cx);
             cx.emit(InputEvent::Change);
         }
         cx.notify();

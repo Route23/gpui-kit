@@ -495,3 +495,120 @@ impl RenderOnce for Input {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+
+    use gpui::{
+        AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, ScrollDelta,
+        ScrollWheelEvent, Styled as _, TestAppContext, VisualTestContext, Window, div, point, px,
+    };
+
+    use super::Input;
+    use crate::{Root, Theme, input::InputState, scroll::ScrollbarShow};
+
+    /// A view that draws an editor a few rows high, and notes when each of
+    /// its frames is drawn. Its frames are the window's.
+    struct Drawn {
+        editor: Entity<InputState>,
+        frames: Vec<Instant>,
+    }
+
+    impl Render for Drawn {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.frames.push(cx.background_executor().now());
+            div()
+                .w(px(400.))
+                .h(px(200.))
+                .child(Input::new(&self.editor).h_full())
+        }
+    }
+
+    /// A code editor of two hundred rows that does not have the focus: no
+    /// caret blinks, so nothing draws it but what the test does.
+    fn editor(cx: &mut TestAppContext) -> (Entity<Drawn>, &mut VisualTestContext) {
+        let drawn = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let drawn = drawn.clone();
+            move |window, cx| {
+                let rows: Vec<String> = (0..200).map(|row| format!("row {row}")).collect();
+                let editor = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .code_editor("text")
+                        .default_value(rows.join("\n"))
+                });
+                let view = cx.new(|_| Drawn {
+                    editor,
+                    frames: vec![],
+                });
+                *drawn.borrow_mut() = Some(view.clone());
+                Root::new(view, window, cx)
+            }
+        });
+        let drawn = drawn.borrow().clone().unwrap();
+        (drawn, cx)
+    }
+
+    /// One notch of the wheel over an editor nothing else redraws, and its
+    /// scrollbar is gone again three seconds later (dopamine #927).
+    ///
+    /// The thumb used to stay: the fade's timer was set by the frame *after*
+    /// a scroll, and for a single wheel event there is none.
+    #[gpui::test]
+    fn the_scrollbar_of_an_idle_editor_fades_after_one_notch(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        // What `Theme::sync_scrollbar_appearance` picks when the system
+        // hides its scroll bars, and when it does not.
+        for show in [ScrollbarShow::Scrolling, ScrollbarShow::Hover] {
+            cx.update(|cx| Theme::global_mut(cx).scrollbar_show = show);
+            let (drawn, cx) = editor(cx);
+            let frames =
+                |cx: &mut VisualTestContext| drawn.read_with(cx, |drawn, _| drawn.frames.len());
+            let before = frames(cx);
+
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(100.), px(100.)),
+                delta: ScrollDelta::Lines(point(0., -1.)),
+                ..Default::default()
+            });
+            let scrolled_at = cx.executor().now();
+            let scrolled = frames(cx);
+            assert_eq!(scrolled - before, 1, "{show:?}: a notch is one frame");
+            let offset =
+                drawn.read_with(cx, |drawn, cx| drawn.editor.read(cx).scroll_handle.offset());
+            assert!(offset.y < px(0.), "{show:?}: {offset:?}");
+
+            cx.executor().advance_clock(Duration::from_secs(10));
+            let fade: Vec<f32> = drawn.read_with(cx, |drawn, _| {
+                drawn.frames[scrolled..]
+                    .iter()
+                    .map(|at| at.duration_since(scrolled_at).as_secs_f32())
+                    .collect()
+            });
+            let last = fade.last().copied();
+            assert!(
+                last.is_some_and(|last| (3.0..3.5).contains(&last)),
+                "{show:?}: the thumb is not drawn gone: {fade:?}"
+            );
+            assert!(
+                fade.len() <= 16,
+                "{show:?}: {} frames: {fade:?}",
+                fade.len()
+            );
+
+            // And an editor that is idle is not drawn.
+            let settled = frames(cx);
+            cx.executor().advance_clock(Duration::from_secs(60));
+            assert_eq!(
+                frames(cx),
+                settled,
+                "{show:?}: still drawing after the fade"
+            );
+        }
+    }
+}
