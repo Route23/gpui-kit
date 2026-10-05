@@ -1836,7 +1836,7 @@ impl InputState {
     pub fn set_cursor_blinking(
         &mut self,
         blinking: CursorBlinking,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let InputMode::CodeEditor {
@@ -1845,10 +1845,17 @@ impl InputState {
         {
             *cursor_blinking = blinking;
         }
-        // The timer only runs for `Blink`, so the style has to be handed over.
-        let blinking = self.mode.cursor_blinking();
-        self.blink_cursor
-            .update(cx, |cursor, cx| cursor.start(blinking, cx));
+        // The timer only runs for `Blink`, so the style has to be handed over
+        // -- **to the input that has the focus.** A host hands a new setting
+        // to every editor it has, and starting the timer in each of them made
+        // every one repaint the window twice a second for a caret that only
+        // one shows (dopamine #930). The others pick the style up when they
+        // are focused.
+        if self.focus_handle.is_focused(window) {
+            let blinking = self.mode.cursor_blinking();
+            self.blink_cursor
+                .update(cx, |cursor, cx| cursor.start(blinking, cx));
+        }
         cx.notify();
     }
 
