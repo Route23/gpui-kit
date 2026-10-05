@@ -130,6 +130,18 @@ impl TextElement {
         }
     }
 
+    /// Ask for the next frame of the display.
+    ///
+    /// On it gpui notifies the view being drawn, which draws the window again
+    /// -- all of it, and at the rate of the display for as long as each frame
+    /// asks for the next. Only a caret slide comes through here: it lasts 90ms
+    /// and has to be smooth. A blinking caret must not (dopamine #902).
+    fn request_display_frame(window: &Window) {
+        #[cfg(test)]
+        display_frames::asked(window.current_view());
+        window.request_animation_frame();
+    }
+
     /// Set the placeholder text of the input field.
     pub fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
         self.placeholder = placeholder.into();
@@ -2663,7 +2675,7 @@ impl Element for TextElement {
         // Paint blinking cursor
         //
         // `Blink` is already on/off by the time it gets here; the fades are
-        // shaped from the phase, and only those need a frame scheduled.
+        // shaped from the phase.
         if focused && show_cursor {
             if let Some(target) = prepaint.cursor_bounds {
                 // Where the caret is *drawn* -- part way along a slide, or the
@@ -2678,7 +2690,8 @@ impl Element for TextElement {
                 let state = self.state.read(cx);
                 let blinking = state.mode.cursor_blinking();
                 let style = state.mode.cursor_style();
-                let phase = state.blink_cursor.read(cx).phase();
+                let blink_cursor = state.blink_cursor.clone();
+                let phase = blink_cursor.read(cx).phase(cx);
                 let (opacity, height) = caret::appearance(blinking, phase);
                 let quad = caret::scale_height(cursor_bounds, height);
                 let color = cx.theme().caret.opacity(opacity);
@@ -2698,11 +2711,20 @@ impl Element for TextElement {
                     window.paint_quad(fill(quad, color));
                 }
 
-                // A slide needs frames for the same reason the fades do.
-                // Every caret move pauses the blink (`pause_blink_cursor`), so
-                // the caret is solid while it travels without any extra work.
-                if sliding || blinking.needs_animation() {
-                    window.request_animation_frame();
+                // A slide asks the display for its frames: it lasts 90ms and
+                // has to be smooth. Every caret move pauses the blink
+                // (`pause_blink_cursor`), so the caret is solid while it
+                // travels without any extra work.
+                if sliding {
+                    Self::request_display_frame(window);
+                }
+                // A fade is stepped by a timer instead, and only where it can
+                // be seen: there are bounds for a caret that is scrolled out
+                // of view too. See `BlinkCursor::request_frame`.
+                if blinking.needs_animation()
+                    && window.content_mask().bounds.intersects(&cursor_bounds)
+                {
+                    blink_cursor.update(cx, |cursor, cx| cursor.request_frame(cx));
                 }
             }
         }
@@ -3065,6 +3087,31 @@ fn split_runs_by_bg_segments(
     }
 
     result
+}
+
+/// The frames of the display the element asked for.
+///
+/// A test window has no display behind it, so nothing ever runs them: they are
+/// noted here instead, and the test plays the display (`blink_cursor.rs`).
+#[cfg(test)]
+pub(super) mod display_frames {
+    use gpui::EntityId;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ASKED: RefCell<Vec<EntityId>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn asked(view: EntityId) {
+        ASKED.with(|asked| asked.borrow_mut().push(view));
+    }
+
+    /// The views that asked for a frame since the last call, each of them once.
+    pub(in crate::input) fn take() -> Vec<EntityId> {
+        let mut views = ASKED.with(|asked| std::mem::take(&mut *asked.borrow_mut()));
+        views.dedup();
+        views
+    }
 }
 
 #[cfg(test)]

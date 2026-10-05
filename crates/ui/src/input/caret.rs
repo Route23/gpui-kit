@@ -86,16 +86,54 @@ pub enum CursorBlinking {
 }
 
 impl CursorBlinking {
-    /// Whether the caret has to be repainted every frame.
+    /// Whether the caret is animated: its opacity or its height is somewhere
+    /// else every time it is drawn, instead of being switched.
     ///
-    /// [`Self::Blink`] is driven by the 500ms timer in `blink_cursor.rs`, and
-    /// [`Self::Solid`] never changes -- neither needs an animation frame.
+    /// [`Self::Blink`] is switched by the 500ms timer in `blink_cursor.rs`, and
+    /// [`Self::Solid`] never changes. The others are drawn a step at a time,
+    /// on a timer as well -- see [`next_fade_frame`]. None of them asks the
+    /// display for frames.
     pub fn needs_animation(self) -> bool {
         matches!(
             self,
             CursorBlinking::Smooth | CursorBlinking::Phase | CursorBlinking::Expand
         )
     }
+}
+
+/// How long between two steps of an animated caret
+/// ([`CursorBlinking::needs_animation`]).
+///
+/// A step draws the window again -- all of it, in an application that caches
+/// none of its views -- so this is what the setting costs for as long as the
+/// editor sits idle with the focus. 30 a second: the biggest step of a fade is
+/// then a tenth of it.
+///
+/// The fades used to ask for a frame of the display on every frame they drew
+/// instead, which is 60 to 144 windows a second (dopamine #902).
+pub const FADE_TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+/// How long to wait before drawing an animated caret again, `elapsed` into
+/// its cycle.
+///
+/// The steps are on a grid counted from the start of the cycle, not one
+/// [`FADE_TICK`] after the frame that asks. A frame is only drawn on the
+/// display's next refresh after its timer, so "a tick from now" lands just
+/// past a refresh every time and waits for the one after: 20 frames a second
+/// on a 60Hz display, not 30. On the grid, one frame being late does not push
+/// the next one back.
+pub fn next_fade_frame(elapsed: Duration) -> Duration {
+    // Never wait for less than this. A frame drawn so late that the next
+    // step is all but due -- or a timer that fired a hair early -- skips that
+    // step instead of drawing it right behind.
+    const MIN: Duration = Duration::from_millis(4);
+
+    let tick = FADE_TICK.as_nanos();
+    let mut wait = tick - elapsed.as_nanos() % tick;
+    if wait < MIN.as_nanos() {
+        wait += tick;
+    }
+    Duration::from_nanos(wait as u64)
 }
 
 /// How the caret moves between two positions.
@@ -410,12 +448,126 @@ mod tests {
     }
 
     #[test]
-    fn only_the_interpolating_styles_need_a_frame() {
+    fn only_the_interpolating_styles_are_animated() {
         assert!(!CursorBlinking::Blink.needs_animation());
         assert!(!CursorBlinking::Solid.needs_animation());
         assert!(CursorBlinking::Smooth.needs_animation());
         assert!(CursorBlinking::Phase.needs_animation());
         assert!(CursorBlinking::Expand.needs_animation());
+    }
+
+    /// The steps of a fade are a tick apart, counted from the start of its
+    /// cycle -- wherever in between the caret happens to be painted.
+    #[test]
+    fn a_fade_is_stepped_on_a_grid() {
+        let ms = Duration::from_millis;
+        assert_eq!(next_fade_frame(Duration::ZERO), FADE_TICK);
+        assert_eq!(next_fade_frame(ms(10)), FADE_TICK - ms(10));
+        assert_eq!(next_fade_frame(FADE_TICK), FADE_TICK);
+        assert_eq!(next_fade_frame(FADE_TICK * 7 + ms(5)), FADE_TICK - ms(5));
+        // Hours in, the grid has not moved.
+        assert_eq!(
+            next_fade_frame(FADE_TICK * 1_000_000 + ms(20)),
+            FADE_TICK - ms(20)
+        );
+
+        // Painted so late that the next step is all but due (or woken a hair
+        // before its own): that one is skipped, not drawn right behind.
+        assert_eq!(next_fade_frame(FADE_TICK - ms(1)), FADE_TICK + ms(1));
+        assert_eq!(next_fade_frame(FADE_TICK * 3 - ms(3)), FADE_TICK + ms(3));
+
+        for micros in (0..200_000).step_by(37) {
+            let wait = next_fade_frame(Duration::from_micros(micros));
+            assert!(wait >= ms(4), "{micros}us: {wait:?}");
+            assert!(wait < FADE_TICK + ms(4), "{micros}us: {wait:?}");
+        }
+    }
+
+    /// A fade as a display shows it, as the refreshes its frames are drawn on.
+    ///
+    /// The timer wakes it, the window is drawn on the next refresh of the
+    /// display, the caret is painted `into_frame` after that refresh began,
+    /// and asks for its next step from there: `next`, given how far into its
+    /// cycle it is. The cycle began `before` the first refresh.
+    fn refreshes_drawn(
+        hz: u64,
+        before: Duration,
+        into_frame: Duration,
+        next: impl Fn(Duration) -> Duration,
+    ) -> Vec<u64> {
+        const SECONDS: u64 = 10;
+        let refresh = |n: u64| Duration::from_nanos(n * 1_000_000_000 / hz);
+        let mut drawn = vec![];
+        let mut painted = into_frame;
+        loop {
+            let wake = painted + next(before + painted);
+            let mut n = (wake.as_nanos() * u128::from(hz) / 1_000_000_000) as u64;
+            while refresh(n) < wake {
+                n += 1;
+            }
+            if n > SECONDS * hz {
+                return drawn;
+            }
+            drawn.push(n);
+            painted = refresh(n) + into_frame;
+        }
+    }
+
+    fn gaps(drawn: &[u64]) -> Vec<u64> {
+        drawn.windows(2).map(|pair| pair[1] - pair[0]).collect()
+    }
+
+    /// 30 frames a second on the displays there are, and evenly: every other
+    /// refresh at 60Hz, every fourth at 120Hz -- wherever between two
+    /// refreshes the cycle began, and however far into its frame the caret is
+    /// painted.
+    #[test]
+    fn a_fade_is_thirty_frames_a_second_on_a_display() {
+        let ms = Duration::from_millis;
+        let befores = [ms(0), ms(3), ms(8), ms(15), ms(21), ms(30)];
+        for before in befores {
+            for into_frame in [ms(0), ms(1), ms(4), ms(9), ms(12)] {
+                let drawn = refreshes_drawn(60, before, into_frame, next_fade_frame);
+                let at = format!("60Hz, began {before:?} before, painted {into_frame:?} in");
+                assert!((299..=300).contains(&drawn.len()), "{at}: {}", drawn.len());
+                assert!(gaps(&drawn).iter().all(|gap| *gap == 2), "{at}");
+            }
+            for into_frame in [ms(0), ms(1), ms(4), ms(7)] {
+                let drawn = refreshes_drawn(120, before, into_frame, next_fade_frame);
+                let at = format!("120Hz, began {before:?} before, painted {into_frame:?} in");
+                assert!((299..=300).contains(&drawn.len()), "{at}: {}", drawn.len());
+                assert!(gaps(&drawn).iter().all(|gap| *gap == 4), "{at}");
+            }
+            // 144 is not a multiple of 30: four or five refreshes apart.
+            for into_frame in [ms(0), ms(1), ms(4)] {
+                let drawn = refreshes_drawn(144, before, into_frame, next_fade_frame);
+                let at = format!("144Hz, began {before:?} before, painted {into_frame:?} in");
+                assert!((299..=300).contains(&drawn.len()), "{at}: {}", drawn.len());
+                assert!(gaps(&drawn).iter().all(|gap| (4..=5).contains(gap)), "{at}");
+            }
+        }
+    }
+
+    /// Why the steps are on a grid: a tick counted from the frame that asks
+    /// comes due just after a refresh, and is drawn on the one after.
+    #[test]
+    fn a_tick_after_each_frame_would_be_twenty_a_second() {
+        let ms = Duration::from_millis;
+        for into_frame in [ms(1), ms(4), ms(9)] {
+            let drawn = refreshes_drawn(60, ms(0), into_frame, |_| FADE_TICK);
+            assert_eq!(drawn.len(), 200, "{into_frame:?} into the frame");
+            assert!(gaps(&drawn).iter().all(|gap| *gap == 3), "{into_frame:?}");
+        }
+    }
+
+    /// A window that takes longer to draw than a tick is not drawn back to
+    /// back for the caret: the steps it is too late for are skipped.
+    #[test]
+    fn a_slow_window_skips_steps() {
+        let slow = Duration::from_millis(40);
+        let drawn = refreshes_drawn(60, Duration::ZERO, slow, next_fade_frame);
+        assert!(drawn.len() <= 200, "{}", drawn.len());
+        assert!(gaps(&drawn).iter().all(|gap| *gap >= 3));
     }
 
     #[test]
