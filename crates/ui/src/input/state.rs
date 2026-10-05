@@ -2378,17 +2378,29 @@ impl InputState {
         debug_assert!(self.mode.is_multi_line());
         self.soft_wrap = wrap;
         if wrap {
-            // **Only once there has been a frame.** Before it there is no
-            // width to wrap at: the bounds this falls back on are set by the
-            // first paint, and are none wide until then. Every row was laid
-            // out nearly a letter to a line for that, and again for the
-            // editor's font, before the first frame brought the width
-            // (dopamine #878). That paint is what brings it now, as it does
-            // for an input made with soft wrap on (`set_input_bounds`).
-            if let Some(last_layout) = self.last_layout.as_ref() {
-                let wrap_width = last_layout
-                    .wrap_width
-                    .unwrap_or(self.input_bounds.size.width);
+            // **Only once a frame has had a width.** Before it there is none
+            // to wrap at: the bounds this looks at are set by the first
+            // paint, and are none wide until then. Every row was laid out
+            // nearly a letter to a line for that, and again for the editor's
+            // font, before the first frame brought the width (dopamine #878).
+            // The frame is what brings it, as it does for an input made with
+            // soft wrap on (`TextElement::prepaint`).
+            let drawn = self
+                .last_layout
+                .as_ref()
+                .filter(|_| self.input_bounds.size.width > px(0.));
+            if let Some(last_layout) = drawn {
+                // What that frame wrapped at -- or, when it did not wrap,
+                // what its gutter left of the editor. The next frame hands
+                // over the width it finds, whatever is put here; this is the
+                // one it finds unless the gutter moves as well, or the rows
+                // wrap at a column (`WrapAt`), and then it has no row to lay
+                // out a second time. (It was the editor's whole width, gutter
+                // and all, with nothing but a resize to put it right:
+                // dopamine #894.)
+                let wrap_width = last_layout.wrap_width.unwrap_or(
+                    self.input_bounds.size.width - last_layout.line_number_width - RIGHT_MARGIN,
+                );
 
                 self.text_wrapper.set_wrap_width(Some(wrap_width), cx);
             }
@@ -4192,23 +4204,18 @@ impl InputState {
     }
 
     pub(super) fn set_input_bounds(&mut self, new_bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
-        let wrap_width_changed = self.input_bounds.size.width != new_bounds.size.width;
+        let width_changed = self.input_bounds.size.width != new_bounds.size.width;
         self.input_bounds = new_bounds;
 
-        // Update text_wrapper wrap_width if changed.
-        if let Some(last_layout) = self.last_layout.as_ref() {
-            if wrap_width_changed {
-                let wrap_width = if !self.soft_wrap {
-                    // None to disable wrapping (will use Pixels::MAX)
-                    None
-                } else {
-                    last_layout.wrap_width
-                };
-
-                self.text_wrapper.set_wrap_width(wrap_width, cx);
-                self.mode.update_auto_grow(&self.text_wrapper);
-                cx.notify();
-            }
+        // The rows are wrapped for a frame before it is laid out
+        // (`TextElement::prepaint`), not here: the width they wrap at is
+        // what the gutter leaves of this one, and the gutter moves without
+        // it (dopamine #894). What is left to follow the width from here is
+        // how many rows an input that grows with its text is high -- that
+        // one has no gutter.
+        if width_changed {
+            self.mode.update_auto_grow(&self.text_wrapper);
+            cx.notify();
         }
     }
 

@@ -1709,8 +1709,63 @@ impl Element for TextElement {
         let font = style.font();
         let text_size = style.font_size.to_pixels(window.rem_size());
 
+        // The gutter, and the width the rows wrap at beside it.
+        //
+        // **Before anything walks the rows.** They used to be wrapped for a
+        // frame's width once it was painted (`set_input_bounds`), and only
+        // when the element was not as wide as in the frame before. But the
+        // width they wrap at is what the gutter leaves, and the gutter moves
+        // while the element stays as wide as it is: line numbers shown or
+        // hidden, the fold chevrons, the columns for breakpoints and for
+        // running, one more digit, a font size. The rows stayed wrapped for
+        // the gutter that had been there until the editor was resized -- with
+        // the numbers newly on, the end of every wrapped line ran out of the
+        // editor on the right (dopamine #894). And a frame that did get new
+        // rows was drawn from the old ones: what asked for the next frame
+        // was a `cx.notify()` from the paint, which gpui does not take for a
+        // reason to draw while it is drawing.
+        let (line_number_width, line_number_len, wrap_width) = {
+            let state = self.state.read(cx);
+            let (line_number_width, line_number_len) =
+                Self::layout_line_numbers(state, &state.text, text_size, &style, window);
+
+            let wrap_width = if state.mode.is_multi_line() && state.soft_wrap {
+                let viewport = bounds.size.width - line_number_width - RIGHT_MARGIN;
+                // A fixed column has to be measured the same way the rulers are,
+                // or the text would not break on the line that marks it.
+                let column = |n: usize| {
+                    crate::input::rulers::column_advance(&style, text_size, window) * n as f32
+                };
+                Some(match state.mode.wrap_at() {
+                    WrapAt::EditorWidth => viewport,
+                    WrapAt::Column(n) => column(n),
+                    WrapAt::Bounded(n) => column(n).min(viewport),
+                })
+            } else {
+                None
+            };
+
+            (line_number_width, line_number_len, wrap_width)
+        };
+
+        // **Nothing wide is no width to wrap at.** A pane that grows in from
+        // nothing is drawn so once, and wrapping for it puts every letter on
+        // a line of its own -- the most a layout can come to. The rows keep
+        // the width they have, which is what came of it before as well: the
+        // paint looked for a width other than the last, and an input starts
+        // from none.
+        let has_width = bounds.size.width > px(0.);
+
         self.state.update(cx, |state, cx| {
-            state.text_wrapper.set_font(font, text_size, cx);
+            if wrap_width.is_some() && !has_width {
+                state.text_wrapper.set_font(font, text_size, cx);
+            } else {
+                // Nothing to do unless one of the two changed, and one layout
+                // of every row when it did -- also when both did.
+                state
+                    .text_wrapper
+                    .set_font_and_wrap_width(font, text_size, wrap_width, cx);
+            }
             state.text_wrapper.prepare_if_need(&state.text, cx);
             // **Before `calculate_visible_range`.** The ghost lines of a
             // multi-line inline completion push everything below the caret
@@ -1755,7 +1810,6 @@ impl Element for TextElement {
         );
 
         let state = self.state.read(cx);
-        let multi_line = state.mode.is_multi_line();
         let text = state.text.clone();
         let is_empty = text.len() == 0;
         let placeholder = self.placeholder.clone();
@@ -1780,26 +1834,6 @@ impl Element for TextElement {
         };
 
         let text_style = window.text_style();
-
-        // Calculate the width of the line numbers
-        let (line_number_width, line_number_len) =
-            Self::layout_line_numbers(&state, &text, text_size, &text_style, window);
-
-        let wrap_width = if multi_line && state.soft_wrap {
-            let viewport = bounds.size.width - line_number_width - RIGHT_MARGIN;
-            // A fixed column has to be measured the same way the rulers are,
-            // or the text would not break on the line that marks it.
-            let column = |n: usize| {
-                crate::input::rulers::column_advance(&text_style, text_size, window) * n as f32
-            };
-            Some(match state.mode.wrap_at() {
-                WrapAt::EditorWidth => viewport,
-                WrapAt::Column(n) => column(n),
-                WrapAt::Bounded(n) => column(n).min(viewport),
-            })
-        } else {
-            None
-        };
 
         // `visible_range.end` may sit one past the last row (the extra row the
         // range keeps for the partially visible line); slicing needs it clamped.

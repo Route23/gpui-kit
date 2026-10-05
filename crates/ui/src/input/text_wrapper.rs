@@ -226,28 +226,43 @@ impl TextWrapper {
     }
 
     pub(super) fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
-        if wrap_width == self.wrap_width {
-            return;
-        }
-
-        self.wrap_width = wrap_width;
-        self.update_all(&self.text.clone(), cx);
+        self.set_font_and_wrap_width(self.font.clone(), self.font_size, wrap_width, cx);
     }
 
     pub(super) fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
-        if self.font.eq(&font) && self.font_size == font_size {
+        self.set_font_and_wrap_width(font, font_size, self.wrap_width, cx);
+    }
+
+    /// Take the font the rows are drawn in and the width they wrap at: what
+    /// a frame knows of the two, and hands over before it draws.
+    ///
+    /// Every row is laid out again when that moves where a row wraps --
+    /// **once**, also when the two change together. They do: the line
+    /// numbers are drawn in the editor's font, so a new font size is a new
+    /// gutter and a new width beside it, in the same frame (dopamine #894).
+    pub(super) fn set_font_and_wrap_width(
+        &mut self,
+        font: Font,
+        font_size: Pixels,
+        wrap_width: Option<Pixels>,
+        cx: &mut App,
+    ) {
+        let same_font = self.font.eq(&font) && self.font_size == font_size;
+        let same_width = self.wrap_width == wrap_width;
+        if same_font && same_width {
             return;
         }
 
         self.font = font;
         self.font_size = font_size;
+        self.wrap_width = wrap_width;
 
         // The font only decides where a row wraps. Without a wrap width every
         // row is one line whatever it is drawn in, so laying them all out
         // again gave back the table it started from -- and the first frame of
         // an editor always came here: the wrapper is made with the window's
         // font, the editor is drawn in its own (dopamine #878).
-        if self.wrap_width.is_none() {
+        if same_width && wrap_width.is_none() {
             self.refresh_longest_row();
             return;
         }
@@ -730,7 +745,10 @@ mod tests {
     use super::*;
     use crate::{
         Root,
-        input::{AutoIndent, Enter, Input, InputState, LensRow, Position},
+        input::{
+            AutoIndent, Enter, Input, InputState, LensRow, LineNumbers, Position, Undo, WrapAt,
+            element::RIGHT_MARGIN,
+        },
     };
     use gpui::{
         AppContext as _, Boundary, Context, Entity, EntityInputHandler as _, FontFeatures,
@@ -738,6 +756,7 @@ mod tests {
         TestAppContext, VisualTestContext, Window, div, px,
     };
     use smallvec::smallvec;
+    use std::rc::Rc;
 
     /// What a piece of code asks of the heap, for the tests that are about
     /// nothing else: how a table is made does not show in what it says.
@@ -1913,10 +1932,10 @@ mod tests {
         });
     }
 
-    /// With soft wrap the width is only known once the editor has been drawn,
-    /// so the rows are laid out when the text is set and once more for the
-    /// width -- in the editor's font, which they were not laid out for when
-    /// it arrived. That used to be four times.
+    /// With soft wrap the width is only known when the editor is drawn, so
+    /// the rows are laid out when the text is set and once more for the
+    /// width its first frame has -- in the editor's font, which they were
+    /// not laid out for when it arrived. That used to be four times.
     #[gpui::test]
     fn opening_a_file_with_soft_wrap_lays_the_rows_out_twice(cx: &mut TestAppContext) {
         let text = format!("{}\nshort\n\n{}\n", "word ".repeat(200), "x".repeat(500));
@@ -2169,7 +2188,10 @@ mod tests {
     }
 
     /// Once there has been a frame there is a width, and turning soft wrap
-    /// on wraps at once, as it did.
+    /// on wraps at once, as it did -- for what the gutter of that frame left
+    /// of the editor, which is the width the next frame finds: it has no row
+    /// to lay out again. (It was the editor's whole width, gutter and all,
+    /// and nothing put that right but a resize.)
     #[gpui::test]
     fn soft_wrap_turned_on_after_a_frame_wraps_at_once(cx: &mut TestAppContext) {
         let text = format!("{}\nshort\n", "word ".repeat(200));
@@ -2179,23 +2201,905 @@ mod tests {
             cx,
         );
         input.update_in(cx, |state, window, cx| {
-            assert!(state.last_layout.is_some(), "a frame was drawn");
+            let layout = state.last_layout.as_ref().expect("a frame was drawn");
+            assert!(layout.line_number_width > px(0.));
+            let beside = state.input_bounds.size.width - layout.line_number_width - RIGHT_MARGIN;
             assert_eq!(state.text_wrapper.rebuilds, 1);
             assert_eq!(state.text_wrapper.lines[0].wrapped_lines.len(), 1);
 
             state.set_soft_wrap(true, window, cx);
             let wrapper = &state.text_wrapper;
-            assert_eq!(wrapper.wrap_width, Some(state.input_bounds.size.width));
+            assert_eq!(wrapper.wrap_width, Some(beside));
             assert_eq!(wrapper.rebuilds, 2);
             assert!(
                 wrapper.lines[0].wrapped_lines.len() > 1,
                 "the long row wraps"
             );
+        });
+        let wrapped = wrapped_frame(&input, cx);
+        assert_eq!(wrapped.rebuilds, 2, "the frame found its width there");
 
-            // And off again, which needs no width.
+        // And off again, which needs no width.
+        input.update_in(cx, |state, window, cx| {
             state.set_soft_wrap(false, window, cx);
             assert_eq!(state.text_wrapper.wrap_width, None);
             assert_eq!(state.text_wrapper.lines[0].wrapped_lines.len(), 1);
         });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            assert_eq!(
+                (layout.wrap_width, state.text_wrapper.wrap_width),
+                (None, None)
+            );
+            assert_eq!(layout.lines[0].wrapped_lines.len(), 1);
+            assert_eq!(state.text_wrapper.rebuilds, 3);
+        });
+    }
+
+    // ── the rows wrap at the width of the frame that draws them (dopamine #894) ──
+
+    /// A window with one editor in it, as wide as the test says and in a font
+    /// as large as it says.
+    struct Framed {
+        input: Entity<InputState>,
+        /// `None`: as wide as the window.
+        width: Option<Pixels>,
+        /// `None`: the size an input is drawn in.
+        font_size: Option<Pixels>,
+    }
+
+    impl Render for Framed {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut input = Input::new(&self.input).h_full();
+            if let Some(font_size) = self.font_size {
+                input = input.text_size(font_size);
+            }
+            let frame = match self.width {
+                Some(width) => div().w(width),
+                None => div().w_full(),
+            };
+            frame.h_full().child(input)
+        }
+    }
+
+    /// Open an editor with `text` in a frame that is `width` wide.
+    fn open_framed(
+        build: impl FnOnce(InputState) -> InputState,
+        text: &str,
+        width: Option<Pixels>,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Framed>,
+        Entity<InputState>,
+        &'static mut VisualTestContext,
+    ) {
+        cx.update(crate::init);
+        let mut made = None;
+        let window = cx.add_window(|window, cx| {
+            let input = cx.new(|cx| build(InputState::new(window, cx)));
+            input.update(cx, |state, cx| {
+                state.set_value(text.to_string(), window, cx)
+            });
+            let frame = cx.new(|_| Framed {
+                input: input.clone(),
+                width,
+                font_size: None,
+            });
+            made = Some((frame.clone(), input));
+            Root::new(frame, window, cx)
+        });
+        let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        cx.run_until_parked();
+        let (frame, input) = made.unwrap();
+        (frame, input, cx)
+    }
+
+    /// What the last frame of an editor had, and what the table has since.
+    struct Frame {
+        /// How wide the gutter was drawn.
+        gutter: Pixels,
+        /// The width the rows wrap at.
+        width: Pixels,
+        /// The rows of the table, as [`rows`] gives them.
+        rows: Vec<(usize, Vec<Range<usize>>, usize, usize)>,
+        /// How many times every row has been laid out.
+        rebuilds: usize,
+    }
+
+    /// Draw what there is to draw, and see that the rows are wrapped for the
+    /// frame: at the width that is left of the editor beside its gutter, the
+    /// way laying every row out for that width wraps them.
+    fn frame_of(input: &Entity<InputState>, cx: &mut VisualTestContext) -> Frame {
+        cx.run_until_parked();
+        let (font, font_size, text, frame) = input.read_with(cx, |state, _| {
+            let layout = state.last_layout.as_ref().expect("a frame was drawn");
+            let wrapper = &state.text_wrapper;
+            let gutter = layout.line_number_width;
+            let width = state.input_bounds.size.width - gutter - RIGHT_MARGIN;
+            assert_eq!(layout.wrap_width, Some(width), "beside the gutter");
+            assert_eq!(
+                wrapper.wrap_width,
+                Some(width),
+                "the rows wrap at the width of the frame"
+            );
+            let frame = Frame {
+                gutter,
+                width,
+                rows: rows(wrapper),
+                rebuilds: wrapper.rebuilds,
+            };
+            (
+                wrapper.font.clone(),
+                wrapper.font_size,
+                state.text.clone(),
+                frame,
+            )
+        });
+        cx.update(|_, cx| {
+            let mut fresh = TextWrapper::new(font, font_size, Some(frame.width));
+            fresh.update(&text, &(0..0), text.len(), cx);
+            assert_eq!(frame.rows, rows(&fresh), "as laid out for that width");
+        });
+        frame
+    }
+
+    /// The same, and the frame was drawn from those rows: each row on screen
+    /// in as many lines as the table wraps it to.
+    fn wrapped_frame(input: &Entity<InputState>, cx: &mut VisualTestContext) -> Frame {
+        let frame = frame_of(input, cx);
+        input.read_with(cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            assert!(!layout.lines.is_empty());
+            for (ix, line) in layout.lines.iter().enumerate() {
+                let row = layout.visible_range.start + ix;
+                assert_eq!(
+                    line.wrapped_lines.len(),
+                    state.text_wrapper.lines[row].lines_len(),
+                    "row {row} was drawn the way it wraps"
+                );
+            }
+        });
+        frame
+    }
+
+    /// The lines of the last frame, to tell one frame from the next by.
+    fn drawn(input: &Entity<InputState>, cx: &mut VisualTestContext) -> Rc<Vec<LineLayout>> {
+        input.read_with(cx, |state, _| {
+            state.last_layout.as_ref().unwrap().lines.clone()
+        })
+    }
+
+    /// A row long enough to wrap dozens of times in a window, and a short one.
+    fn long_and_short() -> String {
+        format!("{}\nshort\n", "word ".repeat(2000))
+    }
+
+    /// The rows wrap at what is left of the editor beside its gutter, and the
+    /// gutter is as wide as what is in it: the line numbers, the fold
+    /// chevrons, the column for breakpoints, the column to run from, the
+    /// digits of the widest number. None of them changes how wide the editor
+    /// itself is -- and that was the one thing the rows were wrapped again
+    /// for. They stayed wrapped for the gutter that had been there: where
+    /// the numbers came on, the end of every wrapped line ran out of the
+    /// editor on the right.
+    #[gpui::test]
+    fn the_rows_wrap_beside_the_gutter_that_is_drawn(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(true),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        let numbered = frame_of(&input, cx);
+        assert!(numbered.gutter > px(0.));
+        assert!(numbered.rows[0].2 > 1, "the long row wraps");
+        assert_eq!(numbered.rebuilds, 2, "for the text, and for the width");
+
+        // The numbers go, and the rows have their width as well.
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx)
+        });
+        let bare = wrapped_frame(&input, cx);
+        assert!(bare.gutter < numbered.gutter);
+        assert!(bare.width > numbered.width);
+        assert_ne!(bare.rows, numbered.rows, "more of the row fits on a line");
+        assert_eq!(bare.rebuilds, numbered.rebuilds + 1);
+
+        // They come back, and so does every row.
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(true, window, cx)
+        });
+        let again = wrapped_frame(&input, cx);
+        assert_eq!(
+            (again.gutter, again.width),
+            (numbered.gutter, numbered.width)
+        );
+        assert_eq!(again.rows, numbered.rows);
+        assert_eq!(again.rebuilds, bare.rebuilds + 1);
+
+        // The rest of what a gutter holds moves the rows the same way.
+        type Change = fn(&mut InputState, &mut Window, &mut Context<InputState>);
+        let changes: [(&str, Change); 4] = [
+            ("the fold chevrons go", |state, window, cx| {
+                state.set_folding(false, window, cx)
+            }),
+            ("a column for breakpoints", |state, _, cx| {
+                state.set_breakpoint_gutter(true, cx)
+            }),
+            ("a column to run from", |state, _, cx| {
+                state.set_runnable_gutter(true, cx)
+            }),
+            ("a number of nine digits", |state, _, cx| {
+                state.set_line_number_labels(Some(vec![Some(123_456_789)]), cx)
+            }),
+        ];
+        let mut last = again;
+        for (what, change) in changes {
+            input.update_in(cx, |state, window, cx| change(state, window, cx));
+            let now = wrapped_frame(&input, cx);
+            assert_ne!(now.gutter, last.gutter, "{what}");
+            assert_ne!(now.width, last.width, "{what}");
+            assert_eq!(now.rebuilds, last.rebuilds + 1, "{what}: laid out once");
+            last = now;
+        }
+    }
+
+    /// What a gutter that moves leaves alone: the editor is the one it was.
+    /// Its rows are wrapped again, and nothing else of it is made again --
+    /// not where it is scrolled to, not the selection, not what there is to
+    /// undo. (A host that could not hand over a gutter without the rows
+    /// going stale made a new editor for it, and lost all three.)
+    #[gpui::test]
+    fn a_gutter_that_moves_leaves_the_editor_where_it_was(cx: &mut TestAppContext) {
+        let row = "word ".repeat(100);
+        let text = vec![row.as_str(); 300].join("\n");
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(true),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        // Something typed, a selection, and a place well down the text.
+        input.update_in(cx, |state, window, cx| {
+            let at = state.text.line_start_offset(105);
+            state.move_to(at, None, cx);
+            state.replace_text_in_range(None, "typed ", window, cx);
+            state.selected_range = (at..at + 5).into();
+            state.scroll_to_row(100, cx);
+        });
+        let numbered = wrapped_frame(&input, cx);
+        let place = |cx: &mut VisualTestContext| {
+            input.read_with(cx, |state, _| {
+                (
+                    state.first_visible_row(),
+                    state.scroll_handle.offset(),
+                    state.selected_range,
+                    state.text.len(),
+                )
+            })
+        };
+        let was = place(cx);
+        // The range of a frame starts a row or two above the first that shows.
+        assert!(
+            was.0.is_some_and(|row| (97..=100).contains(&row)),
+            "{was:?}"
+        );
+        assert!(was.1.y < px(0.));
+        assert_eq!(was.3, text.len() + 6);
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx)
+        });
+        let bare = wrapped_frame(&input, cx);
+        assert_eq!(bare.rebuilds, numbered.rebuilds + 1);
+        let without = place(cx);
+        assert!(without.1.y < px(0.), "still scrolled down the text");
+        assert_eq!((without.2, without.3), (was.2, was.3));
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(true, window, cx)
+        });
+        wrapped_frame(&input, cx);
+        assert_eq!(place(cx), was, "back where it was");
+
+        // And what was typed is still there to take back.
+        input.update_in(cx, |state, window, cx| state.undo(&Undo, window, cx));
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.text.len(), text.len());
+            assert_eq!(state.text.line_len(105), 500);
+        });
+    }
+
+    /// Nor does it take what is on the rows: a fold stays closed through the
+    /// rows being laid out again, and the row a lens sits in stays under the
+    /// row above it.
+    #[gpui::test]
+    fn a_gutter_that_moves_keeps_a_fold_and_a_lens(cx: &mut TestAppContext) {
+        let text = format!(
+            "fn main() {{\n    let a = 1;\n    let b = 2;\n}}\n{}\ntail",
+            "word ".repeat(2000)
+        );
+        let (input, cx) = open(
+            |state| state.code_editor("text").folding(true).soft_wrap(true),
+            |state, window, cx| {
+                state.set_value(text.clone(), window, cx);
+                state.set_folded_rows(&[0], cx);
+                state.set_lens_rows(
+                    vec![LensRow {
+                        row: 5,
+                        items: vec!["Run".into()],
+                    }],
+                    cx,
+                );
+            },
+            cx,
+        );
+        // (lines the long row wraps to, lines of the whole text, layouts)
+        let marked = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            input.read_with(cx, |state, _| {
+                let layout = state.last_layout.as_ref().unwrap();
+                let wrapper = &state.text_wrapper;
+                assert_eq!(wrapper.wrap_width, layout.wrap_width);
+                assert!(state.is_folded(0));
+                let rows = rows(wrapper);
+                assert_eq!(rows[0].2, 1, "the row the fold starts on shows");
+                assert_eq!((rows[1].2, rows[2].2), (0, 0), "what it hides does not");
+                assert_eq!(rows[4].3, 1, "the row the lens above `tail` sits in");
+                assert_eq!((rows[5].2, rows[5].3), (1, 0));
+                // The fold's two rows are out of the count, the lens's is in.
+                let lines: usize = rows.iter().map(|row| row.2 + row.3).sum();
+                assert_eq!(wrapper.len() + 1, lines);
+                assert_eq!(
+                    wrapper.total_height(layout.line_height),
+                    lines as f32 * layout.line_height
+                );
+                (rows[4].2, lines, wrapper.rebuilds)
+            })
+        };
+        let numbered = marked(cx);
+        assert!(numbered.0 > 1, "the long row wraps");
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx)
+        });
+        let bare = marked(cx);
+        assert!(bare.0 < numbered.0, "more of the row fits on a line");
+        assert_eq!(bare.1, numbered.1 - (numbered.0 - bare.0));
+        assert_eq!(bare.2, numbered.2 + 1);
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(true, window, cx)
+        });
+        let again = marked(cx);
+        assert_eq!((again.0, again.1), (numbered.0, numbered.1));
+        assert_eq!(again.2, bare.2 + 1);
+    }
+
+    /// A frame that finds the editor, its gutter and its font the way the
+    /// last one did lays out no row: the width is looked at for every frame,
+    /// and looking is all it comes to.
+    #[gpui::test]
+    fn a_frame_that_moves_no_width_lays_out_no_row(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(true),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        let first = frame_of(&input, cx);
+
+        type Change = fn(&mut InputState, &mut Window, &mut Context<InputState>);
+        let changes: [(&str, Change); 5] = [
+            ("nothing at all", |_, _, cx| cx.notify()),
+            ("the caret", |state, _, cx| state.move_to(7, None, cx)),
+            // As wide as the numbers that count from the top.
+            ("numbers from the caret", |state, window, cx| {
+                state.set_line_number(LineNumbers::Relative, window, cx)
+            }),
+            ("a breakpoint", |state, _, cx| {
+                state.set_breakpoints(vec![1], cx)
+            }),
+            ("a scroll", |state, _, cx| state.scroll_to_row(1, cx)),
+        ];
+        for (what, change) in changes {
+            let before = drawn(&input, cx);
+            input.update_in(cx, |state, window, cx| change(state, window, cx));
+            let now = wrapped_frame(&input, cx);
+            assert!(
+                !Rc::ptr_eq(&before, &drawn(&input, cx)),
+                "{what}: a frame was drawn"
+            );
+            assert_eq!((now.gutter, now.width), (first.gutter, first.width));
+            assert_eq!(now.rebuilds, first.rebuilds, "{what}");
+        }
+    }
+
+    /// Without soft wrap no row wraps, whatever is in the gutter: nothing
+    /// there lays a row out.
+    #[gpui::test]
+    fn a_gutter_lays_out_no_row_that_does_not_wrap(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (frame, input, cx) = open_framed(
+            |state| state.code_editor("text").soft_wrap(false),
+            &text,
+            None,
+            cx,
+        );
+        let unwrapped = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            input.read_with(cx, |state, _| {
+                let layout = state.last_layout.as_ref().unwrap();
+                let wrapper = &state.text_wrapper;
+                assert_eq!((layout.wrap_width, wrapper.wrap_width), (None, None));
+                assert_eq!(wrapper.len(), wrapper.lines.len());
+                assert_eq!(layout.lines[0].wrapped_lines.len(), 1);
+                assert_eq!(wrapper.rebuilds, 1);
+                layout.line_number_width
+            })
+        };
+        let numbered = unwrapped(cx);
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx)
+        });
+        let bare = unwrapped(cx);
+        assert!(bare < numbered);
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(true, window, cx);
+            state.set_folding(false, window, cx);
+            state.set_breakpoint_gutter(true, cx);
+        });
+        assert_ne!(unwrapped(cx), numbered);
+
+        // Nor does a font: it is as it was (dopamine #878).
+        frame.update(cx, |frame, cx| {
+            frame.font_size = Some(px(28.));
+            cx.notify();
+        });
+        assert!(unwrapped(cx) > numbered, "the numbers are in the font");
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.text_wrapper.font_size, px(28.));
+        });
+    }
+
+    /// Rows that wrap at a column of forty do so wherever the gutter ends:
+    /// one that moves lays out none of them.
+    fn a_gutter_beside_rows_at_a_column(wrap_at: WrapAt, cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(true).wrap_at(wrap_at),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        let at_the_column = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            input.read_with(cx, |state, _| {
+                let layout = state.last_layout.as_ref().unwrap();
+                let wrapper = &state.text_wrapper;
+                assert!(layout.wrap_width.is_some());
+                assert_eq!(wrapper.wrap_width, layout.wrap_width);
+                assert_eq!(wrapper.rebuilds, 2);
+                (
+                    layout.line_number_width,
+                    wrapper.wrap_width,
+                    wrapper.lines[0].lines_len(),
+                )
+            })
+        };
+        let (numbered, width, lines) = at_the_column(cx);
+        assert!(lines > 200, "forty columns of ten thousand: {lines}");
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx)
+        });
+        let (bare, bare_width, bare_lines) = at_the_column(cx);
+        assert!(bare < numbered);
+        assert_eq!((bare_width, bare_lines), (width, lines));
+        input.read_with(cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            assert_eq!(layout.lines[0].wrapped_lines.len(), lines);
+        });
+    }
+
+    /// Rows that wrap at a column do so wherever the gutter ends.
+    #[gpui::test]
+    fn rows_that_wrap_at_a_column_are_not_laid_out_for_a_gutter(cx: &mut TestAppContext) {
+        a_gutter_beside_rows_at_a_column(WrapAt::Column(40), cx);
+    }
+
+    /// Rows bounded by a column wrap at it, or at what the gutter leaves of
+    /// the editor where that is less. Where it is the column, they are rows
+    /// that wrap at a column...
+    #[gpui::test]
+    fn rows_bounded_by_a_column_are_not_laid_out_for_a_gutter(cx: &mut TestAppContext) {
+        a_gutter_beside_rows_at_a_column(WrapAt::Bounded(40), cx);
+    }
+
+    /// ...and where it is the editor, they wrap beside its gutter as rows
+    /// that wrap at the editor's width do.
+    #[gpui::test]
+    fn rows_bounded_by_the_editor_wrap_beside_its_gutter(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (input, cx) = open(
+            |state| {
+                state
+                    .code_editor("text")
+                    .soft_wrap(true)
+                    // More columns than the window has room for.
+                    .wrap_at(WrapAt::Bounded(10_000))
+            },
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        let numbered = frame_of(&input, cx);
+        assert_eq!(numbered.rebuilds, 2, "for the text, and for the width");
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(false, window, cx)
+        });
+        let bare = wrapped_frame(&input, cx);
+        assert!(bare.width > numbered.width);
+        assert_ne!(bare.rows, numbered.rows, "more of the row fits on a line");
+        assert_eq!(bare.rebuilds, numbered.rebuilds + 1);
+
+        input.update_in(cx, |state, window, cx| {
+            state.set_line_number(true, window, cx)
+        });
+        let again = wrapped_frame(&input, cx);
+        assert_eq!(again.rows, numbered.rows);
+        assert_eq!(again.rebuilds, bare.rebuilds + 1);
+    }
+
+    /// A larger font widens the gutter with it -- the numbers are drawn in
+    /// that font -- so the font and the width change in the same frame. Every
+    /// row is laid out for the two of them, once.
+    #[gpui::test]
+    fn a_new_font_size_and_its_gutter_lay_the_rows_out_once(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (frame, input, cx) = open_framed(
+            |state| state.code_editor("text").soft_wrap(true),
+            &text,
+            None,
+            cx,
+        );
+        let small = frame_of(&input, cx);
+
+        frame.update(cx, |frame, cx| {
+            frame.font_size = Some(px(28.));
+            cx.notify();
+        });
+        let large = wrapped_frame(&input, cx);
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.text_wrapper.font_size, px(28.));
+        });
+        assert!(large.gutter > small.gutter, "the numbers are in the font");
+        assert!(large.width < small.width);
+        assert!(large.rows[0].2 > small.rows[0].2, "fewer letters fit");
+        assert_eq!(large.rebuilds, small.rebuilds + 1, "once for the two");
+    }
+
+    /// A gutter and the editor's own width that move in the same frame are
+    /// one width to wrap at, and one layout of every row for it. (dopamine's
+    /// Zen mode puts the sidebars away and hides the line numbers in one go,
+    /// and brings both back in another.)
+    #[gpui::test]
+    fn a_gutter_and_a_width_that_move_together_lay_the_rows_out_once(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (frame, input, cx) = open_framed(
+            |state| state.code_editor("text").soft_wrap(true),
+            &text,
+            Some(px(900.)),
+            cx,
+        );
+        let narrow = frame_of(&input, cx);
+
+        // As wide as the window, and without its numbers.
+        cx.update(|window, cx| {
+            frame.update(cx, |frame, cx| {
+                frame.width = None;
+                cx.notify();
+            });
+            input.update(cx, |state, cx| state.set_line_number(false, window, cx));
+        });
+        let wide = wrapped_frame(&input, cx);
+        assert!(wide.gutter < narrow.gutter);
+        assert!(
+            wide.width - narrow.width > narrow.gutter - wide.gutter,
+            "wider by more than the gutter gave up"
+        );
+        assert_eq!(wide.rebuilds, narrow.rebuilds + 1, "once for the two");
+
+        // And back, the two together again.
+        cx.update(|window, cx| {
+            frame.update(cx, |frame, cx| {
+                frame.width = Some(px(900.));
+                cx.notify();
+            });
+            input.update(cx, |state, cx| state.set_line_number(true, window, cx));
+        });
+        let back = wrapped_frame(&input, cx);
+        assert_eq!((back.gutter, back.width), (narrow.gutter, narrow.width));
+        assert_eq!(back.rows, narrow.rows);
+        assert_eq!(back.rebuilds, wide.rebuilds + 1, "once for the two");
+    }
+
+    /// The font and the width handed over together: every row is laid out
+    /// when either moves where a row wraps, and once when both do.
+    #[gpui::test]
+    fn a_font_and_a_width_together_lay_the_rows_out_once(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text = Rope::from(format!("{}\na middling row\nshort", "word ".repeat(40)));
+            // What a wrapper made with this font and width from the start has.
+            let fresh = |font_size: Pixels, wrap_width: Option<Pixels>, cx: &mut App| {
+                let mut wrapper = TextWrapper::new(test_font(), font_size, wrap_width);
+                wrapper.update(&text, &(0..0), text.len(), cx);
+                rows(&wrapper)
+            };
+
+            let mut wrapper = TextWrapper::new(test_font(), px(16.), None);
+            wrapper.update(&text, &(0..0), text.len(), cx);
+            assert_eq!(wrapper.rebuilds, 1);
+
+            // Neither changed.
+            wrapper.set_font_and_wrap_width(test_font(), px(16.), None, cx);
+            assert_eq!(wrapper.rebuilds, 1);
+
+            // A font for rows that do not wrap, before and after: no row is
+            // laid out, and the longest is looked for again (dopamine #878).
+            wrapper.longest_row = LongestRow { row: 2, len: 5 };
+            wrapper.set_font_and_wrap_width(test_font(), px(14.), None, cx);
+            assert_eq!(wrapper.rebuilds, 1);
+            assert_eq!((wrapper.longest_row.row, wrapper.longest_row.len), (0, 200));
+            assert_eq!(rows(&wrapper), fresh(px(14.), None, cx));
+
+            // A width alone.
+            wrapper.set_font_and_wrap_width(test_font(), px(14.), Some(px(300.)), cx);
+            assert_eq!(wrapper.rebuilds, 2);
+            let wrapped = rows(&wrapper);
+            assert!(wrapped[0].1.len() > 1, "the long row wraps");
+            assert_eq!(wrapped, fresh(px(14.), Some(px(300.)), cx));
+
+            // A font alone, for rows that wrap.
+            wrapper.set_font_and_wrap_width(test_font(), px(20.), Some(px(300.)), cx);
+            assert_eq!(wrapper.rebuilds, 3);
+            assert_eq!(rows(&wrapper), fresh(px(20.), Some(px(300.)), cx));
+
+            // Both: once, and for the two of them.
+            wrapper.set_font_and_wrap_width(test_font(), px(28.), Some(px(250.)), cx);
+            assert_eq!(wrapper.rebuilds, 4);
+            let both = rows(&wrapper);
+            assert_eq!(both, fresh(px(28.), Some(px(250.)), cx));
+            assert_ne!(both, fresh(px(20.), Some(px(250.)), cx));
+            assert_ne!(both, fresh(px(28.), Some(px(300.)), cx));
+
+            // The same again is nothing to do.
+            wrapper.set_font_and_wrap_width(test_font(), px(28.), Some(px(250.)), cx);
+            assert_eq!(wrapper.rebuilds, 4);
+
+            // The width goes, with a font that comes: the rows are one line
+            // each again, which is a layout.
+            wrapper.set_font_and_wrap_width(test_font(), px(14.), None, cx);
+            assert_eq!(wrapper.rebuilds, 5);
+            assert_eq!(rows(&wrapper), fresh(px(14.), None, cx));
+        });
+    }
+
+    /// The first frame of an editor with soft wrap is drawn wrapped. The rows
+    /// used to be wrapped once it was painted, with a call for another frame
+    /// that gpui does not hear while it draws: the frame that was on screen
+    /// had every row on one line, until something else drew the next.
+    #[gpui::test]
+    fn the_first_frame_with_soft_wrap_is_drawn_wrapped(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (input, cx) = open(
+            |state| state.code_editor("text").soft_wrap(true),
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        let first = wrapped_frame(&input, cx);
+        assert!(first.rows[0].2 > 1, "the long row wraps");
+        assert_eq!(first.rebuilds, 2, "for the text, and for the width");
+    }
+
+    /// A text that was only put in (`default_value`) has no rows until the
+    /// first frame, and that frame knows the width: they are laid out once,
+    /// where they were laid out without a width and then for it.
+    #[gpui::test]
+    fn a_default_value_with_soft_wrap_is_laid_out_once(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (input, cx) = open(
+            |state| {
+                state
+                    .code_editor("text")
+                    .soft_wrap(true)
+                    .default_value(text.clone())
+            },
+            |state, _, _| assert!(state.text_wrapper.lines.is_empty()),
+            cx,
+        );
+        let first = wrapped_frame(&input, cx);
+        assert!(first.rows[0].2 > 1, "the long row wraps");
+        assert_eq!(first.rebuilds, 1);
+    }
+
+    /// A new width of the editor is drawn wrapped for it, in the frame that
+    /// has the width -- the last frame of a resize was left wrapped for the
+    /// width before it.
+    #[gpui::test]
+    fn a_new_width_is_drawn_wrapped_for_it(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (frame, input, cx) = open_framed(
+            |state| state.code_editor("text").soft_wrap(true),
+            &text,
+            None,
+            cx,
+        );
+        let wide = frame_of(&input, cx);
+
+        // The window, as a drag of its edge does it.
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        let narrower = wrapped_frame(&input, cx);
+        assert_eq!(narrower.gutter, wide.gutter);
+        assert!(narrower.width < wide.width);
+        assert!(narrower.rows[0].2 > wide.rows[0].2);
+        assert_eq!(narrower.rebuilds, wide.rebuilds + 1);
+
+        // What the editor sits in, as a pane next to it does it.
+        frame.update(cx, |frame, cx| {
+            frame.width = Some(px(500.));
+            cx.notify();
+        });
+        let narrow = wrapped_frame(&input, cx);
+        assert!(narrow.width < narrower.width);
+        assert!(narrow.rows[0].2 > narrower.rows[0].2);
+        assert_eq!(narrow.rebuilds, narrower.rebuilds + 1);
+    }
+
+    /// An editor that is nothing wide has no width to wrap at, and its rows
+    /// stay as they are: a pane that grows in from nothing is drawn so once,
+    /// and a row for every letter is the most a layout can come to.
+    #[gpui::test]
+    fn an_editor_that_is_nothing_wide_keeps_its_rows(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (frame, input, cx) = open_framed(
+            |state| state.code_editor("text").soft_wrap(true),
+            &text,
+            Some(px(0.)),
+            cx,
+        );
+        input.read_with(cx, |state, _| {
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            assert_eq!(state.input_bounds.size.width, px(0.));
+            assert_eq!(state.text_wrapper.wrap_width, None);
+            assert_eq!(state.text_wrapper.rebuilds, 1);
+        });
+
+        // It gets a width, and the rows are wrapped for it.
+        frame.update(cx, |frame, cx| {
+            frame.width = None;
+            cx.notify();
+        });
+        let wide = wrapped_frame(&input, cx);
+        assert_eq!(wide.rebuilds, 2);
+
+        // It loses the width again, and the rows wait for the next.
+        frame.update(cx, |frame, cx| {
+            frame.width = Some(px(0.));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.input_bounds.size.width, px(0.));
+            assert_eq!(state.text_wrapper.wrap_width, Some(wide.width));
+            assert_eq!(state.text_wrapper.rebuilds, 2);
+        });
+        frame.update(cx, |frame, cx| {
+            frame.width = None;
+            cx.notify();
+        });
+        assert_eq!(wrapped_frame(&input, cx).rebuilds, 2);
+    }
+
+    /// When the gutter moves in the same breath -- a view of a diff turns its
+    /// line numbers and its soft wrap on together -- the width put there is
+    /// not the one the frame finds, and the frame wraps the rows for its own.
+    #[gpui::test]
+    fn soft_wrap_turned_on_with_a_new_gutter_is_wrapped_by_the_frame(cx: &mut TestAppContext) {
+        let text = long_and_short();
+        let (input, cx) = open(
+            |state| {
+                state
+                    .code_editor("text")
+                    .line_number(false)
+                    .folding(false)
+                    .soft_wrap(false)
+            },
+            |state, window, cx| state.set_value(text.clone(), window, cx),
+            cx,
+        );
+        input.update_in(cx, |state, window, cx| {
+            let layout = state.last_layout.as_ref().expect("a frame was drawn");
+            assert_eq!(layout.line_number_width, px(0.));
+
+            state.set_line_number(true, window, cx);
+            state.set_line_number_labels(Some(vec![Some(41), Some(42)]), cx);
+            state.set_soft_wrap(true, window, cx);
+            assert_eq!(
+                state.text_wrapper.wrap_width,
+                Some(state.input_bounds.size.width - RIGHT_MARGIN),
+                "for the gutter of the frame before"
+            );
+        });
+        let wrapped = wrapped_frame(&input, cx);
+        assert!(wrapped.gutter > px(0.));
+        assert!(wrapped.rows[0].2 > 1, "the long row wraps");
+    }
+
+    /// A frame that was nothing wide left no width to wrap at either: soft
+    /// wrap turned on after it waits for one that has a width, as it does
+    /// before the first.
+    #[gpui::test]
+    fn soft_wrap_turned_on_in_an_editor_that_is_nothing_wide_waits_for_a_width(
+        cx: &mut TestAppContext,
+    ) {
+        let text = long_and_short();
+        let (frame, input, cx) = open_framed(
+            |state| state.code_editor("text").soft_wrap(false),
+            &text,
+            Some(px(0.)),
+            cx,
+        );
+        input.update_in(cx, |state, window, cx| {
+            assert!(state.last_layout.is_some(), "a frame was drawn");
+            assert_eq!(state.input_bounds.size.width, px(0.));
+
+            state.set_soft_wrap(true, window, cx);
+            assert_eq!(state.text_wrapper.wrap_width, None, "no width yet");
+            assert_eq!(state.text_wrapper.rebuilds, 1);
+        });
+        cx.run_until_parked();
+        input.read_with(cx, |state, _| {
+            assert_eq!(state.text_wrapper.wrap_width, None, "nor in that frame");
+            assert_eq!(state.text_wrapper.rebuilds, 1);
+        });
+
+        frame.update(cx, |frame, cx| {
+            frame.width = None;
+            cx.notify();
+        });
+        let wrapped = wrapped_frame(&input, cx);
+        assert!(wrapped.rows[0].2 > 1, "the long row wraps");
+        assert_eq!(wrapped.rebuilds, 2);
+    }
+
+    /// An input that grows with its text is as many rows high as its text
+    /// wraps to, and that follows its width as it did: the rows are counted
+    /// when the width has changed, after they were wrapped for it.
+    #[gpui::test]
+    fn an_input_that_grows_counts_the_rows_of_its_width(cx: &mut TestAppContext) {
+        let text = "word ".repeat(400);
+        let (frame, input, cx) = open_framed(|state| state.auto_grow(1, 50), &text, None, cx);
+        let counted = |cx: &mut VisualTestContext| {
+            let frame = frame_of(&input, cx);
+            assert_eq!(frame.gutter, px(0.), "an input has no gutter");
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.mode.rows(), state.text_wrapper.len().clamp(1, 50));
+                state.mode.rows()
+            })
+        };
+        let wide = counted(cx);
+        assert!(wide > 1, "the text wraps");
+
+        frame.update(cx, |frame, cx| {
+            frame.width = Some(px(600.));
+            cx.notify();
+        });
+        let narrow = counted(cx);
+        assert!(
+            narrow > wide,
+            "{narrow} rows at 600px, {wide} in the window"
+        );
     }
 }
