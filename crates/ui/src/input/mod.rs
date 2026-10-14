@@ -14,6 +14,7 @@ mod diff_marks;
 mod gutter_marks;
 mod breakpoints;
 mod runnables;
+mod scroll_axis;
 pub use breakpoints::BreakpointKind;
 mod indent;
 mod inlay;

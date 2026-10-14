@@ -524,6 +524,8 @@ pub struct InputState {
 
     /// Popover
     diagnostic_popover: Option<Entity<DiagnosticPopover>>,
+    /// The axis of the current trackpad swipe (dopamine #1014).
+    scroll_axis: super::scroll_axis::GestureAxis,
     /// Completion/CodeAction context menu
     pub(super) context_menu: Option<ContextMenu>,
     pub(super) mouse_context_menu: Entity<MouseContextMenu>,
@@ -691,6 +693,7 @@ impl InputState {
             mask_pattern: MaskPattern::default(),
             lsp: Lsp::default(),
             diagnostic_popover: None,
+            scroll_axis: Default::default(),
             context_menu: None,
             mouse_context_menu,
             completion_inserting: false,
@@ -3448,11 +3451,14 @@ impl InputState {
 
         // A diagonal gesture moves on one axis only (#252). Trackpads make
         // perfectly straight gestures hard; this decides for the reader.
+        // Decided once per swipe, not per event (dopamine #1014): a vertical swipe
+        // carries horizontal-only events (wobble, momentum) that used to scroll sideways.
         if self.mode.scroll_predominant_axis() {
-            if delta.y.abs() >= delta.x.abs() {
-                delta.x = px(0.);
-            } else {
-                delta.y = px(0.);
+            let precise = matches!(event.delta, gpui::ScrollDelta::Pixels(_));
+            match self.scroll_axis.decide(event.touch_phase, delta, precise, Instant::now()) {
+                Some(gpui::Axis::Vertical) => delta.x = px(0.),
+                Some(gpui::Axis::Horizontal) => delta.y = px(0.),
+                None => {}
             }
         }
 
