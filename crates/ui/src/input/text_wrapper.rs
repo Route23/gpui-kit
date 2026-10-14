@@ -343,7 +343,16 @@ impl TextWrapper {
         let end_row = end_row.min(self.lines.len().saturating_sub(1));
         let rows_range = start_row..=end_row;
 
-        if rows_range.contains(&self.longest_row.row) {
+        // The row remembered as the longest has to be looked for again over
+        // **every** row when the edit went through it -- a shorter row there
+        // does not say the others are shorter still -- or when rows came or
+        // went before it and its number moved (dopamine #939). Looking only
+        // at the edited rows left a horizontal scroll that reached too far or
+        // not far enough. Row lengths are kept (#878), so it is one pass.
+        let old_rows = end_row + 1 - start_row;
+        let longest_edited = rows_range.contains(&self.longest_row.row);
+        let longest_after = self.longest_row.row > end_row;
+        if longest_edited {
             self.longest_row = LongestRow::default();
         }
 
@@ -424,9 +433,14 @@ impl TextWrapper {
         self.text = changed_text.clone();
         self.apply_hidden_rows();
         self.apply_extra_rows();
-        self.longest_row = LongestRow {
-            row: longest_row_ix,
-            len: longest_row_len,
+        if !whole && (longest_edited || (longest_after && new_rows != old_rows)) {
+            self.longest_row = LongestRow::default();
+            self.refresh_longest_row();
+        } else {
+            self.longest_row = LongestRow {
+                row: longest_row_ix,
+                len: longest_row_len,
+            }
         }
     }
 
@@ -1766,6 +1780,29 @@ mod tests {
     /// Rows that do not wrap are not laid out for a new font, but the longest
     /// of them is still looked for again, as laying them out did: it is not
     /// kept right through every edit.
+    /// **Editing the longest row looks for the longest over every row**
+    /// (dopamine #939): shortening it used to leave it remembered as the
+    /// longest, or pick the longest of the edited rows only.
+    #[gpui::test]
+    fn shortening_the_longest_row_finds_the_next_longest(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text = Rope::from("aaaaaaaaaa\nbbbbb\ncccccccc");
+            let mut wrapper = TextWrapper::new(test_font(), px(16.), None);
+            wrapper.update(&text, &(0..0), text.len(), cx);
+            assert_eq!((wrapper.longest_row.row, wrapper.longest_row.len), (0, 10));
+            // Row 0 down to "a".
+            let mut edited = text.clone();
+            edited.replace(1..10, "");
+            wrapper.update(&edited, &(1..10), 0, cx);
+            assert_eq!((wrapper.longest_row.row, wrapper.longest_row.len), (2, 8));
+            // A row added before the longest moves its number.
+            let mut more = edited.clone();
+            more.replace(0..0, "x\n");
+            wrapper.update(&more, &(0..0), 2, cx);
+            assert_eq!((wrapper.longest_row.row, wrapper.longest_row.len), (3, 8));
+        });
+    }
+
     #[gpui::test]
     fn a_new_font_still_looks_for_the_longest_row(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2102,6 +2139,46 @@ mod tests {
         // The frame that follows is drawn from the table.
         cx.run_until_parked();
         input.read_with(cx, |state, _| assert_rows_in_step(state));
+    }
+
+    /// **One Undo after the indent was taken back leaves the text as it was**
+    /// (dopamine #939). The trim used to stay out of the history while the
+    /// history still pointed at its bytes: Undo then took `bar` with it.
+    #[gpui::test]
+    fn undo_after_the_indent_was_taken_back_restores_the_text(cx: &mut TestAppContext) {
+        let (input, cx) = open(
+            |state| indenting(state, AutoIndent::Keep, true),
+            |state, window, cx| state.set_value("    foo\nbar", window, cx),
+            cx,
+        );
+        input.update_in(cx, |state, window, cx| {
+            state.move_to(7, None, cx);
+            state.enter(&Enter { secondary: false }, window, cx);
+            state.move_to(0, None, cx);
+            assert_eq!(state.text.to_string(), "    foo\n\nbar");
+            state.undo(&Undo, window, cx);
+            assert_eq!(state.text.to_string(), "    foo\nbar", "one Undo takes back the Enter and the trim");
+            assert_rows_in_step(state);
+        });
+    }
+
+    /// **One Undo takes back a closer and the indent it pulled back**
+    /// (dopamine #939).
+    #[gpui::test]
+    fn undo_after_a_closer_pulled_its_row_back_restores_the_text(cx: &mut TestAppContext) {
+        let (input, cx) = open(
+            |state| indenting(state, AutoIndent::Brackets, false),
+            |state, window, cx| state.set_value("{\n    ", window, cx),
+            cx,
+        );
+        input.update_in(cx, |state, window, cx| {
+            state.move_to(state.text.len(), None, cx);
+            state.replace_text_in_range(None, "}", window, cx);
+            assert_eq!(state.text.to_string(), "{\n  }");
+            state.undo(&Undo, window, cx);
+            assert_eq!(state.text.to_string(), "{\n    ");
+            assert_rows_in_step(state);
+        });
     }
 
     /// A closing bracket typed as the first thing on a row pulls the row back

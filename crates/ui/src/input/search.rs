@@ -163,6 +163,11 @@ pub struct SearchMatcher {
     /// lowers it again once the editor has been asked (`replace_next`,
     /// `replace_all`), or it would wait for an edit that is not a replacement.
     replacing: bool,
+    /// Where the text after the replacement starts (dopamine #939). The place
+    /// is taken from here, not kept by index: a replacement that matches as
+    /// well (`foo` -> `foobar`) is still the match at that index, and every
+    /// "Replace" went on replacing the same place.
+    resume_at: Option<usize>,
     /// The reader typed a regular expression that does not parse.
     ///
     /// Kept so the panel can say so; matching simply finds nothing. Building
@@ -197,6 +202,7 @@ impl SearchMatcher {
             query_text: String::new(),
             wrap: true,
             replacing: false,
+            resume_at: None,
             invalid: false,
         }
     }
@@ -237,8 +243,16 @@ impl SearchMatcher {
             }
         }
         self.matched_ranges = Rc::new(new_ranges);
+        let resume_at = self.resume_at.take();
         if !std::mem::take(&mut self.replacing) {
             self.current_match_ix = 0;
+        } else if let Some(at) = resume_at {
+            // The first match after the replaced text, round to the first.
+            self.current_match_ix = self
+                .matched_ranges
+                .iter()
+                .position(|r| r.start >= at)
+                .unwrap_or_else(|| self.past_the_end(self.matched_ranges.len()));
         } else if self.current_match_ix >= self.matched_ranges.len() {
             // The replaced match is gone and the one after it has moved into
             // its place -- unless it was the last, and then the place is past
@@ -708,6 +722,15 @@ impl SearchPanel {
             // matches at all. Leave the panel exactly as it was.
             return;
         };
+        // Going round at either end moves the screen the other way
+        // (dopamine #939): `scroll_to` cancels a scroll against the direction
+        // it is given, so from 3/3 "next" said 1/3 and the screen stayed put.
+        let here = self.editor.read(cx).cursor();
+        let direction = match direction {
+            MoveDirection::Down if range.start < here => MoveDirection::Up,
+            MoveDirection::Up if range.start > here => MoveDirection::Down,
+            d => d,
+        };
         self.reveal(&range, Some(direction), cx);
         if self.behavior.close_on_result {
             self.hide(window, cx);
@@ -735,6 +758,7 @@ impl SearchPanel {
             // Raised only when there is something to replace: it is the
             // update this causes that lowers it.
             self.matcher.replacing = true;
+            self.matcher.resume_at = Some(range.start + new_text.len());
             cx.spawn_in(window, async move |this, cx| {
                 cx.update(|window, cx| {
                     text_state.update(cx, |state, cx| {
@@ -759,6 +783,7 @@ impl SearchPanel {
                     let landing = this
                         .update(cx, |this, _| {
                             this.matcher.replacing = false;
+                            this.matcher.resume_at = None;
                             this.matcher.current()
                         })
                         .ok()
@@ -1340,29 +1365,41 @@ mod tests {
         assert!(on_screen(&editor, 50, cx), "{:?}", scrolled(&editor, cx));
     }
 
-    /// A replacement that still matches is still the current match: the panel
-    /// stays on it, and so does the screen.
-    ///
-    /// Where to go used to be decided before replacing, as if the match were
-    /// sure to be gone. From the last match the screen went off to the first
-    /// while the panel -- and the next press -- stayed here, out of sight.
+    /// **Going round from the last match brings the first into view**
+    /// (dopamine #939). `scroll_to` was handed the direction of the walk
+    /// (down) and cancelled the scroll up: 1/2, and the screen at the end.
     #[gpui::test]
-    fn a_replacement_that_still_matches_leaves_the_screen_on_it(cx: &mut TestAppContext) {
+    fn going_round_to_the_first_match_scrolls_back_up(cx: &mut TestAppContext) {
+        let (editor, panel, cx) = drawn(&[0, 99], "x", false, cx);
+        step(&panel, cx);
+        assert_eq!(label(&panel, cx), "2/2");
+        assert!(on_screen(&editor, 99, cx));
+        step(&panel, cx);
+        assert_eq!(label(&panel, cx), "1/2");
+        assert!(on_screen(&editor, 0, cx), "{:?}", scrolled(&editor, cx));
+    }
+
+    /// **A replacement that still matches is passed over** (dopamine #939):
+    /// the panel goes on to the match after it -- round to the first from the
+    /// last -- and the screen with it, as VS Code does. It used to stay on the
+    /// replacement (#927), and every "Replace" replaced the same place again
+    /// (`foo` -> `foobar` -> `foobarbar`).
+    #[gpui::test]
+    fn a_replacement_that_still_matches_is_passed_over(cx: &mut TestAppContext) {
         let (editor, panel, cx) = drawn(&[0, 99], "foobar", false, cx);
         step(&panel, cx);
         assert_eq!(label(&panel, cx), "2/2");
         assert!(on_screen(&editor, 99, cx));
-        let at = scrolled(&editor, cx);
 
         replace(&panel, cx);
         assert!(text(&editor, cx).ends_with("\nrow 99 foobar"));
-        assert_eq!(label(&panel, cx), "2/2");
-        assert_eq!(scrolled(&editor, cx), at, "away from the current match");
+        assert_eq!(label(&panel, cx), "1/2", "round to the first");
+        assert!(on_screen(&editor, 0, cx), "{:?}", scrolled(&editor, cx));
 
-        // The next press is made where the reader is looking.
+        // The next press replaces the first, not the same place again.
         replace(&panel, cx);
-        assert!(text(&editor, cx).ends_with("\nrow 99 foobarbar"));
-        assert_eq!(scrolled(&editor, cx), at);
+        assert!(text(&editor, cx).starts_with("row 0 foobar\n"));
+        assert!(text(&editor, cx).ends_with("\nrow 99 foobar"));
     }
 
     /// "Replace" in a read-only editor replaces nothing, and so it goes
@@ -1522,6 +1559,18 @@ mod tests {
         m.update(&Rope::from("foo x foo"));
         assert_eq!(m.label(), "2/2");
         assert_eq!(m.current(), Some(6..9), "what was the third");
+    }
+
+    /// **A replacement that matches as well is passed over** (dopamine #939):
+    /// `foo` -> `foobar` used to stay on the same place for ever.
+    #[test]
+    fn a_replacement_that_matches_is_passed_over() {
+        let mut m = on_the_nth_of_three(1);
+        m.replacing = true;
+        // "foo foo foo" with the first replaced by "foobar".
+        m.resume_at = Some(6);
+        m.update(&Rope::from("foobar foo foo"));
+        assert_eq!(m.current(), Some(7..10), "the one after the replacement");
     }
 
     /// From the last match the walk goes round to the first, the way

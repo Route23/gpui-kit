@@ -3732,6 +3732,33 @@ impl InputState {
         }
     }
 
+    /// A small edit the editor makes on its own (taking back auto indent,
+    /// pulling a closing bracket's line back), through the same path as a
+    /// typed one: history, diagnostics, wrap table, folds, breakpoints,
+    /// highlighter, and `InputEvent::Change` (dopamine #939). The caller
+    /// decides which undo step it joins.
+    pub(super) fn apply_side_edit(
+        &mut self,
+        range: Range<usize>,
+        new_text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let old_text = self.text.clone();
+        self.text.replace(range.clone(), new_text);
+        self.push_history(&old_text, &range, new_text);
+        if let Some(diagnostics) = self.mode.diagnostics_mut() {
+            diagnostics.reset(&self.text)
+        }
+        self.text_wrapper
+            .update(&self.text, &range, new_text.len(), cx);
+        self.shift_folds_for_edit(&old_text, &range);
+        self.shift_breakpoints_for_edit(&old_text, &range, cx);
+        self.update_folds();
+        self.mode
+            .update_highlighter(&range, &self.text, new_text, true, cx);
+        cx.emit(InputEvent::Change);
+    }
+
     fn push_history(&mut self, text: &Rope, range: &Range<usize>, new_text: &str) {
         if self.history.ignore {
             return;
@@ -4366,13 +4393,13 @@ impl EntityInputHandler for InputState {
         // bracket itself still goes through auto-closing below.
         if range_utf16.is_none() && self.selected_range.is_empty() {
             if let Some(drop) = self.outdent_for_closer(new_text) {
-                self.text.replace(drop.clone(), "");
-                // The wrap table hears of this edit here. What follows may
-                // be the caret stepping over a closer that is already there,
-                // and then nothing below is reached: the next frame drew a
-                // row that was longer in the table than in the text, which
-                // is a slice out of range (dopamine #878).
-                self.text_wrapper.update(&self.text, &drop, 0, cx);
+                // Through the same path as any edit (dopamine #939): history,
+                // wrap table (#878 -- what follows may be the caret stepping
+                // over a closer that is already there, and nothing below is
+                // reached), highlighter, folds. The bracket typed next joins
+                // this undo step, so one Undo takes back both.
+                self.apply_side_edit(drop.clone(), "", cx);
+                self.history.start_grouping();
                 self.selected_range = (drop.start..drop.start).into();
             }
         }
@@ -4382,6 +4409,7 @@ impl EntityInputHandler for InputState {
         // change *what* gets written (and where the caret lands afterwards).
         let auto = self.auto_close_edit(range_utf16.as_ref(), new_text);
         if let Some(AutoCloseEdit::Overtype { to }) = auto {
+            self.history.end_grouping();
             self.selected_range = (to..to).into();
             self.update_preferred_column();
             cx.notify();
@@ -4409,6 +4437,7 @@ impl EntityInputHandler for InputState {
             // Check if the new text is valid
             if !self.is_valid_input(&pending_text, cx) {
                 self.text = old_text;
+                self.history.end_grouping();
                 return;
             }
 

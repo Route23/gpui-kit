@@ -9,7 +9,7 @@
 //! this fork ships highlight and injection queries only. `Brackets` covers the
 //! cases those queries are mostly used for and costs nothing new.
 
-use gpui::App;
+
 
 use super::brackets::Pair;
 use crate::RopeExt as _;
@@ -310,9 +310,18 @@ impl super::InputState {
     /// without anything being typed on it (`editor.trimAutoWhitespace`).
     ///
     /// Returns the target offset, moved back if text before it went away.
-    /// **Not an undo step** -- it removes what the editor put there itself,
-    /// so putting it in the history would make Undo restore whitespace.
-    pub(super) fn trim_auto_whitespace_on_leave(&mut self, target: usize, cx: &mut App) -> usize {
+    ///
+    /// **Joins the undo step that put the indent there** (the Enter), so one
+    /// Undo takes back both and leaves the text as it was (dopamine #939).
+    /// It used to stay out of the history, and the history still pointed at
+    /// the removed bytes: Undo then took the characters after them with it
+    /// (`bar` on the next line), and the highlighter, folds and listeners
+    /// never heard of the edit.
+    pub(super) fn trim_auto_whitespace_on_leave(
+        &mut self,
+        target: usize,
+        cx: &mut gpui::Context<Self>,
+    ) -> usize {
         let Some(range) = self.auto_ws.clone() else {
             return target;
         };
@@ -343,11 +352,9 @@ impl super::InputState {
         if slice.is_empty() || !slice.chars().all(|c| c == ' ' || c == '\t') {
             return target;
         }
-        self.text.replace(range.clone(), "");
-        // The wrap table has to hear of it: the next frame is drawn from the
-        // table, and a row that is longer there than in the text is a slice
-        // out of range (dopamine #878).
-        self.text_wrapper.update(&self.text, &range, 0, cx);
+        self.history.start_grouping();
+        self.apply_side_edit(range.clone(), "", cx);
+        self.history.end_grouping();
         if target >= range.end {
             target - range.len()
         } else {
