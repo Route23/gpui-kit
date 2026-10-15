@@ -125,6 +125,10 @@ struct UpdateFuture {
     current_style: TextViewStyle,
     current_text: SharedString,
     timer: Timer,
+    /// The timer is set and has not fired yet. While it is, more changes do not push it back
+    /// (dopamine #908) — a stream of chunks would otherwise keep pushing the parse out until
+    /// it stopped, and the view would sit on its first chunk.
+    armed: bool,
     rx: Pin<Box<smol::channel::Receiver<Update>>>,
     tx_result: smol::channel::Sender<Result<ParsedContent, SharedString>>,
     delay: Duration,
@@ -149,6 +153,7 @@ impl UpdateFuture {
             current_style: style,
             current_text: text,
             timer: Timer::never(),
+            armed: false,
             rx: Box::pin(rx),
             tx_result,
             delay,
@@ -175,9 +180,12 @@ impl Future for UpdateFuture {
                         }
                         _ => false,
                     };
-                    if changed {
+                    // Throttle, not debounce: the first change sets the timer and the ones after it
+                    // ride along, so a steady stream is parsed at least once per `delay`.
+                    if changed && !self.armed {
                         let delay = self.delay;
                         self.timer.set_after(delay);
+                        self.armed = true;
                     }
                     continue;
                 }
@@ -187,6 +195,7 @@ impl Future for UpdateFuture {
 
             match self.timer.poll_next(cx) {
                 Poll::Ready(Some(_)) => {
+                    self.armed = false;
                     let res = parse_content(
                         self.type_,
                         &self.current_text,
@@ -214,6 +223,16 @@ enum InitState {
     Initialized {
         tx: smol::channel::Sender<Update>,
     },
+}
+
+/// The parsed state of a text view, held by its owner (see [`TextView::markdown_in`]).
+#[derive(Clone)]
+pub struct TextViewHandle(Entity<TextViewState>);
+
+impl TextViewHandle {
+    pub fn new(cx: &mut App) -> Self {
+        Self(cx.new(TextViewState::new))
+    }
 }
 
 pub(crate) struct TextViewState {
@@ -395,6 +414,41 @@ impl TextView {
                 style: Default::default(),
                 highlight_theme: highlight_theme.clone(),
             }
+        }
+    }
+
+    /// Create a markdown text view whose parsed state lives in `handle` rather than in the
+    /// element state (dopamine #908). Element state is dropped the first frame the view is not
+    /// drawn — scrolled out of a virtual list, a hidden tab — and the next draw parses the whole
+    /// text again on the main thread. The owner keeps the handle for as long as the text lives.
+    pub fn markdown_in(
+        handle: &TextViewHandle,
+        id: impl Into<ElementId>,
+        markdown: impl Into<SharedString>,
+        cx: &mut App,
+    ) -> Self {
+        let markdown = markdown.into();
+        let highlight_theme = cx.theme().highlight_theme.clone();
+        let state = handle.0.clone();
+        let init_state = Self::create_init_state(
+            TextViewType::Markdown,
+            &markdown,
+            &highlight_theme,
+            &state,
+            cx,
+        );
+        if let Some(tx) = &state.read(cx).tx {
+            let _ = tx.try_send(Update::Text(markdown.clone()));
+        }
+        Self {
+            id: id.into(),
+            init_state: Some(init_state),
+            raw: markdown,
+            style: StyleRefinement::default(),
+            state,
+            selectable: false,
+            scrollable: false,
+            code_block_actions: None,
         }
     }
 
@@ -625,7 +679,8 @@ impl Element for TextView {
                 highlight_theme,
                 rx,
                 tx_result,
-                Duration::from_millis(200),
+                // dopamine #908: 100ms, so a streamed reply moves at least ten times a second.
+                Duration::from_millis(100),
                 code_block_actions,
             ))
             .detach();
