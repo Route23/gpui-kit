@@ -453,6 +453,9 @@ pub struct InputState {
     pub(super) size: Size,
     pub(super) disabled: bool,
     pub(super) masked: bool,
+    /// The text color, instead of the theme's foreground (dopamine #1157 — canvas text keeps its shape's color
+    /// while being edited). `None` keeps the theme's foreground.
+    pub(super) text_color: Option<gpui::Hsla>,
     pub(super) clean_on_escape: bool,
     pub(super) soft_wrap: bool,
     /// Rows that head a folded region, sorted.
@@ -653,6 +656,7 @@ impl InputState {
             selecting: false,
             disabled: false,
             masked: false,
+            text_color: None,
             clean_on_escape: false,
             soft_wrap: true,
             folded_rows: Vec::new(),
@@ -2361,6 +2365,12 @@ impl InputState {
         debug_assert!(self.mode.is_single_line());
         self.masked = masked;
         cx.notify();
+    }
+
+    /// Draw the text in `color` instead of the theme's foreground (dopamine #1157).
+    pub fn text_color(mut self, color: gpui::Hsla) -> Self {
+        self.text_color = Some(color);
+        self
     }
 
     /// Set true to clear the input by pressing Escape key.

@@ -1904,10 +1904,10 @@ impl Element for TextElement {
         } else if state.masked {
             (
                 &Rope::from("*".repeat(text.chars().count())),
-                cx.theme().foreground,
+                state.text_color.unwrap_or(cx.theme().foreground),
             )
         } else {
-            (&text, cx.theme().foreground)
+            (&text, state.text_color.unwrap_or(cx.theme().foreground))
         };
 
         let text_style = window.text_style();
