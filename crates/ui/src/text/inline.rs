@@ -1,14 +1,15 @@
 use std::{
+    cell::RefCell,
     ops::Range,
     rc::Rc,
     sync::{Arc, Mutex},
 };
 
 use gpui::{
-    point, px, quad, App, BorderStyle, Bounds, CursorStyle, Edges, Element, ElementId,
-    GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    LayoutId, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, StyledText, TextLayout,
-    Window,
+    point, px, quad, size, App, AvailableSpace, BorderStyle, Bounds, CursorStyle, Edges, Element,
+    ElementId, GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId,
+    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, StyledText,
+    TextLayout, TextRun, Window, WrappedLine,
 };
 
 use crate::{global_state::GlobalState, input::Selection, text::node::LinkMark, ActiveTheme};
@@ -24,6 +25,22 @@ pub(super) struct Inline {
     styled_text: StyledText,
 
     state: Arc<Mutex<InlineState>>,
+    /// See [`crate::text::TextViewStyle::fixed_layout`].
+    fixed: bool,
+    /// The layout at the theme's rem, while `fixed` and the rem around the view differs from it.
+    scaled: Option<Rc<RefCell<Option<FixedLayout>>>>,
+}
+
+/// Text laid out at the theme's rem (dopamine #1186), painted scaled by `k`.
+struct FixedLayout {
+    lines: Vec<WrappedLine>,
+    /// Byte offset of each line in the text (lines are split at `\n`).
+    starts: Vec<usize>,
+    runs: Vec<TextRun>,
+    font_size: Pixels,
+    line_height: Pixels,
+    k: f32,
+    wrap_width: Pixels,
 }
 
 /// The inline text state, used RefCell to keep the selection state.
@@ -57,6 +74,84 @@ impl Inline {
             text: text.clone(),
             styled_text: StyledText::new(text),
             state,
+            fixed: false,
+            scaled: None,
+        }
+    }
+
+    /// Lay out at the theme's rem and paint scaled (see [`crate::text::TextViewStyle::fixed_layout`]).
+    pub(super) fn fixed_layout(mut self, fixed: bool) -> Self {
+        self.fixed = fixed;
+        self
+    }
+
+    /// Paint the fixed layout: every glyph and decoration of the base-size layout, scaled by `k`
+    /// from `origin`.
+    fn paint_fixed(layout: &FixedLayout, origin: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        let k = layout.k;
+        let text_system = cx.text_system().clone();
+        let mut row_top = px(0.);
+        for (line, &start) in layout.lines.iter().zip(&layout.starts) {
+            let unwrapped = &line.unwrapped_layout;
+            let padding_top = (layout.line_height - unwrapped.ascent - unwrapped.descent) / 2.;
+            let baseline = padding_top + unwrapped.ascent;
+            let mut wraps = line.wrap_boundaries.iter().peekable();
+            let mut row_x = px(0.);
+            let mut row = 0usize;
+            for (run_ix, run) in unwrapped.runs.iter().enumerate() {
+                let max_w = text_system.bounding_box(run.font_id, layout.font_size).size.width;
+                for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+                    if wraps.peek().is_some_and(|w| w.run_ix == run_ix && w.glyph_ix == glyph_ix) {
+                        wraps.next();
+                        row += 1;
+                        row_x = glyph.position.x;
+                    }
+                    let x = glyph.position.x - row_x;
+                    let y = row_top + layout.line_height * row as f32;
+                    let byte = start + glyph.index;
+                    let style = run_at(&layout.runs, byte);
+                    let next_x = run
+                        .glyphs
+                        .get(glyph_ix + 1)
+                        .map(|g| g.position.x - row_x)
+                        .unwrap_or(x + max_w.min(layout.font_size));
+                    if let Some(style) = style {
+                        if let Some(bg) = style.background_color {
+                            let b = Bounds::new(
+                                point(origin.x + x * k, origin.y + y * k),
+                                size((next_x - x) * k, layout.line_height * k),
+                            );
+                            window.paint_quad(gpui::fill(b, bg));
+                        }
+                    }
+                    let at = point(origin.x + x * k, origin.y + (y + baseline) * k);
+                    let font_size = layout.font_size * k;
+                    if glyph.is_emoji {
+                        let _ = window.paint_emoji(at, run.font_id, glyph.id, font_size);
+                    } else if let Some(style) = style {
+                        let _ = window.paint_glyph(at, run.font_id, glyph.id, font_size, style.color);
+                    }
+                    if let Some(style) = style {
+                        if let Some(u) = style.underline {
+                            let thick = u.thickness * k;
+                            let b = Bounds::new(
+                                point(origin.x + x * k, origin.y + (y + baseline) * k + thick),
+                                size((next_x - x) * k, thick),
+                            );
+                            window.paint_quad(gpui::fill(b, u.color.unwrap_or(style.color)));
+                        }
+                        if let Some(st) = style.strikethrough {
+                            let thick = st.thickness * k;
+                            let b = Bounds::new(
+                                point(origin.x + x * k, origin.y + (y + baseline - unwrapped.ascent / 3.) * k),
+                                size((next_x - x) * k, thick),
+                            );
+                            window.paint_quad(gpui::fill(b, st.color.unwrap_or(style.color)));
+                        }
+                    }
+                }
+            }
+            row_top += layout.line_height * (line.wrap_boundaries.len() + 1) as f32;
         }
     }
 
@@ -259,6 +354,55 @@ impl Element for Inline {
             runs.push(text_style.to_run(self.text.len() - ix));
         }
 
+        // Fixed layout (dopamine #1186): lay out at the theme's rem, report the size scaled.
+        let rem = window.rem_size();
+        let base_rem = cx.theme().font_size;
+        let k = if f32::from(base_rem) > 0.0 { f32::from(rem) / f32::from(base_rem) } else { 1.0 };
+        if self.fixed && (k - 1.0).abs() > 1e-4 {
+            let font_size = text_style.font_size.to_pixels(rem) / k;
+            let line_height = text_style.line_height.to_pixels(font_size.into(), base_rem).round();
+            let text = self.text.clone();
+            let cell = Rc::new(RefCell::new(None::<FixedLayout>));
+            self.scaled = Some(cell.clone());
+            let layout_id = window.request_measured_layout(Default::default(), move |known, available, window, _cx| {
+                let width = known.width.or(match available.width {
+                    AvailableSpace::Definite(w) => Some(w),
+                    _ => None,
+                });
+                let wrap_width = width.map(|w| w / k);
+                let mut slot = cell.borrow_mut();
+                let reuse = slot.as_ref().is_some_and(|l| Some(l.wrap_width) == wrap_width && (l.k - k).abs() < 1e-6);
+                if !reuse {
+                    let lines: Vec<WrappedLine> = window
+                        .text_system()
+                        .shape_text(text.clone(), font_size, &runs, wrap_width, None)
+                        .map(|l| l.into_iter().collect())
+                        .unwrap_or_default();
+                    let mut starts = Vec::with_capacity(lines.len());
+                    let mut at = 0;
+                    for l in &lines {
+                        starts.push(at);
+                        at += l.len() + 1;
+                    }
+                    *slot = Some(FixedLayout {
+                        lines,
+                        starts,
+                        runs: runs.clone(),
+                        font_size,
+                        line_height,
+                        k,
+                        wrap_width: wrap_width.unwrap_or_default(),
+                    });
+                }
+                let l = slot.as_ref().unwrap();
+                let rows: usize = l.lines.iter().map(|w| w.wrap_boundaries.len() + 1).sum();
+                let widest = l.lines.iter().map(|w| w.unwrapped_layout.width).fold(px(0.), |a, b| a.max(b));
+                size(width.unwrap_or(widest * k), l.line_height * rows.max(1) as f32 * k)
+            });
+            return (layout_id, ());
+        }
+        self.scaled = None;
+
         self.styled_text = StyledText::new(self.text.clone()).with_runs(runs);
         let (layout_id, _) =
             self.styled_text
@@ -276,8 +420,10 @@ impl Element for Inline {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.styled_text
-            .prepaint(id, inspector_id, bounds, &mut (), window, cx);
+        if self.scaled.is_none() {
+            self.styled_text
+                .prepaint(id, inspector_id, bounds, &mut (), window, cx);
+        }
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         hitbox
@@ -293,6 +439,12 @@ impl Element for Inline {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(cell) = self.scaled.take() {
+            if let Some(layout) = cell.borrow().as_ref() {
+                Self::paint_fixed(layout, bounds.origin, window, cx);
+            }
+            return;
+        }
         let current_view = window.current_view();
         let hitbox = prepaint;
         let mut state = self.state.lock().unwrap();
@@ -362,6 +514,18 @@ impl Element for Inline {
             });
         }
     }
+}
+
+/// The run covering byte `byte` of the text.
+fn run_at(runs: &[TextRun], byte: usize) -> Option<&TextRun> {
+    let mut end = 0;
+    for r in runs {
+        end += r.len;
+        if byte < end {
+            return Some(r);
+        }
+    }
+    runs.last()
 }
 
 /// Check if a `pos` is within a `bounds`, considering multi-line selections.

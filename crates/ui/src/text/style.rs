@@ -21,6 +21,12 @@ pub struct TextViewStyle {
     /// The style refinement for code blocks.
     pub code_block: StyleRefinement,
     pub is_dark: bool,
+    /// Lay the text out at the theme's rem and scale the result to the rem around the view, instead of
+    /// laying it out again at every size (dopamine #1186). Line breaks and glyph positions then stay
+    /// put while a canvas zooms: the system font's spacing is not proportional to its size, so laying
+    /// out at each size re-wraps lines and shuffles glyphs. Links and selection are not hit-tested
+    /// in this mode.
+    pub fixed_layout: bool,
 }
 
 impl PartialEq for TextViewStyle {
@@ -28,6 +34,7 @@ impl PartialEq for TextViewStyle {
         self.paragraph_gap == other.paragraph_gap
             && self.heading_base_font_size == other.heading_base_font_size
             && self.highlight_theme == other.highlight_theme
+            && self.fixed_layout == other.fixed_layout
     }
 }
 
@@ -40,6 +47,7 @@ impl Default for TextViewStyle {
             highlight_theme: HighlightTheme::default_light().clone(),
             code_block: StyleRefinement::default(),
             is_dark: false,
+            fixed_layout: false,
         }
     }
 }

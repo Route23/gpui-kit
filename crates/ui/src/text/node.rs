@@ -384,12 +384,10 @@ impl CodeBlock {
                     .text_size(cx.theme().mono_font_size * rem_scale(window, cx))
                     .relative()
                     .refine_style(&style.code_block)
-                    .child(Inline::new(
-                        "code",
-                        self.state.clone(),
-                        vec![],
-                        self.styles.clone(),
-                    ))
+                    .child(
+                        Inline::new("code", self.state.clone(), vec![], self.styles.clone())
+                            .fixed_layout(style.fixed_layout),
+                    )
                     .when_some(node_cx.code_block_actions.clone(), |this, actions| {
                         this.child(
                             div()
@@ -609,6 +607,7 @@ impl Paragraph {
                             links.clone(),
                             highlights.clone(),
                         )
+                        .fixed_layout(node_cx.style.fixed_layout)
                         .into_any_element(),
                     );
                 }
@@ -688,7 +687,11 @@ impl Paragraph {
         if text.len() > 0 {
             self.state.lock().unwrap().set_text(text.into());
             child_nodes
-                .push(Inline::new(ix, self.state.clone(), links, highlights).into_any_element());
+                .push(
+                    Inline::new(ix, self.state.clone(), links, highlights)
+                        .fixed_layout(node_cx.style.fixed_layout)
+                        .into_any_element(),
+                );
         }
 
         div().id(span.unwrap_or_default()).children(child_nodes)
