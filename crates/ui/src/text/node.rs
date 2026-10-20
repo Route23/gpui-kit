@@ -381,7 +381,7 @@ impl CodeBlock {
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted)
                     .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(cx.theme().mono_font_size)
+                    .text_size(cx.theme().mono_font_size * rem_scale(window, cx))
                     .relative()
                     .refine_style(&style.code_block)
                     .child(Inline::new(
@@ -407,6 +407,13 @@ impl CodeBlock {
 }
 
 /// A context for rendering nodes, contains link references.
+/// How much the current rem differs from the theme's (1.0 unless something overrides the rem
+/// around the view). `Root` sets the window's rem to `theme.font_size` every frame.
+fn rem_scale(window: &Window, cx: &App) -> f32 {
+    let base = f32::from(cx.theme().font_size);
+    if base > 0.0 { f32::from(window.rem_size()) / base } else { 1.0 }
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct NodeContext {
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
@@ -1178,6 +1185,10 @@ impl Node {
                 if let Some(f) = node_cx.style.heading_font_size.as_ref() {
                     text_size = (f)(*level, node_cx.style.heading_base_font_size);
                 }
+                // Follow a rem override around the view (a zoomed canvas, a scaled pane — dopamine #1184).
+                // Headings are sized in px, so without this they stay put while the body text scales.
+                // Applied at draw time: changing the style instead would parse the whole text again.
+                text_size = text_size * rem_scale(window, cx);
 
                 h_flex()
                     .id(("h", *level as usize))
