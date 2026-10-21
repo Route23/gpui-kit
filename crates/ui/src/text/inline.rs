@@ -50,6 +50,14 @@ pub(crate) struct InlineState {
     /// The text that actually rendering, matched with selection.
     pub(super) text: SharedString,
     pub(super) selection: Option<Selection>,
+    /// The wrap width (at the theme's rem) this text was last laid out with in fixed layout
+    /// (dopamine #1186). Kept while the width seen through the zoom stays within a pixel or so of
+    /// it: layout widths are rounded to the pixel at every zoom, and the list markers next to the
+    /// text are measured at the zoomed size, so `width / k` drifts by a fraction of a pixel —
+    /// enough to re-wrap a line that only just fits.
+    /// A few of them: taffy also measures with trial widths (a flex item against its whole row),
+    /// and those must not push out the one the text is actually laid out at.
+    fixed_wrap: Vec<Pixels>,
 }
 
 impl InlineState {
@@ -358,10 +366,11 @@ impl Element for Inline {
         let rem = window.rem_size();
         let base_rem = cx.theme().font_size;
         let k = if f32::from(base_rem) > 0.0 { f32::from(rem) / f32::from(base_rem) } else { 1.0 };
-        if self.fixed && (k - 1.0).abs() > 1e-4 {
+        if self.fixed {
             let font_size = text_style.font_size.to_pixels(rem) / k;
             let line_height = text_style.line_height.to_pixels(font_size.into(), base_rem).round();
             let text = self.text.clone();
+            let inline_state = self.state.clone();
             let cell = Rc::new(RefCell::new(None::<FixedLayout>));
             self.scaled = Some(cell.clone());
             let layout_id = window.request_measured_layout(Default::default(), move |known, available, window, _cx| {
@@ -369,7 +378,24 @@ impl Element for Inline {
                     AvailableSpace::Definite(w) => Some(w),
                     _ => None,
                 });
-                let wrap_width = width.map(|w| w / k);
+                let wrap_width = width.map(|w| {
+                    let target = w / k;
+                    let tolerance = px(1.5f32.max(1.0 / k));
+                    let mut st = inline_state.lock().unwrap();
+                    match st.fixed_wrap.iter().position(|prev| (target - *prev).abs() <= tolerance) {
+                        Some(i) => {
+                            // Most recently used first, so the least used is the one to go.
+                            let prev = st.fixed_wrap.remove(i);
+                            st.fixed_wrap.insert(0, prev);
+                            prev
+                        }
+                        None => {
+                            st.fixed_wrap.insert(0, target);
+                            st.fixed_wrap.truncate(4);
+                            target
+                        }
+                    }
+                });
                 let mut slot = cell.borrow_mut();
                 let reuse = slot.as_ref().is_some_and(|l| Some(l.wrap_width) == wrap_width && (l.k - k).abs() < 1e-6);
                 if !reuse {
