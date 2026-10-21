@@ -6,10 +6,11 @@ use std::{
 };
 
 use gpui::{
-    point, px, quad, size, App, AvailableSpace, BorderStyle, Bounds, CursorStyle, Edges, Element,
-    ElementId, GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId,
-    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, StyledText,
-    TextLayout, TextRun, Window, WrappedLine,
+    point, px, quad, size, AbsoluteLength, App, AvailableSpace, BorderStyle, Bounds, CursorStyle,
+    DefiniteLength, Edges, Element, ElementId, GlobalElementId, Half, HighlightStyle, Hitbox,
+    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, SharedString, StyledText, TextLayout, TextOverflow, TextRun, WhiteSpace, Window,
+    WrappedLine,
 };
 
 use crate::{global_state::GlobalState, input::Selection, text::node::LinkMark, ActiveTheme};
@@ -25,10 +26,35 @@ pub(super) struct Inline {
     styled_text: StyledText,
 
     state: Arc<Mutex<InlineState>>,
-    /// See [`crate::text::TextViewStyle::fixed_layout`].
-    fixed: bool,
+    /// See [`crate::text::TextViewStyle::fixed_layout`]. `None` is the ordinary layout.
+    fixed: Option<FixedWidth>,
     /// The layout at the theme's rem, while `fixed` and the rem around the view differs from it.
     scaled: Option<Rc<RefCell<Option<FixedLayout>>>>,
+}
+
+/// How a fixed-layout Inline gets the width it wraps at, at the theme's rem (dopamine #1186).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum FixedWidth {
+    /// Worked out from the markdown tree by node.rs, starting from `TextView::fixed_width`. The
+    /// same value at every zoom, so the line breaks are too.
+    Given(Pixels),
+    /// No wrap: one row per `\n` (list markers).
+    Unbounded,
+    /// The view got no `TextView::fixed_width`: wrap at the width layout hands over, divided by
+    /// the zoom. Layout rounds to the pixel and some neighbours are not linear in the zoom, so
+    /// a line that only just fits can re-wrap — best effort.
+    Measured,
+}
+
+/// A length from the (zoomed) text style, back at the theme's rem (dopamine #1186). Rems are exact.
+/// A px length comes in as `p · k`, and `/ k` gives back `p` only within an ulp or two
+/// (14 · z / z is 13.999999 on some frames — and the system font steps at whole sizes), so it is
+/// snapped to 1/256 px.
+pub(super) fn at_100(len: AbsoluteLength, k: f32, rem: Pixels) -> Pixels {
+    match len {
+        AbsoluteLength::Rems(r) => r.to_pixels(rem),
+        AbsoluteLength::Pixels(p) => px((f32::from(p) / k * 256.).round() / 256.),
+    }
 }
 
 /// Text laid out at the theme's rem (dopamine #1186), painted scaled by `k`.
@@ -40,7 +66,6 @@ struct FixedLayout {
     font_size: Pixels,
     line_height: Pixels,
     k: f32,
-    wrap_width: Pixels,
 }
 
 /// The inline text state, used RefCell to keep the selection state.
@@ -50,14 +75,6 @@ pub(crate) struct InlineState {
     /// The text that actually rendering, matched with selection.
     pub(super) text: SharedString,
     pub(super) selection: Option<Selection>,
-    /// The wrap width (at the theme's rem) this text was last laid out with in fixed layout
-    /// (dopamine #1186). Kept while the width seen through the zoom stays within a pixel or so of
-    /// it: layout widths are rounded to the pixel at every zoom, and the list markers next to the
-    /// text are measured at the zoomed size, so `width / k` drifts by a fraction of a pixel —
-    /// enough to re-wrap a line that only just fits.
-    /// A few of them: taffy also measures with trial widths (a flex item against its whole row),
-    /// and those must not push out the one the text is actually laid out at.
-    fixed_wrap: Vec<Pixels>,
 }
 
 impl InlineState {
@@ -82,22 +99,29 @@ impl Inline {
             text: text.clone(),
             styled_text: StyledText::new(text),
             state,
-            fixed: false,
+            fixed: None,
             scaled: None,
         }
     }
 
-    /// Lay out at the theme's rem and paint scaled (see [`crate::text::TextViewStyle::fixed_layout`]).
-    pub(super) fn fixed_layout(mut self, fixed: bool) -> Self {
+    /// A one-off label (a list marker), with its own state.
+    pub(super) fn label(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
+        let state = Arc::new(Mutex::new(InlineState::default()));
+        state.lock().unwrap().set_text(text.into());
+        Self::new(id, state, vec![], vec![])
+    }
+
+    /// Lay out at the theme's rem and paint scaled (see [`crate::text::TextViewStyle::fixed_layout`]),
+    /// at the given width; `None` keeps the ordinary layout.
+    pub(super) fn fixed(mut self, fixed: Option<FixedWidth>) -> Self {
         self.fixed = fixed;
         self
     }
 
     /// Paint the fixed layout: every glyph and decoration of the base-size layout, scaled by `k`
     /// from `origin`.
-    fn paint_fixed(layout: &FixedLayout, origin: Point<Pixels>, window: &mut Window, cx: &mut App) {
+    fn paint_fixed(layout: &FixedLayout, origin: Point<Pixels>, window: &mut Window) {
         let k = layout.k;
-        let text_system = cx.text_system().clone();
         let mut row_top = px(0.);
         for (line, &start) in layout.lines.iter().zip(&layout.starts) {
             let unwrapped = &line.unwrapped_layout;
@@ -106,8 +130,16 @@ impl Inline {
             let mut wraps = line.wrap_boundaries.iter().peekable();
             let mut row_x = px(0.);
             let mut row = 0usize;
+            // Where each glyph ends: where the next one starts (in any run), or the line's end.
+            let ends: Vec<Pixels> = unwrapped
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|g| g.position.x))
+                .skip(1)
+                .chain(std::iter::once(unwrapped.width))
+                .collect();
+            let mut nth = 0usize;
             for (run_ix, run) in unwrapped.runs.iter().enumerate() {
-                let max_w = text_system.bounding_box(run.font_id, layout.font_size).size.width;
                 for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                     if wraps.peek().is_some_and(|w| w.run_ix == run_ix && w.glyph_ix == glyph_ix) {
                         wraps.next();
@@ -118,11 +150,8 @@ impl Inline {
                     let y = row_top + layout.line_height * row as f32;
                     let byte = start + glyph.index;
                     let style = run_at(&layout.runs, byte);
-                    let next_x = run
-                        .glyphs
-                        .get(glyph_ix + 1)
-                        .map(|g| g.position.x - row_x)
-                        .unwrap_or(x + max_w.min(layout.font_size));
+                    let next_x = ends[nth] - row_x;
+                    nth += 1;
                     if let Some(style) = style {
                         if let Some(bg) = style.background_color {
                             let b = Bounds::new(
@@ -142,8 +171,12 @@ impl Inline {
                     if let Some(style) = style {
                         if let Some(u) = style.underline {
                             let thick = u.thickness * k;
+                            // Where gpui puts it (`text_system/line.rs`).
                             let b = Bounds::new(
-                                point(origin.x + x * k, origin.y + (y + baseline) * k + thick),
+                                point(
+                                    origin.x + x * k,
+                                    origin.y + (y + baseline + unwrapped.descent * 0.618) * k,
+                                ),
                                 size((next_x - x) * k, thick),
                             );
                             window.paint_quad(gpui::fill(b, u.color.unwrap_or(style.color)));
@@ -151,7 +184,10 @@ impl Inline {
                         if let Some(st) = style.strikethrough {
                             let thick = st.thickness * k;
                             let b = Bounds::new(
-                                point(origin.x + x * k, origin.y + (y + baseline - unwrapped.ascent / 3.) * k),
+                                point(
+                                    origin.x + x * k,
+                                    origin.y + (y + (unwrapped.ascent * 0.5 + baseline) * 0.5) * k,
+                                ),
                                 size((next_x - x) * k, thick),
                             );
                             window.paint_quad(gpui::fill(b, st.color.unwrap_or(style.color)));
@@ -363,68 +399,73 @@ impl Element for Inline {
         }
 
         // Fixed layout (dopamine #1186): lay out at the theme's rem, report the size scaled.
-        let rem = window.rem_size();
-        let base_rem = cx.theme().font_size;
-        let k = if f32::from(base_rem) > 0.0 { f32::from(rem) / f32::from(base_rem) } else { 1.0 };
-        if self.fixed {
-            let font_size = text_style.font_size.to_pixels(rem) / k;
-            let line_height = text_style.line_height.to_pixels(font_size.into(), base_rem).round();
+        if let Some(fixed) = self.fixed {
+            let base_rem = cx.theme().font_size;
+            let k = if f32::from(base_rem) > 0.0 { f32::from(window.rem_size()) / f32::from(base_rem) } else { 1.0 };
+            let font_size = at_100(text_style.font_size, k, base_rem);
+            let line_height = match text_style.line_height {
+                DefiniteLength::Absolute(a) => at_100(a, k, base_rem),
+                rel => rel.to_pixels(font_size.into(), base_rem),
+            }
+            .round();
+            let wraps = text_style.white_space == WhiteSpace::Normal;
+            let suffix = text_style.text_overflow.clone().map(|TextOverflow::Truncate(s)| s);
+            let clamp = text_style.line_clamp;
+            let font = text_style.font();
             let text = self.text.clone();
-            let inline_state = self.state.clone();
             let cell = Rc::new(RefCell::new(None::<FixedLayout>));
             self.scaled = Some(cell.clone());
-            let layout_id = window.request_measured_layout(Default::default(), move |known, available, window, _cx| {
-                let width = known.width.or(match available.width {
-                    AvailableSpace::Definite(w) => Some(w),
-                    _ => None,
-                });
-                let wrap_width = width.map(|w| {
-                    let target = w / k;
-                    let tolerance = px(1.5f32.max(1.0 / k));
-                    let mut st = inline_state.lock().unwrap();
-                    match st.fixed_wrap.iter().position(|prev| (target - *prev).abs() <= tolerance) {
-                        Some(i) => {
-                            // Most recently used first, so the least used is the one to go.
-                            let prev = st.fixed_wrap.remove(i);
-                            st.fixed_wrap.insert(0, prev);
-                            prev
-                        }
-                        None => {
-                            st.fixed_wrap.insert(0, target);
-                            st.fixed_wrap.truncate(4);
-                            target
-                        }
+            // Shape at `room` (the width at the theme's rem); `None` is unbounded.
+            let shape = move |room: Option<Pixels>, window: &mut Window, cx: &mut App| -> FixedLayout {
+                let mut runs = runs.clone();
+                let shown = match (room, &suffix) {
+                    (Some(w), Some(suffix)) => {
+                        let w = clamp.map_or(w, |n| w * n as f32);
+                        let mut wrapper = cx.text_system().line_wrapper(font.clone(), font_size);
+                        wrapper.truncate_line(text.clone(), w, suffix, &mut runs)
                     }
-                });
-                let mut slot = cell.borrow_mut();
-                let reuse = slot.as_ref().is_some_and(|l| Some(l.wrap_width) == wrap_width && (l.k - k).abs() < 1e-6);
-                if !reuse {
-                    let lines: Vec<WrappedLine> = window
-                        .text_system()
-                        .shape_text(text.clone(), font_size, &runs, wrap_width, None)
-                        .map(|l| l.into_iter().collect())
-                        .unwrap_or_default();
-                    let mut starts = Vec::with_capacity(lines.len());
-                    let mut at = 0;
-                    for l in &lines {
-                        starts.push(at);
-                        at += l.len() + 1;
-                    }
-                    *slot = Some(FixedLayout {
-                        lines,
-                        starts,
-                        runs: runs.clone(),
-                        font_size,
-                        line_height,
-                        k,
-                        wrap_width: wrap_width.unwrap_or_default(),
-                    });
+                    _ => text.clone(),
+                };
+                let wrap_width = room.filter(|_| wraps);
+                let lines: Vec<WrappedLine> = window
+                    .text_system()
+                    .shape_text(shown, font_size, &runs, wrap_width, clamp)
+                    .map(|l| l.into_iter().collect())
+                    .unwrap_or_default();
+                let mut starts = Vec::with_capacity(lines.len());
+                let mut at = 0;
+                for l in &lines {
+                    starts.push(at);
+                    at += l.len() + 1;
                 }
-                let l = slot.as_ref().unwrap();
-                let rows: usize = l.lines.iter().map(|w| w.wrap_boundaries.len() + 1).sum();
-                let widest = l.lines.iter().map(|w| w.unwrapped_layout.width).fold(px(0.), |a, b| a.max(b));
-                size(width.unwrap_or(widest * k), l.line_height * rows.max(1) as f32 * k)
-            });
+                FixedLayout { lines, starts, runs, font_size, line_height, k }
+            };
+            let layout_id = match fixed {
+                // The width is decided: shape once, here. Nothing layout asks (trial widths,
+                // min / max content) can change the line breaks.
+                FixedWidth::Given(_) | FixedWidth::Unbounded => {
+                    let room = match fixed {
+                        FixedWidth::Given(w) => Some(w.max(px(0.))),
+                        _ => None,
+                    };
+                    let layout = shape(room, window, cx);
+                    let (natural, height) = (layout.natural(), layout.height());
+                    *cell.borrow_mut() = Some(layout);
+                    window.request_measured_layout(Default::default(), move |known, _, _, _| {
+                        size(known.width.unwrap_or(natural * k), height * k)
+                    })
+                }
+                FixedWidth::Measured => window.request_measured_layout(Default::default(), move |known, available, window, cx| {
+                    let width = known.width.or(match available.width {
+                        AvailableSpace::Definite(w) => Some(w),
+                        _ => None,
+                    });
+                    let layout = shape(width.map(|w| px(f32::from(w) / k)), window, cx);
+                    let (natural, height) = (layout.natural(), layout.height());
+                    *cell.borrow_mut() = Some(layout);
+                    size(width.unwrap_or(natural * k), height * k)
+                }),
+            };
             return (layout_id, ());
         }
         self.scaled = None;
@@ -467,7 +508,7 @@ impl Element for Inline {
     ) {
         if let Some(cell) = self.scaled.take() {
             if let Some(layout) = cell.borrow().as_ref() {
-                Self::paint_fixed(layout, bounds.origin, window, cx);
+                Self::paint_fixed(layout, bounds.origin, window);
             }
             return;
         }
@@ -542,6 +583,34 @@ impl Element for Inline {
     }
 }
 
+impl FixedLayout {
+    /// Rows, counting wrapped ones.
+    fn rows(&self) -> usize {
+        self.lines.iter().map(|w| w.wrap_boundaries.len() + 1).sum::<usize>().max(1)
+    }
+
+    /// Height at the theme's rem.
+    fn height(&self) -> Pixels {
+        self.line_height * self.rows() as f32
+    }
+
+    /// The widest row at the theme's rem.
+    fn natural(&self) -> Pixels {
+        let mut widest = px(0.);
+        for line in &self.lines {
+            let l = &line.unwrapped_layout;
+            let mut start_x = px(0.);
+            for b in &line.wrap_boundaries {
+                let x = l.runs[b.run_ix].glyphs[b.glyph_ix].position.x;
+                widest = widest.max(x - start_x);
+                start_x = x;
+            }
+            widest = widest.max(l.width - start_x);
+        }
+        widest
+    }
+}
+
 /// The run covering byte `byte` of the text.
 fn run_at(runs: &[TextRun], byte: usize) -> Option<&TextRun> {
     let mut end = 0;
@@ -591,8 +660,21 @@ fn point_in_text_selection(
 
 #[cfg(test)]
 mod tests {
-    use super::point_in_text_selection;
-    use gpui::{point, px, size, Bounds};
+    use super::{at_100, point_in_text_selection};
+    use gpui::{point, px, rems, size, AbsoluteLength, Bounds};
+
+    /// dopamine #1186: the size at 100% is the same at every zoom — rems exactly, px snapped.
+    #[test]
+    fn at_100_is_the_same_at_every_zoom() {
+        let rem = px(16.);
+        let font = AbsoluteLength::Rems(rems(14. / 16.));
+        for i in 1..=400 {
+            let k = i as f32 * 0.01;
+            assert_eq!(at_100(font, k, rem), px(14.), "rems at k = {k}");
+            let zoomed = AbsoluteLength::Pixels(px(14. * k));
+            assert_eq!(at_100(zoomed, k, rem), px(14.), "px at k = {k}");
+        }
+    }
 
     #[test]
     fn test_point_in_text_selection() {

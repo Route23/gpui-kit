@@ -40,6 +40,7 @@ pub(crate) fn init(cx: &mut App) {
 #[derive(IntoElement, Clone)]
 struct TextViewElement {
     list_state: Option<ListState>,
+    fixed_width: Option<Pixels>,
     state: Entity<TextViewState>,
 }
 
@@ -51,6 +52,7 @@ impl RenderOnce for TextViewElement {
                 .map(|this| match &mut state.parsed_result {
                     Some(Ok(content)) => this.child(content.root_node.render_root(
                         self.list_state.clone(),
+                        self.fixed_width,
                         &content.node_cx,
                         window,
                         cx,
@@ -97,6 +99,7 @@ pub struct TextView {
     selectable: bool,
     scrollable: bool,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+    fixed_width: Option<Pixels>,
 }
 
 #[derive(PartialEq)]
@@ -449,6 +452,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             code_block_actions: None,
+            fixed_width: None,
         }
     }
 
@@ -485,6 +489,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             code_block_actions: None,
+            fixed_width: None,
         }
     }
 
@@ -516,6 +521,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             code_block_actions: None,
+            fixed_width: None,
         }
     }
 
@@ -567,6 +573,17 @@ impl TextView {
     /// This mode is suitable for small content, such as a few lines of text, a label, etc.
     pub fn scrollable(mut self, scrollable: bool) -> Self {
         self.scrollable = scrollable;
+        self
+    }
+
+    /// The width the text has at 100% — at the theme's rem — for
+    /// [`TextViewStyle::fixed_layout`] (dopamine #1186). Each block takes its insets off it at
+    /// 100% (a list marker, a quote's bar, a cell's padding), so the line breaks are the same at
+    /// every zoom. Without it, fixed layout wraps at the width layout hands over divided by the
+    /// zoom — which layout rounds to the pixel, and list markers are not linear in the zoom, so a
+    /// line that only just fits can re-wrap. Set at draw time: it does not parse the text again.
+    pub fn fixed_width(mut self, width: Pixels) -> Self {
+        self.fixed_width = Some(width);
         self
     }
 
@@ -714,6 +731,7 @@ impl Element for TextView {
                 } else {
                     None
                 },
+                fixed_width: self.fixed_width,
                 state: self.state.clone(),
             })
             .refine_style(&self.style)

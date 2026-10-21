@@ -24,8 +24,9 @@ pub struct TextViewStyle {
     /// Lay the text out at the theme's rem and scale the result to the rem around the view, instead of
     /// laying it out again at every size (dopamine #1186). Line breaks and glyph positions then stay
     /// put while a canvas zooms: the system font's spacing is not proportional to its size, so laying
-    /// out at each size re-wraps lines and shuffles glyphs. Links and selection are not hit-tested
-    /// in this mode.
+    /// out at each size re-wraps lines and shuffles glyphs. Give the view its width at 100% with
+    /// [`crate::text::TextView::fixed_width`] so the wrap width does not come from the zoomed
+    /// layout. Links and selection are not hit-tested in this mode.
     pub fixed_layout: bool,
 }
 

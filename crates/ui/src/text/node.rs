@@ -5,10 +5,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight, Half,
-    HighlightStyle, InteractiveElement as _, IntoElement, Length, ListState, ObjectFit,
-    ParentElement, SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _,
-    Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
+    AbsoluteLength, AnyElement, App, DefiniteLength, Div, Element, ElementId, FontStyle,
+    FontWeight, Half, HighlightStyle, InteractiveElement as _, IntoElement, Length, ListState,
+    ObjectFit, ParentElement, Pixels, Rems, SharedString, SharedUri, StatefulInteractiveElement,
+    Styled, StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
 };
 use markdown::mdast;
 use ropey::Rope;
@@ -18,7 +18,7 @@ use crate::{
     highlighter::{HighlightTheme, SyntaxHighlighter},
     text::{
         CodeBlockActionsFn,
-        inline::{Inline, InlineState},
+        inline::{FixedWidth, Inline, InlineState, at_100},
     },
     tooltip::Tooltip,
     v_flex,
@@ -371,6 +371,15 @@ impl CodeBlock {
         cx: &mut App,
     ) -> AnyElement {
         let style = &node_cx.style;
+        // The code inside `p_3`, or the padding `style.code_block` puts in its place.
+        let inner = options.fixed.map(|f| {
+            let side = |side: Option<DefiniteLength>| match side {
+                Some(DefiniteLength::Absolute(AbsoluteLength::Rems(r))) => r.to_pixels(f.rem),
+                Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(p))) => p,
+                _ => f.rems(0.75),
+            };
+            f.less(side(style.code_block.padding.left) + side(style.code_block.padding.right))
+        });
 
         div()
             .when(!options.is_last, |this| this.pb(style.paragraph_gap))
@@ -381,12 +390,15 @@ impl CodeBlock {
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted)
                     .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(cx.theme().mono_font_size * rem_scale(window, cx))
+                    .map(|this| match options.fixed {
+                        Some(f) => this.text_size(f.zoomed(cx.theme().mono_font_size)),
+                        None => this.text_size(cx.theme().mono_font_size * rem_scale(window, cx)),
+                    })
                     .relative()
                     .refine_style(&style.code_block)
                     .child(
                         Inline::new("code", self.state.clone(), vec![], self.styles.clone())
-                            .fixed_layout(style.fixed_layout),
+                            .fixed(inline_width(node_cx, inner)),
                     )
                     .when_some(node_cx.code_block_actions.clone(), |this, actions| {
                         this.child(
@@ -410,6 +422,80 @@ impl CodeBlock {
 fn rem_scale(window: &Window, cx: &App) -> f32 {
     let base = f32::from(cx.theme().font_size);
     if base > 0.0 { f32::from(window.rem_size()) / base } else { 1.0 }
+}
+
+/// The room for text in fixed layout (dopamine #1186), at the theme's rem: the view's
+/// [`crate::text::TextView::fixed_width`], less what each block on the way down takes off at
+/// 100% (a list marker, a quote's bar, a cell's padding). Layout never decides it, so it is the
+/// same at every zoom — and so are the line breaks. Lengths that take room from the text are
+/// drawn in rems ([`Fixed::zoomed`]), so the boxes scale with it exactly.
+#[derive(Clone, Copy)]
+struct Fixed {
+    width: Pixels,
+    /// The theme's rem.
+    rem: Pixels,
+    /// The current rem over the theme's.
+    k: f32,
+}
+
+impl Fixed {
+    /// `base` px at 100%, as rems: scales with the zoom with no rounding of its own.
+    fn zoomed(&self, base: Pixels) -> Rems {
+        rems(f32::from(base) / f32::from(self.rem))
+    }
+
+    /// `r` rems at the theme's rem.
+    fn rems(&self, r: f32) -> Pixels {
+        self.rem * r
+    }
+
+    /// The room left after `by`.
+    fn less(self, by: Pixels) -> Self {
+        Self { width: (self.width - by).max(px(0.)), ..self }
+    }
+}
+
+/// How an Inline gets its wrap width: `None` is the ordinary layout.
+fn inline_width(node_cx: &NodeContext, fixed: Option<Fixed>) -> Option<FixedWidth> {
+    node_cx
+        .style
+        .fixed_layout
+        .then(|| fixed.map_or(FixedWidth::Measured, |f| FixedWidth::Given(f.width)))
+}
+
+/// A list marker's width at 100%, as layout would give a string child (rounded up).
+fn marker_width(prefix: &str, f: Fixed, window: &mut Window) -> Pixels {
+    let style = window.text_style();
+    let size = at_100(style.font_size, f.k, f.rem);
+    let run = style.to_run(prefix.len());
+    window
+        .text_system()
+        .shape_line(SharedString::from(prefix.to_string()), size, &[run], None)
+        .width
+        .ceil()
+}
+
+/// Column widths at 100% for cells of `w(relative(len))` in a row of `room`: they all overflow,
+/// and flex shrinks each in proportion to its inner base size (CSS). Worked out here in fixed
+/// layout so the cells — and the text truncated in them — are the same at every zoom.
+fn fixed_columns(lens: &[usize], room: Pixels, pad: Pixels, border: Pixels) -> Vec<Pixels> {
+    let n = lens.len();
+    let room = f64::from(f32::from(room));
+    let edge = |i: usize| f64::from(f32::from(pad + if i + 1 < n { border } else { px(0.) }));
+    let basis: Vec<f64> = lens.iter().map(|&len| len as f64 * room).collect();
+    let inner: Vec<f64> = (0..n).map(|i| (basis[i] - edge(i)).max(0.)).collect();
+    let deficit = basis.iter().sum::<f64>() - room;
+    let inner_total: f64 = inner.iter().sum();
+    (0..n)
+        .map(|i| {
+            let w = if deficit > 0. && inner_total > 0. {
+                basis[i] - deficit * inner[i] / inner_total
+            } else {
+                basis[i]
+            };
+            px(w.max(edge(i)) as f32)
+        })
+        .collect()
 }
 
 #[derive(Default, Clone)]
@@ -575,6 +661,7 @@ impl Paragraph {
     fn render(
         &self,
         node_cx: &NodeContext,
+        fixed: Option<Fixed>,
         _window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
@@ -607,7 +694,7 @@ impl Paragraph {
                             links.clone(),
                             highlights.clone(),
                         )
-                        .fixed_layout(node_cx.style.fixed_layout)
+                        .fixed(inline_width(node_cx, fixed))
                         .into_any_element(),
                     );
                 }
@@ -689,7 +776,7 @@ impl Paragraph {
             child_nodes
                 .push(
                     Inline::new(ix, self.state.clone(), links, highlights)
-                        .fixed_layout(node_cx.style.fixed_layout)
+                        .fixed(inline_width(node_cx, fixed))
                         .into_any_element(),
                 );
         }
@@ -705,6 +792,7 @@ struct NodeRenderOptions {
     ordered: bool,
     depth: usize,
     is_last: bool,
+    fixed: Option<Fixed>,
 }
 
 impl NodeRenderOptions {
@@ -912,6 +1000,21 @@ impl Node {
                 .children({
                     let mut items: Vec<Div> = Vec::with_capacity(children.len());
 
+                    // In fixed layout the marker is drawn at 100% in a box of its 100% width, and the
+                    // text gets the rest (dopamine #1186). A string child would be measured at the
+                    // zoomed size and rounded up, and the rest would drift with the zoom.
+                    let prefix = (!options.todo && checked.is_none())
+                        .then(|| list_item_prefix(ix, options.ordered, options.depth));
+                    let marker = options.fixed.zip(prefix.as_ref()).map(|(f, prefix)| {
+                        (f, marker_width(prefix, f, window))
+                    });
+                    let column = options.fixed.map(|f| match (checked, marker) {
+                        // `size(0.875rem)` + `mr_1p5`
+                        (Some(_), _) => f.less(f.rems(0.875 + 0.375)),
+                        (None, Some((_, width))) => f.less(width),
+                        (None, None) => f,
+                    });
+
                     for (child_ix, child) in children.iter().enumerate() {
                         match child {
                             Node::Paragraph(_) => {
@@ -923,12 +1026,33 @@ impl Node {
                                         depth: options.depth + 1,
                                         todo: checked.is_some(),
                                         is_last: true,
+                                        fixed: column,
                                         ..options
                                     },
                                     node_cx,
                                     window,
                                     cx,
                                 );
+
+                                // In fixed layout a later paragraph goes under the first, in a
+                                // column as wide as the one it was laid out for (dopamine #1186).
+                                // Merged into the row it would sit beside the first paragraph, which
+                                // is laid out for the whole column and would paint over it.
+                                if last_not_list && !items.is_empty() {
+                                    if let Some((f, column)) = options.fixed.zip(column) {
+                                        items.push(
+                                            h_flex()
+                                                .items_start()
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .w(f.zoomed(f.width - column.width)),
+                                                )
+                                                .child(div().flex_1().min_w_0().child(text)),
+                                        );
+                                        continue;
+                                    }
+                                }
 
                                 // merge content into last item.
                                 if last_not_list {
@@ -946,12 +1070,14 @@ impl Node {
                                         .relative()
                                         .items_start()
                                         .content_start()
-                                        .when(!options.todo && checked.is_none(), |this| {
-                                            this.child(list_item_prefix(
-                                                ix,
-                                                options.ordered,
-                                                options.depth,
-                                            ))
+                                        .when_some(prefix.clone(), |this, prefix| match marker {
+                                            Some((f, width)) => this.child(
+                                                div().flex_none().w(f.zoomed(width)).child(
+                                                    Inline::label(("marker", ix), prefix)
+                                                        .fixed(Some(FixedWidth::Unbounded)),
+                                                ),
+                                            ),
+                                            None => this.child(prefix),
                                         })
                                         .when_some(*checked, |this, checked| {
                                             // Todo list checkbox
@@ -979,7 +1105,17 @@ impl Node {
                                         // flex 行の中で `overflow_hidden` だけだと最小幅が 0 になり、
                                         // 本文が 0 幅に潰れて**箇条書きの文字が消える**（dopamine #651）。
                                         // 残りの幅を取らせる。
-                                        .child(div().flex_1().min_w_0().overflow_hidden().child(text)),
+                                        // In fixed layout the text's width is decided already; clipping
+                                        // at the laid-out box would only shave a pixel off at a zoom.
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .when(options.fixed.is_none(), |this| {
+                                                    this.overflow_hidden()
+                                                })
+                                                .child(text),
+                                        ),
                                 );
                             }
                             Node::List { .. } => {
@@ -988,6 +1124,7 @@ impl Node {
                                         depth: options.depth + 1,
                                         todo: checked.is_some(),
                                         is_last: true,
+                                        fixed: options.fixed.map(|f| f.less(f.rems(1.))),
                                         ..options
                                     },
                                     node_cx,
@@ -1007,6 +1144,7 @@ impl Node {
 
     fn render_table(
         item: &Node,
+        fixed: Option<Fixed>,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -1041,7 +1179,10 @@ impl Node {
                     div()
                         .id("table")
                         .w_full()
-                        .border_1()
+                        .map(|this| match fixed {
+                            Some(f) => this.border(f.zoomed(px(1.))),
+                            None => this.border_1(),
+                        })
                         .border_color(cx.theme().border)
                         .rounded(cx.theme().radius)
                         .children({
@@ -1052,13 +1193,30 @@ impl Node {
                                         .id("row")
                                         .w_full()
                                         .when(row_ix < table.children.len() - 1, |this| {
-                                            this.border_b_1()
+                                            match fixed {
+                                                Some(f) => this.border_b(f.zoomed(px(1.))),
+                                                None => this.border_b_1(),
+                                            }
                                         })
                                         .border_color(cx.theme().border)
                                         .flex()
                                         .flex_row()
                                         .children({
                                             let mut cells = Vec::with_capacity(row.children.len());
+                                            // Inside the table's border; `px_2` and `border_r_1`.
+                                            let columns = fixed.map(|f| {
+                                                let lens: Vec<usize> = (0..row.children.len())
+                                                    .map(|ix| {
+                                                        col_lens
+                                                            .get(ix)
+                                                            .copied()
+                                                            .unwrap_or(MAX_LENGTH)
+                                                            .min(MAX_LENGTH)
+                                                    })
+                                                    .collect();
+                                                let room = f.less(px(2.)).width;
+                                                (f, fixed_columns(&lens, room, f.rems(1.), px(1.)))
+                                            });
                                             for (ix, cell) in row.children.iter().enumerate() {
                                                 let align = table.column_align(ix);
                                                 let is_last_col = ix == row.children.len() - 1;
@@ -1080,18 +1238,42 @@ impl Node {
                                                             align == ColumnumnAlign::Right,
                                                             |this| this.justify_end(),
                                                         )
-                                                        .w(Length::Definite(relative(len as f32)))
+                                                        .map(|this| match &columns {
+                                                            Some((f, columns)) => this
+                                                                .flex_none()
+                                                                .w(f.zoomed(columns[ix])),
+                                                            None => this.w(Length::Definite(
+                                                                relative(len as f32),
+                                                            )),
+                                                        })
                                                         .px_2()
                                                         .py_1()
                                                         .when(!is_last_col, |this| {
-                                                            this.border_r_1()
-                                                                .border_color(cx.theme().border)
+                                                            match fixed {
+                                                                Some(f) => this
+                                                                    .border_r(f.zoomed(px(1.))),
+                                                                None => this.border_r_1(),
+                                                            }
+                                                            .border_color(cx.theme().border)
                                                         })
                                                         .truncate()
-                                                        .child(
-                                                            cell.children
-                                                                .render(node_cx, window, cx),
-                                                        ),
+                                                        .child(cell.children.render(
+                                                            node_cx,
+                                                            columns.as_ref().map(|(f, columns)| {
+                                                                let mut f = *f;
+                                                                f.width = columns[ix];
+                                                                f.less(
+                                                                    f.rems(1.)
+                                                                        + if is_last_col {
+                                                                            px(0.)
+                                                                        } else {
+                                                                            px(1.)
+                                                                        },
+                                                                )
+                                                            }),
+                                                            window,
+                                                            cx,
+                                                        )),
                                                 )
                                             }
                                             cells
@@ -1109,12 +1291,21 @@ impl Node {
     pub(super) fn render_root(
         &self,
         list_state: Option<ListState>,
+        fixed_width: Option<Pixels>,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
+        let fixed = fixed_width
+            .filter(|_| node_cx.style.fixed_layout)
+            .map(|width| Fixed {
+                width,
+                rem: cx.theme().font_size,
+                k: rem_scale(window, cx),
+            });
         let options = NodeRenderOptions {
             is_last: true,
+            fixed,
             ..Default::default()
         };
 
@@ -1171,7 +1362,7 @@ impl Node {
             Node::Paragraph(paragraph) => div()
                 .id("p")
                 .pb(mb)
-                .child(paragraph.render(node_cx, window, cx))
+                .child(paragraph.render(node_cx, options.fixed, window, cx))
                 .into_any_element(),
             Node::Heading { level, children } => {
                 let (text_size, font_weight) = match level {
@@ -1191,7 +1382,11 @@ impl Node {
                 // Follow a rem override around the view (a zoomed canvas, a scaled pane — dopamine #1184).
                 // Headings are sized in px, so without this they stay put while the body text scales.
                 // Applied at draw time: changing the style instead would parse the whole text again.
-                text_size = text_size * rem_scale(window, cx);
+                // In fixed layout as rems, which come back to the same px at 100% (dopamine #1186).
+                let text_size: AbsoluteLength = match options.fixed {
+                    Some(f) => f.zoomed(text_size).into(),
+                    None => (text_size * rem_scale(window, cx)).into(),
+                };
 
                 h_flex()
                     .id(("h", *level as usize))
@@ -1199,7 +1394,7 @@ impl Node {
                     .whitespace_normal()
                     .text_size(text_size)
                     .font_weight(font_weight)
-                    .child(children.render(node_cx, window, cx))
+                    .child(children.render(node_cx, options.fixed, window, cx))
                     .into_any_element()
             }
             Node::Blockquote { children } => div()
@@ -1210,11 +1405,19 @@ impl Node {
                         .id("blockquote")
                         .w_full()
                         .text_color(cx.theme().muted_foreground)
-                        .border_l_3()
+                        .map(|this| match options.fixed {
+                            Some(f) => this.border_l(f.zoomed(px(3.))),
+                            None => this.border_l_3(),
+                        })
                         .border_color(cx.theme().secondary_active)
                         .px_4()
                         .children({
                             let children_len = children.len();
+                            // `border_l_3` and `px_4`
+                            let options = NodeRenderOptions {
+                                fixed: options.fixed.map(|f| f.less(px(3.) + f.rems(2.))),
+                                ..options
+                            };
                             children.into_iter().enumerate().map(move |(index, c)| {
                                 let is_last = index == children_len - 1;
                                 c.render_block(options.is_last(is_last), node_cx, window, cx)
@@ -1251,10 +1454,17 @@ impl Node {
                 })
                 .into_any_element(),
             Node::CodeBlock(code_block) => code_block.render(&options, node_cx, window, cx),
-            Node::Table { .. } => Self::render_table(self, node_cx, window, cx).into_any_element(),
+            Node::Table { .. } => {
+                Self::render_table(self, options.fixed, node_cx, window, cx).into_any_element()
+            }
             Node::Divider => div()
                 .pb(mb)
-                .child(div().id("divider").bg(cx.theme().border).h(px(2.)))
+                .child(div().id("divider").bg(cx.theme().border).map(|this| {
+                    match options.fixed {
+                        Some(f) => this.h(f.zoomed(px(2.))),
+                        None => this.h(px(2.)),
+                    }
+                }))
                 .into_any_element(),
             Node::Break { .. } => div().id("break").into_any_element(),
             Node::Unknown | Node::Definition { .. } => div().into_any_element(),
@@ -1266,5 +1476,27 @@ impl Node {
                 div().into_any_element()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixed_columns;
+    use gpui::px;
+
+    /// dopamine #1186: the columns taffy gives `w(relative(len))` cells — shrunk from `len × room`
+    /// in proportion to their inner size — add up to the row and keep their padding.
+    #[test]
+    fn fixed_columns_fill_the_row_like_flex_shrink() {
+        let room = px(800.);
+        let (pad, border) = (px(16.), px(1.));
+        let columns = fixed_columns(&[5, 20, 10], room, pad, border);
+        let total: f32 = columns.iter().map(|w| f32::from(*w)).sum();
+        assert!((total - 800.).abs() < 0.01, "{columns:?}");
+        // Wider text, wider column; each keeps its padding and border.
+        assert!(columns[0] < columns[2] && columns[2] < columns[1], "{columns:?}");
+        assert!(columns.iter().all(|w| *w >= pad + border), "{columns:?}");
+        // One column takes the whole row.
+        assert_eq!(fixed_columns(&[7], room, pad, border), vec![room]);
     }
 }
